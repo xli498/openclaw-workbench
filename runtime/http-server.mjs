@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { startWorkbench } from './index.mjs';
 import { createPatchProposal, approveAndApplyPatch, createCommandProposal, approveAndRunCommand, WorkflowError } from './workflow.mjs';
 import { createChatSessionManager, SessionError } from './session.mjs';
+import { createCodeToolProposal } from './code-tools.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -58,6 +59,14 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
       if (request.method === 'POST' && sessionMessages) return json(response, 200, await sessions.sendMessage({ sessionId: sessionMessages[1], ...await bodyOf(request) }));
       const sessionPlan = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/plan$/);
       if (request.method === 'POST' && sessionPlan) return json(response, 200, await sessions.planReview({ sessionId: sessionPlan[1], ...await bodyOf(request) }));
+      const sessionTool = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/tools\/proposals$/);
+      if (request.method === 'POST' && sessionTool) {
+        const session = sessions.getSession(sessionTool[1]);
+        const input = await bodyOf(request);
+        const proposal = await createCodeToolProposal({ mode: session.mode, tool: input.tool, input: { ...input.input, sessionId: session.id }, root, audit });
+        proposals.set(proposal.action.id, proposal);
+        return json(response, 201, { proposal: publicProposal(proposal) });
+      }
       const sessionClose = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/close$/);
       if (request.method === 'POST' && sessionClose) return json(response, 200, { session: sessions.closeSession(sessionClose[1]) });
       if (request.method === 'POST' && url.pathname === '/v1/proposals/patch') {

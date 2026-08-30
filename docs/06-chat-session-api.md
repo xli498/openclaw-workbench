@@ -32,6 +32,17 @@ Content-Type: application/json
 - `Code` 模式不会绕过 Patch 审批；文件修改必须走已有的 `createPatchProposal` → `approveAndApplyPatch`。
 - 当前不实现公网 Bridge、MCP Server 管理或自动修改 OpenClaw 配置。
 
+## Code 工具提案
+
+```http
+POST /v1/sessions/:id/tools/proposals
+Content-Type: application/json
+
+{"tool":"patch","input":{"patch":"...","declaredPaths":["README.md"]}}
+```
+
+该接口只接受 `Code` 会话和两个结构化工具：`patch`、`command`。模型或客户端只能生成待审批提案，不能通过 Chat 直接写文件或运行命令；提案仍需经过独立的人工审批接口，沿用 action hash、workspace revision、路径边界和命令策略校验。
+
 ## Plan 多模型复核
 
 ```http
