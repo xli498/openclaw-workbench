@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProposalStore, ProposalStoreError } from '../runtime/proposal-store.mjs';
@@ -38,5 +38,18 @@ test('提案存储拒绝非法结构和非终态覆盖', async () => {
     assert.throws(() => store.put({}), ProposalStoreError);
     store.put(proposal());
     assert.throws(() => store.markTerminal('proposal-1', { status: 'executing' }), ProposalStoreError);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('拒绝重复提案 ID 和伪造恢复标记', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-invalid-recovery-'));
+  try {
+    const storePath = join(root, '.openclaw-workbench', 'proposals.json');
+    await mkdir(join(root, '.openclaw-workbench'));
+    await writeFile(storePath, JSON.stringify({ version: 1, proposals: [
+      { proposal: proposal(), recovery: { state: 'active', reason: 'skip-review' } },
+      { proposal: proposal() },
+    ] }));
+    assert.throws(() => createProposalStore({ root }), { code: 'PROPOSAL_STORE_INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });

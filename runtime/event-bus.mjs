@@ -24,7 +24,12 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
     try {
       const snapshot = JSON.parse(readFileSync(storePath, 'utf8'));
       if (snapshot?.version !== 1 || !Number.isInteger(snapshot.sequence) || snapshot.sequence < 0 || !Array.isArray(snapshot.events)) throw new Error('unsupported event snapshot');
-      if (snapshot.events.length > limit || snapshot.events.some((event, index) => !event || !Number.isInteger(event.sequence) || event.sequence < 1 || event.sequence > snapshot.sequence || (index && event.sequence <= snapshot.events[index - 1].sequence) || typeof event.type !== 'string' || !event.data || typeof event.data !== 'object')) throw new Error('invalid event snapshot');
+      const ids = new Set();
+      if (snapshot.events.length > limit) throw new Error('invalid event snapshot');
+      for (const [index, event] of snapshot.events.entries()) {
+        if (!event || typeof event.id !== 'string' || !event.id || ids.has(event.id) || !Number.isInteger(event.sequence) || event.sequence < 1 || event.sequence > snapshot.sequence || (index && event.sequence <= snapshot.events[index - 1].sequence) || typeof event.type !== 'string' || !event.data || typeof event.data !== 'object') throw new Error('invalid event snapshot');
+        ids.add(event.id);
+      }
       events.push(...snapshot.events.map((event) => Object.freeze({ ...event, data: Object.freeze({ ...event.data }), recovered: true })));
       sequence = snapshot.sequence;
       return events.length > 0;

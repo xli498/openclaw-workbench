@@ -29,10 +29,13 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
     try {
       const snapshot = JSON.parse(readFileSync(storePath, 'utf8'));
       if (snapshot?.version !== 1 || !Array.isArray(snapshot.proposals)) throw new Error('unsupported proposal snapshot');
+      const ids = new Set();
       for (const record of snapshot.proposals) {
-        if (!record || !validProposal(record.proposal)) throw new Error('invalid proposal snapshot');
+        if (!record || !validProposal(record.proposal) || ids.has(record.proposal.action.id)) throw new Error('invalid proposal snapshot');
         const action = record.proposal.action;
-        const recovery = TERMINAL.has(action.status) ? record.recovery : { state: 'manual_review', reason: 'restarted_before_terminal' };
+        ids.add(action.id);
+        if (record.recovery && (record.recovery.state !== 'manual_review' || record.recovery.reason !== 'restarted_before_terminal')) throw new Error('invalid proposal recovery');
+        const recovery = TERMINAL.has(action.status) ? undefined : { state: 'manual_review', reason: 'restarted_before_terminal' };
         records.set(action.id, Object.freeze({ proposal: record.proposal, ...(recovery ? { recovery } : {}) }));
       }
     } catch (error) {

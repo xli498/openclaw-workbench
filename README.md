@@ -16,13 +16,13 @@ node bin/workbench.mjs --root /path/to/workspace --json
 
 ## 本地控制面 API
 
-`createWorkbenchServer` 提供默认仅监听 `127.0.0.1` 的本地 HTTP 控制面：`GET /health`、`GET /v1/status`、创建 Patch/Command 提案以及明确批准执行提案。请求体限制为 256 KiB；配置 `token` 后所有请求必须携带 `Authorization: Bearer <token>`。该 API 不绑定公网地址、不接管 Gateway，也不把提案持久化到网络数据库；服务重启后内存提案失效，ledger 仍负责阻断命令 action 重放。
+`createWorkbenchServer` 提供默认仅监听 `127.0.0.1` 的本地 HTTP 控制面：`GET /health`、`GET /v1/status`、创建 Patch/Command 提案以及明确批准执行提案。请求体限制为 256 KiB；配置 `token` 后所有请求必须携带 `Authorization: Bearer <token>`。该 API 不绑定公网地址、不接管 Gateway，也不把状态持久化到网络数据库；会话、提案和本地事件分别写入工作区的原子 JSON 快照。服务重启后未完成会话/提案只进入 `manual_review`，不会自动调用模型或执行命令。
 
 启动入口只扫描并报告未完成事务；仅对文件已全部达到 `afterHash` 的事务自动标记为 `committed`，不会自动执行 `resume` 或 `rollback`。非法清单会被隔离为结构化错误，其他事务继续扫描。
 
 Chat 会话接口遵循 ShunCode 的 Ask / Plan / Code 三模式：`POST /v1/sessions` 创建会话，`POST /v1/sessions/:id/messages` 调用独立的 OpenClaw Adapter，`GET /v1/sessions/:id/messages` 读取消息，`POST /v1/sessions/:id/close` 关闭会话。当前三种模式已完成会话级边界；真正的 Code 文件修改仍必须通过 Patch 提案和明确审批，不允许 Chat 直接写文件。
 
-Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前仍不包含 UI、完整 Chat/Plan 工作流、MCP 管理和公网 Bridge。
+Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前仍不包含桌面 UI、MCP 管理、OpenClaw channel/Gateway 生命周期接入和公网 Bridge。
 
 ## 能力状态
 

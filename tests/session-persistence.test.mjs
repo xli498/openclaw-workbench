@@ -59,3 +59,16 @@ test('人工复核只恢复会话状态，不重放中断回合', async () => {
     assert.throws(() => manager.reviewSession('review-me', { decision: 'resume' }), { code: 'REVIEW_NOT_REQUIRED' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('拒绝重复会话 ID 和非法消息快照', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-invalid-shape-'));
+  try {
+    const storePath = join(root, '.openclaw-workbench', 'sessions.json');
+    await mkdir(join(root, '.openclaw-workbench'));
+    await writeFile(storePath, JSON.stringify({ version: 1, sessions: [
+      { id: 'duplicate', mode: 'Ask', status: 'active', messages: [] },
+      { id: 'duplicate', mode: 'Ask', status: 'active', messages: [{ role: 'tool', content: 'unsafe' }] },
+    ] }));
+    assert.throws(() => createChatSessionManager({ root }), { code: 'SESSION_STORE_INVALID' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

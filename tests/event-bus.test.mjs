@@ -46,3 +46,16 @@ test('事件总线拒绝损坏快照而不是伪造新事件流', async () => {
     assert.throws(() => createEventBus({ root }), (error) => error instanceof EventBusError && error.code === 'EVENT_STORE_INVALID');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('拒绝重复事件 ID 和缺少事件 ID 的快照', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-events-invalid-shape-'));
+  try {
+    const store = join(root, '.openclaw-workbench', 'events.json');
+    await mkdir(join(root, '.openclaw-workbench'));
+    await writeFile(store, JSON.stringify({ version: 1, sequence: 2, events: [
+      { id: 'same', sequence: 1, type: 'one', data: {} },
+      { id: 'same', sequence: 2, type: 'two', data: {} },
+    ] }));
+    assert.throws(() => createEventBus({ root }), (error) => error instanceof EventBusError && error.code === 'EVENT_STORE_INVALID');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

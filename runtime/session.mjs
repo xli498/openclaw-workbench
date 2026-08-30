@@ -37,8 +37,10 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     try {
       const payload = JSON.parse(readFileSync(storePath, 'utf8'));
       if (payload?.version !== 1 || !Array.isArray(payload.sessions)) throw new Error('unsupported snapshot');
+      const ids = new Set();
       for (const raw of payload.sessions) {
-        if (!raw || typeof raw.id !== 'string' || !CHAT_MODES.includes(raw.mode) || !Array.isArray(raw.messages)) throw new Error('invalid session snapshot');
+        if (!raw || typeof raw.id !== 'string' || !raw.id || ids.has(raw.id) || !CHAT_MODES.includes(raw.mode) || (raw.status !== undefined && !['active', 'closed', 'manual_review'].includes(raw.status)) || !Array.isArray(raw.messages) || raw.messages.some((message) => !message || !['user', 'assistant'].includes(message.role) || (typeof message.content !== 'string' && (!message.content || typeof message.content !== 'object' || Array.isArray(message.content))))) throw new Error('invalid session snapshot');
+        ids.add(raw.id);
         const interrupted = raw.running === true;
         const session = { id: raw.id, workspaceId: raw.workspaceId || root, mode: raw.mode, actor: raw.actor || 'user', status: interrupted ? 'manual_review' : raw.status === 'closed' ? 'closed' : 'active', createdAt: raw.createdAt || clock().toISOString(), messages: raw.messages.map((message) => Object.freeze({ ...message })), running: false, ...(interrupted ? { recoveryReason: 'interrupted_turn' } : {}) };
         sessions.set(session.id, session);
