@@ -112,5 +112,17 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     return publicSession(session);
   }
 
-  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), sendMessage, planReview, listMessages, closeSession, snapshotPath: storePath });
+  function reviewSession(sessionId, { decision, reviewer = 'user' } = {}) {
+    const session = getSession(sessionId);
+    if (session.status !== 'manual_review') throw new SessionError('REVIEW_NOT_REQUIRED', 'session is not awaiting manual review');
+    if (!['resume', 'close'].includes(decision)) throw new SessionError('INVALID_REVIEW_DECISION', 'decision must be resume or close');
+    if (typeof reviewer !== 'string' || !reviewer || reviewer.length > 256) throw new SessionError('INVALID_REVIEWER', 'reviewer is required and must be at most 256 characters');
+    session.status = decision === 'resume' ? 'active' : 'closed';
+    session.recoveryReason = undefined;
+    session.review = Object.freeze({ decision, reviewer, reviewedAt: clock().toISOString(), replayed: false });
+    persist();
+    return publicSession(session);
+  }
+
+  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), sendMessage, planReview, listMessages, closeSession, reviewSession, snapshotPath: storePath });
 }

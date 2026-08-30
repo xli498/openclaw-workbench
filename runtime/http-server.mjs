@@ -73,6 +73,12 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
       }
       const sessionClose = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/close$/);
       if (request.method === 'POST' && sessionClose) return json(response, 200, { session: sessions.closeSession(sessionClose[1]) });
+      const sessionReview = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/review$/);
+      if (request.method === 'POST' && sessionReview) {
+        const session = sessions.reviewSession(sessionReview[1], await bodyOf(request));
+        eventBus.publish({ type: 'session.reviewed', sessionId: session.id, requestId, data: { status: session.status } });
+        return json(response, 200, { session });
+      }
       if (request.method === 'POST' && url.pathname === '/v1/proposals/patch') {
         const input = await bodyOf(request);
         const proposal = await createPatchProposal({ ...input, root, audit });

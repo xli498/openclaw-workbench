@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
@@ -73,4 +73,20 @@ test('本地事件 API 仅暴露已发生事件且遵守鉴权', async () => {
     const unauthorized = await fetch(`http://${address.address}:${address.port}/v1/events`);
     assert.equal(unauthorized.status, 401);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('人工复核 API 仅转换 manual_review 状态并发布只读事件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-review-'));
+  try {
+    await mkdir(path.join(root, '.openclaw-workbench'));
+    await writeFile(path.join(root, '.openclaw-workbench', 'sessions.json'), JSON.stringify({ version: 1, sessions: [{ id: 'manual', workspaceId: root, mode: 'Ask', actor: 'user', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', messages: [], running: true }] }));
+    const app = createWorkbenchServer({ root, token: 'test-token' });
+    const address = await app.listen();
+    const reviewed = await request(address, '/v1/sessions/manual/review', { method: 'POST', body: JSON.stringify({ decision: 'resume' }) });
+    assert.equal(reviewed.status, 200);
+    assert.equal(reviewed.body.session.status, 'active');
+    const events = await request(address, '/v1/events?after=0&limit=10');
+    assert.equal(events.body.events.at(-1).type, 'session.reviewed');
+    await app.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

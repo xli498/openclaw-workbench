@@ -56,6 +56,15 @@ Authorization: Bearer <token>
 
 会话快照写入工作区 `.openclaw-workbench/sessions.json`，通过临时文件与原子 rename 更新。启动时只恢复历史、`active` 和 `closed` 会话；快照记录为 `running` 的会话会被降级为 `manual_review` 并标注 `interrupted_turn`，不会重新调用模型、重放消息或执行任何工具。损坏或不兼容快照将拒绝恢复，而不是猜测性修复。
 
+```http
+POST /v1/sessions/:id/review
+Content-Type: application/json
+
+{"decision":"resume","reviewer":"user"}
+```
+
+只有 `manual_review` 会话可调用该接口。`resume` 仅将会话标为可接收**新的**回合，`close` 则关闭会话；二者都不会重放中断消息、模型调用、Patch 或命令。完成后发布只读的 `session.reviewed` 事件。
+
 ## Plan 多模型复核
 
 ```http

@@ -43,3 +43,19 @@ test('拒绝损坏会话快照，避免猜测性恢复', async () => {
     assert.throws(() => createChatSessionManager({ root }), SessionError);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('人工复核只恢复会话状态，不重放中断回合', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-review-'));
+  try {
+    const storePath = join(root, '.openclaw-workbench', 'sessions.json');
+    await mkdir(join(root, '.openclaw-workbench'));
+    await writeFile(storePath, JSON.stringify({ version: 1, sessions: [{ id: 'review-me', workspaceId: root, mode: 'Ask', actor: 'user', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', messages: [{ role: 'user', content: 'old turn', createdAt: '2026-01-01T00:00:00.000Z' }], running: true }] }));
+    let calls = 0;
+    const manager = createChatSessionManager({ root, runAgentFn: async () => { calls += 1; return { text: 'new only' }; } });
+    assert.equal(manager.reviewSession('review-me', { decision: 'resume', reviewer: 'alice' }).status, 'active');
+    assert.equal(calls, 0);
+    await manager.sendMessage({ sessionId: 'review-me', message: 'fresh turn' });
+    assert.equal(calls, 1);
+    assert.throws(() => manager.reviewSession('review-me', { decision: 'resume' }), { code: 'REVIEW_NOT_REQUIRED' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
