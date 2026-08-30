@@ -102,6 +102,8 @@ Content-Type: application/json
 
 事件查询的 `after` 与 `limit` 只接受安全范围内、无前导零的十进制整数；空白、十六进制、科学计数法、小数、前导零与超出 JavaScript 安全整数范围的值都会以 `INVALID_QUERY_INTEGER` 拒绝。
 
+所有写接口的请求体必须是 JSON 对象。数组、`null`、字符串、数字和布尔值会以 `INVALID_BODY` 拒绝；格式非法的 JSON 以 `INVALID_JSON` 拒绝，不会进入会话、提案或执行参数。
+
 ## 鉴权比较
 
 配置了 token 时，控制面仅接受精确的 `Authorization: Bearer <token>`。服务端对期望值和收到的认证值分别做 SHA-256 后进行恒定时间比较；前缀、后缀、认证方案或类型不匹配均按未授权处理。

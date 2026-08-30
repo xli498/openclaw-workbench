@@ -45,8 +45,15 @@ async function bodyOf(request) {
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  let body;
+  try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { const error = new Error('request body must be valid JSON'); error.code = 'INVALID_JSON'; throw error; }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    const error = new Error('request body must be a JSON object');
+    error.code = 'INVALID_BODY';
+    throw error;
+  }
+  return body;
 }
 
 function errorResponse(error) {
@@ -55,7 +62,7 @@ function errorResponse(error) {
   if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error instanceof EventBusError) return { status: 400, body: { error: error.code, message: error.message } };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : 400, body: { error: error.code, message: error.message } };
-  return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_QUERY_INTEGER' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
+  return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
 }
 
 function requireToken(request, token) {

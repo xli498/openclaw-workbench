@@ -67,6 +67,22 @@ test('事件游标和页面大小只接受安全的十进制整数', async () =>
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('写接口只接受 JSON 对象请求体，不把原始 JSON 值传入运行时', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-body-shape-'));
+  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await app.listen();
+  try {
+    for (const body of ['null', '[]', '"text"', '1', 'true']) {
+      const response = await request(address, '/v1/sessions', { method: 'POST', body });
+      assert.equal(response.status, 400, body);
+      assert.equal(response.body.error, 'INVALID_BODY');
+    }
+    const malformed = await request(address, '/v1/sessions', { method: 'POST', body: '{' });
+    assert.equal(malformed.status, 400);
+    assert.equal(malformed.body.error, 'INVALID_JSON');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面提供 Chat 会话并把模式绑定到 Adapter', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-chat-'));
   const calls = [];
