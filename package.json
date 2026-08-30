@@ -1,8 +1,11 @@
 {
   "name": "openclaw-workbench",
   "version": "0.1.0",
-  "private": true,
-  "description": "Product runtime foundation for an OpenClaw local Agent workbench",
+  "private": false,
+  "description": "Auditable local runtime foundation for OpenClaw with approval-gated patch and terminal execution",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/xli498/openclaw-workbench.git" },
+  "homepage": "https://github.com/xli498/openclaw-workbench",
   "main": "./runtime/index.mjs",
   "exports": {
     ".": "./runtime/index.mjs",

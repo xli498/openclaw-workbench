@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -35,6 +35,20 @@ export function verifyAuditChain(records) {
 export async function createFileAuditLog({ filePath, clock = () => new Date() } = {}) {
   if (!filePath || path.isAbsolute(filePath) === false && filePath.includes('..')) throw new Error('audit_invalid_path');
   await mkdir(path.dirname(filePath), { recursive: true });
+  const lockPath = `${filePath}.lock`;
+  async function withLock(operation) {
+    let acquired = false;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      try { await mkdir(lockPath); acquired = true; break; }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    if (!acquired) throw new Error('audit_lock_timeout');
+    try { return await operation(); }
+    finally { await rm(lockPath, { recursive: true, force: true }); }
+  }
   let previousHash = 'GENESIS';
   try {
     const content = await readFile(filePath, 'utf8');
@@ -44,13 +58,20 @@ export async function createFileAuditLog({ filePath, clock = () => new Date() } 
   return Object.freeze({
     async append(event) {
       if (!event || !event.type || !event.actor) throw new Error('audit_event_requires_type_and_actor');
-      const timestamp = clock().toISOString();
-      const record = { id: `${timestamp}-${Date.now()}`, timestamp, ...event, previousHash };
-      const recordHash = createHash('sha256').update(JSON.stringify(record)).digest('hex');
-      const persisted = Object.freeze({ ...record, recordHash });
-      await appendFile(filePath, `${JSON.stringify(persisted)}\n`, { encoding: 'utf8', flag: 'a' });
-      previousHash = recordHash;
-      return persisted;
+      return withLock(async () => {
+        let currentPreviousHash = 'GENESIS';
+        try {
+          const lines = (await readFile(filePath, 'utf8')).split('\n').filter(Boolean);
+          if (lines.length) currentPreviousHash = JSON.parse(lines.at(-1)).recordHash;
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        const timestamp = clock().toISOString();
+        const record = { id: `${timestamp}-${Date.now()}`, timestamp, ...event, previousHash: currentPreviousHash };
+        const recordHash = createHash('sha256').update(JSON.stringify(record)).digest('hex');
+        const persisted = Object.freeze({ ...record, recordHash });
+        await appendFile(filePath, `${JSON.stringify(persisted)}\n`, { encoding: 'utf8', flag: 'a' });
+        previousHash = recordHash;
+        return persisted;
+      });
     },
     async list() {
       try { return (await readFile(filePath, 'utf8')).split('\n').filter(Boolean).map((line) => Object.freeze(JSON.parse(line))); }

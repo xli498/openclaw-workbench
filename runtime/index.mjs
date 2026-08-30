@@ -3,7 +3,7 @@ import { scanStartupRecovery } from './startup-recovery.mjs';
 export { createPatchProposal, approveAndApplyPatch, createCommandProposal, approveAndRunCommand, WorkflowError } from './workflow.mjs';
 export { classifyCommand, COMMAND_CLASSES } from './policy.mjs';
 export { runControlledCommand, TerminalError } from './terminal.mjs';
-export { claimCommandAction, scanCommandLedger } from './command-ledger.mjs';
+export { claimCommandAction, scanCommandLedger, updateCommandAction } from './command-ledger.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {
   if (!root) throw new Error('root is required');

@@ -4,7 +4,7 @@ import { classifyCommand, decide } from './policy.mjs';
 import { actionHash, createAction, transition } from './action.mjs';
 import { applyPatchTransaction, TransactionError } from './change-transaction.mjs';
 import { runControlledCommand, validateCommandLimits } from './terminal.mjs';
-import { claimCommandAction } from './command-ledger.mjs';
+import { claimCommandAction, updateCommandAction } from './command-ledger.mjs';
 
 export class WorkflowError extends Error {
   constructor(code, message, details = {}) { super(message); this.name = 'WorkflowError'; this.code = code; this.details = details; }
@@ -89,14 +89,17 @@ export async function approveAndRunCommand({ proposal, root = proposal?.root, ap
   const approvedAction = transition(action, 'approved', { expectedHash: expectedActionHash, currentWorkspaceRevision: action.workspaceRevision });
   if (audit) await audit.append({ type: 'command.approved', actor: 'user', actionId: approvedAction.id, sessionId: approvedAction.sessionId, actionHash: approvedAction.actionHash, policy: commandPolicy });
   const executing = transition(approvedAction, 'executing');
+  await updateCommandAction({ root, actionHash: action.actionHash, status: 'executing' });
   try {
     const result = await runControlledCommand({ root, ...proposal.command, approved: true, signal });
     const verified = transition(executing, 'verified');
+    await updateCommandAction({ root, actionHash: action.actionHash, status: 'verified', result: { code: result.code, cwd: result.cwd } });
     if (audit) await audit.append({ type: 'command.verified', actor: 'system', actionId: verified.id });
     return Object.freeze({ action: verified, result });
   } catch (error) {
     const terminalStatus = error.code === 'TIMEOUT' ? 'timed_out' : error.code === 'ABORTED' ? 'cancelled' : 'failed';
     const failed = transition(executing, terminalStatus);
+    await updateCommandAction({ root, actionHash: action.actionHash, status: terminalStatus, error: { code: error.code, message: error.message } });
     if (audit) await audit.append({ type: 'command.failed', actor: 'system', actionId: failed.id, code: error.code });
     throw new WorkflowError(error.code ?? 'COMMAND_FAILED', error.message, { cause: error, action: failed });
   }

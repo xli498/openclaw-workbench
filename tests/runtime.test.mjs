@@ -92,3 +92,13 @@ test('审计日志追加后不可通过 list 结果反向修改内部状态', ()
   copy.length = 0;
   assert.equal(log.list().length, 1);
 });
+
+test('文件审计日志并发追加保持单一哈希链', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'ocw-audit-concurrent-'));
+  const filePath = path.join(dir, 'audit.jsonl');
+  const logs = await Promise.all(Array.from({ length: 8 }, () => createFileAuditLog({ filePath })));
+  await Promise.all(logs.map((log, index) => log.append({ type: 'concurrent.test', actor: `worker-${index}` })));
+  const records = await logs[0].list();
+  assert.equal(records.length, 8);
+  assert.equal(verifyAuditChain(records), true);
+});
