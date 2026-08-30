@@ -67,6 +67,19 @@ test('事件游标和页面大小只接受安全的十进制整数', async () =>
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('事件游标和页面大小拒绝重复查询参数', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-event-duplicates-'));
+  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await app.listen();
+  try {
+    for (const query of ['after=0&after=1', 'limit=10&limit=20', 'after=0&limit=10&after=0']) {
+      const response = await request(address, `/v1/events?${query}`);
+      assert.equal(response.status, 400, query);
+      assert.equal(response.body.error, 'DUPLICATE_QUERY_PARAMETER');
+    }
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('写接口只接受 JSON 对象请求体，不把原始 JSON 值传入运行时', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-body-shape-'));
   const app = createWorkbenchServer({ root, token: 'test-token' });

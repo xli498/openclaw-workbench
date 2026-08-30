@@ -100,7 +100,7 @@ Content-Type: application/json
 
 `X-Request-Id` 仅接受 1—128 个 ASCII 字符：首位为字母数字，后续仅允许字母数字、`.`、`_`、`:`、`-`。不满足格式的值会被服务端 UUID 替换；未经限制的请求头值不会进入响应头、事件数据或本地快照。
 
-事件查询的 `after` 与 `limit` 只接受安全范围内、无前导零的十进制整数；空白、十六进制、科学计数法、小数、前导零与超出 JavaScript 安全整数范围的值都会以 `INVALID_QUERY_INTEGER` 拒绝。
+事件查询的 `after` 与 `limit` 只接受安全范围内、无前导零的十进制整数；空白、十六进制、科学计数法、小数、前导零与超出 JavaScript 安全整数范围的值都会以 `INVALID_QUERY_INTEGER` 拒绝。任一参数重复出现会以 `DUPLICATE_QUERY_PARAMETER` 拒绝，服务端不会静默选择第一个或最后一个值。
 
 所有写接口的请求体必须是 JSON 对象。数组、`null`、字符串、数字和布尔值会以 `INVALID_BODY` 拒绝；格式非法的 JSON 以 `INVALID_JSON` 拒绝，不会进入会话、提案或执行参数。
 
