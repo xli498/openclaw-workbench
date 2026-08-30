@@ -73,6 +73,8 @@ Content-Type: application/json
 
 本地事件快照位于 `.openclaw-workbench/events.json`，按 `sequence` 保存并原子更新。重启后，已恢复事件会带 `recovered: true`，`GET /v1/events` 响应也会带 `recovered: true`；这表示它们是历史审计记录，不能被 UI 当作本进程的实时执行流。新发布事件保持递增 sequence，但不带该标记。事件 API 仍是 Bearer 鉴权的只读轮询接口，未开放 SSE 或 WebSocket。
 
+`GET /v1/status` 还会提供不含消息、命令、Patch、会话 ID 或提案内容的 `persistedState` 汇总：会话的总数/活跃/关闭/人工复核/中断回合计数，提案的总数/人工复核/终态计数，以及事件是否来自恢复和最新 sequence。该摘要仅用于本地操作者识别重启后待处理状态；它不构成恢复、审批或执行入口。
+
 ## Plan 多模型复核
 
 ```http
@@ -86,4 +88,4 @@ Content-Type: application/json
 
 ## 当前实现边界
 
-本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验和 Plan 多模型分歧标记；Code 的结构化工具编排、会话持久化和 Gateway WebSocket Adapter 属于后续垂直切片，不能从当前接口声明中推断已实现。
+本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复。仍不包含 Gateway WebSocket Adapter、OpenClaw channel 生命周期接入、MCP 管理、桌面 UI 或公网 Bridge；不能从本地 HTTP 接口推断这些能力已实现。

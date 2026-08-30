@@ -58,7 +58,7 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
       if (!requireToken(request, token)) return json(response, 401, { error: 'UNAUTHORIZED', message: 'bearer token required' });
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: Number(url.searchParams.get('after') ?? 0), limit: Number(url.searchParams.get('limit') ?? 100) }));
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
-      if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startWorkbench({ root, audit })), root });
+      if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startWorkbench({ root, audit })), root, persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
       if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }
       const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
       if (request.method === 'GET' && sessionMessages) return json(response, 200, { messages: sessions.listMessages(sessionMessages[1]) });

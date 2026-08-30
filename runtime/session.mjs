@@ -126,5 +126,10 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     return publicSession(session);
   }
 
-  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), sendMessage, planReview, listMessages, closeSession, reviewSession, snapshotPath: storePath });
+  function recoverySummary() {
+    const values = [...sessions.values()];
+    return Object.freeze({ total: values.length, active: values.filter((session) => session.status === 'active').length, closed: values.filter((session) => session.status === 'closed').length, manualReview: values.filter((session) => session.status === 'manual_review').length, interruptedTurns: values.filter((session) => session.recoveryReason === 'interrupted_turn').length });
+  }
+
+  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), sendMessage, planReview, listMessages, closeSession, reviewSession, recoverySummary, snapshotPath: storePath });
 }

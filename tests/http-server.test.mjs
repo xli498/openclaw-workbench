@@ -141,3 +141,21 @@ test('重启后事件 API 把历史事件标记为 recovered，且维持全局 s
     assert.equal(events.body.events[0].sequence, 1);
   } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('状态 API 汇总重启恢复状态，不暴露会话或提案内容', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-status-recovery-'));
+  try {
+    await mkdir(path.join(root, '.openclaw-workbench'));
+    await writeFile(path.join(root, '.openclaw-workbench', 'sessions.json'), JSON.stringify({ version: 1, sessions: [{ id: 'manual', workspaceId: root, mode: 'Code', actor: 'user', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', messages: [], running: true }] }));
+    const app = createWorkbenchServer({ root, token: 'test-token' });
+    const address = await app.listen();
+    const status = await request(address, '/v1/status');
+    assert.equal(status.status, 200);
+    assert.deepEqual(status.body.persistedState.sessions, { total: 1, active: 0, closed: 0, manualReview: 1, interruptedTurns: 1 });
+    assert.deepEqual(status.body.persistedState.proposals, { total: 0, manualReview: 0, terminal: 0 });
+    assert.equal(status.body.persistedState.events.recovered, false);
+    assert.equal(JSON.stringify(status.body.persistedState).includes('"id"'), false);
+    assert.equal(JSON.stringify(status.body.persistedState).includes('"messages"'), false);
+    await app.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -60,5 +60,9 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
     return publicRecord(records.get(id));
   }
   function get(id) { return records.has(id) ? publicRecord(records.get(id)) : null; }
-  return Object.freeze({ put, markTerminal, get, snapshotPath: storePath });
+  function recoverySummary() {
+    const values = [...records.values()];
+    return Object.freeze({ total: values.length, manualReview: values.filter((record) => record.recovery?.state === 'manual_review').length, terminal: values.filter((record) => TERMINAL.has(record.proposal.action.status)).length });
+  }
+  return Object.freeze({ put, markTerminal, get, recoverySummary, snapshotPath: storePath });
 }
