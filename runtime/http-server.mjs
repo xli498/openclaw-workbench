@@ -2,6 +2,7 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { startWorkbench } from './index.mjs';
 import { createPatchProposal, approveAndApplyPatch, createCommandProposal, approveAndRunCommand, WorkflowError } from './workflow.mjs';
+import { createChatSessionManager, SessionError } from './session.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -25,6 +26,7 @@ async function bodyOf(request) {
 
 function errorResponse(error) {
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: { error: error.code, message: error.message, details: error.details } };
+  if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: { error: error.code, message: error.message, details: error.details } };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
 }
 
@@ -37,9 +39,10 @@ function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
-export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0 } = {}) {
+export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0, runAgentFn } = {}) {
   if (!root) throw new Error('root is required');
   const proposals = new Map();
+  const sessions = createChatSessionManager({ root, runAgentFn });
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
     const requestId = request.headers['x-request-id'] ?? randomUUID();
@@ -48,6 +51,12 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
       if (!requireToken(request, token)) return json(response, 401, { error: 'UNAUTHORIZED', message: 'bearer token required' });
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startWorkbench({ root, audit })), root });
+      if (request.method === 'POST' && url.pathname === '/v1/sessions') return json(response, 201, { session: sessions.createSession(await bodyOf(request)) });
+      const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
+      if (request.method === 'GET' && sessionMessages) return json(response, 200, { messages: sessions.listMessages(sessionMessages[1]) });
+      if (request.method === 'POST' && sessionMessages) return json(response, 200, await sessions.sendMessage({ sessionId: sessionMessages[1], ...await bodyOf(request) }));
+      const sessionClose = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/close$/);
+      if (request.method === 'POST' && sessionClose) return json(response, 200, { session: sessions.closeSession(sessionClose[1]) });
       if (request.method === 'POST' && url.pathname === '/v1/proposals/patch') {
         const input = await bodyOf(request);
         const proposal = await createPatchProposal({ ...input, root, audit });
