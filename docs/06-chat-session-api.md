@@ -32,6 +32,17 @@ Content-Type: application/json
 - `Code` 模式不会绕过 Patch 审批；文件修改必须走已有的 `createPatchProposal` → `approveAndApplyPatch`。
 - 当前不实现公网 Bridge、MCP Server 管理或自动修改 OpenClaw 配置。
 
+## Plan 多模型复核
+
+```http
+POST /v1/sessions/:id/plan
+Content-Type: application/json
+
+{"question":"请设计只读审计方案","models":["model-a","model-b"]}
+```
+
+该接口只能用于 `Plan` 会话。它并行调用 2—4 个独立模型，要求每路返回可用文本，并按回答摘要哈希标记 `full` 或 `partial` agreement。出现模型失败或回答分歧时，结果会设置 `requiresHumanReview: true`；它不会创建 Patch、运行 Terminal，也不会自动执行任何建议。
+
 ## 当前实现边界
 
-本版已完成会话管理、消息调用、忙状态、防半轮残留和三模式校验；Plan 的多模型博弈、Code 的结构化工具编排、会话持久化和 Gateway WebSocket Adapter 属于后续垂直切片，不能从当前接口声明中推断已实现。
+本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验和 Plan 多模型分歧标记；Code 的结构化工具编排、会话持久化和 Gateway WebSocket Adapter 属于后续垂直切片，不能从当前接口声明中推断已实现。

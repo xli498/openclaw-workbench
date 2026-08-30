@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { runAgent } from './openclaw-adapter.mjs';
+import { runPlanReview, PlanError } from './plan.mjs';
 
 export const CHAT_MODES = Object.freeze(['Ask', 'Plan', 'Code']);
 const MAX_MESSAGE_LENGTH = 32 * 1024;
@@ -53,6 +54,17 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     } finally { session.running = false; }
   }
 
+  async function planReview({ sessionId, question, models, thinking, timeoutSeconds } = {}) {
+    const session = getSession(sessionId);
+    if (session.status !== 'active') throw new SessionError('SESSION_NOT_ACTIVE', 'session is not active');
+    if (session.mode !== 'Plan') throw new SessionError('MODE_INSUFFICIENT', 'plan review requires a Plan session');
+    if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
+    session.running = true;
+    try { return await runPlanReview({ question, models, sessionKey: session.id, thinking, timeoutSeconds }); }
+    catch (error) { if (error instanceof PlanError) throw error; throw error; }
+    finally { session.running = false; }
+  }
+
   function listMessages(sessionId) {
     const session = getSession(sessionId);
     return Object.freeze(session.messages.map((message) => Object.freeze({ ...message })));
@@ -65,5 +77,5 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     return publicSession(session);
   }
 
-  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), sendMessage, listMessages, closeSession });
+  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), sendMessage, planReview, listMessages, closeSession });
 }

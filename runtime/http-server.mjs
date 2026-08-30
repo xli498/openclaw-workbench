@@ -27,6 +27,7 @@ async function bodyOf(request) {
 function errorResponse(error) {
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: { error: error.code, message: error.message, details: error.details } };
+  if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: { error: error.code, message: error.message, details: error.details } };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
 }
 
@@ -55,6 +56,8 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
       const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
       if (request.method === 'GET' && sessionMessages) return json(response, 200, { messages: sessions.listMessages(sessionMessages[1]) });
       if (request.method === 'POST' && sessionMessages) return json(response, 200, await sessions.sendMessage({ sessionId: sessionMessages[1], ...await bodyOf(request) }));
+      const sessionPlan = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/plan$/);
+      if (request.method === 'POST' && sessionPlan) return json(response, 200, await sessions.planReview({ sessionId: sessionPlan[1], ...await bodyOf(request) }));
       const sessionClose = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/close$/);
       if (request.method === 'POST' && sessionClose) return json(response, 200, { session: sessions.closeSession(sessionClose[1]) });
       if (request.method === 'POST' && url.pathname === '/v1/proposals/patch') {
