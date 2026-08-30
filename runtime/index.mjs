@@ -4,6 +4,7 @@ export { createPatchProposal, approveAndApplyPatch, createCommandProposal, appro
 export { classifyCommand, COMMAND_CLASSES } from './policy.mjs';
 export { runControlledCommand, TerminalError } from './terminal.mjs';
 export { claimCommandAction, scanCommandLedger, updateCommandAction } from './command-ledger.mjs';
+export { createWorkbenchServer } from './http-server.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {
   if (!root) throw new Error('root is required');
