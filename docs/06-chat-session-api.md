@@ -108,6 +108,10 @@ Content-Type: application/json
 
 在 POSIX 平台，Adapter 会以独立进程组启动 OpenClaw 子进程。超时、取消或输出超限时，会向整个进程组发送终止信号，而非只终止直接父进程；这避免模型调用或包装脚本留下后代进程。Windows 保持直接子进程终止行为。
 
+## 事件数据边界
+
+事件的 `data` 会在发布和快照恢复时进行 JSON 规范化、深复制和深冻结。循环引用或其他不可 JSON 序列化的数据以 `INVALID_EVENT_DATA` 拒绝；单条数据上限为 64 KiB，超限以 `EVENT_DATA_LIMIT` 拒绝。调用方后续修改原始嵌套对象不会影响已发布事件。
+
 ## 鉴权比较
 
 配置了 token 时，控制面仅接受精确的 `Authorization: Bearer <token>`。服务端对期望值和收到的认证值分别做 SHA-256 后进行恒定时间比较；前缀、后缀、认证方案或类型不匹配均按未授权处理。

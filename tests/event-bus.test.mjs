@@ -20,6 +20,17 @@ test('事件总线拒绝非法事件和游标', () => {
   assert.throws(() => bus.list({ after: -1 }), EventBusError);
 });
 
+test('事件数据会深复制冻结，拒绝不可序列化或超限内容', () => {
+  const bus = createEventBus();
+  const data = { nested: { state: 'original' } };
+  const event = bus.publish({ type: 'safe', data });
+  data.nested.state = 'mutated';
+  assert.equal(event.data.nested.state, 'original');
+  assert.equal(Object.isFrozen(event.data.nested), true);
+  assert.throws(() => bus.publish({ type: 'bad', data: { cycle: (() => { const value = {}; value.self = value; return value; })() } }), { code: 'INVALID_EVENT_DATA' });
+  assert.throws(() => bus.publish({ type: 'large', data: { value: 'x'.repeat(64 * 1024) } }), { code: 'EVENT_DATA_LIMIT' });
+});
+
 test('事件总线重启后保留顺序并将历史明确标记为 recovered', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-events-'));
   try {

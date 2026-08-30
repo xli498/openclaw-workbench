@@ -3,9 +3,29 @@ import { join } from 'node:path';
 import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 const DEFAULT_LIMIT = 500;
+const MAX_EVENT_DATA_BYTES = 64 * 1024;
 
 export class EventBusError extends Error {
   constructor(code, message) { super(message); this.name = 'EventBusError'; this.code = code; }
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const item of Object.values(value)) deepFreeze(item);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function normalizeEventData(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new EventBusError('INVALID_EVENT_DATA', 'event data must be an object');
+  let encoded;
+  try { encoded = JSON.stringify(data); }
+  catch { throw new EventBusError('INVALID_EVENT_DATA', 'event data must be JSON serializable'); }
+  if (!encoded || Buffer.byteLength(encoded) > MAX_EVENT_DATA_BYTES) throw new EventBusError('EVENT_DATA_LIMIT', `event data must not exceed ${MAX_EVENT_DATA_BYTES} bytes`);
+  const normalized = JSON.parse(encoded);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) throw new EventBusError('INVALID_EVENT_DATA', 'event data must be a JSON object');
+  return deepFreeze(normalized);
 }
 
 export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date(), root, storePath = root ? join(root, '.openclaw-workbench', 'events.json') : undefined } = {}) {
@@ -28,10 +48,11 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
       const ids = new Set();
       if (snapshot.events.length > limit) throw new Error('invalid event snapshot');
       for (const [index, event] of snapshot.events.entries()) {
-        if (!event || typeof event.id !== 'string' || !event.id || ids.has(event.id) || !Number.isInteger(event.sequence) || event.sequence < 1 || event.sequence > snapshot.sequence || (index && event.sequence <= snapshot.events[index - 1].sequence) || typeof event.type !== 'string' || !event.data || typeof event.data !== 'object') throw new Error('invalid event snapshot');
+        if (!event || typeof event.id !== 'string' || !event.id || ids.has(event.id) || !Number.isInteger(event.sequence) || event.sequence < 1 || event.sequence > snapshot.sequence || (index && event.sequence <= snapshot.events[index - 1].sequence) || typeof event.type !== 'string') throw new Error('invalid event snapshot');
+        normalizeEventData(event.data);
         ids.add(event.id);
       }
-      events.push(...snapshot.events.map((event) => Object.freeze({ ...event, data: Object.freeze({ ...event.data }), recovered: true })));
+      events.push(...snapshot.events.map((event) => Object.freeze({ ...event, data: normalizeEventData(event.data), recovered: true })));
       sequence = snapshot.sequence;
       return events.length > 0;
     } catch (error) {
@@ -41,10 +62,10 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
   const recovered = restore();
   function publish({ type, sessionId, actionId, requestId, data = {} } = {}) {
     if (typeof type !== 'string' || !type || type.length > 128) throw new EventBusError('INVALID_EVENT_TYPE', 'event type is required and must be at most 128 characters');
-    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new EventBusError('INVALID_EVENT_DATA', 'event data must be an object');
+    const normalizedData = normalizeEventData(data);
     const previousEvents = [...events];
     const previousSequence = sequence;
-    const event = Object.freeze({ id: randomUUID(), sequence: ++sequence, type, ...(sessionId ? { sessionId } : {}), ...(actionId ? { actionId } : {}), ...(requestId ? { requestId } : {}), data: Object.freeze({ ...data }), createdAt: clock().toISOString() });
+    const event = Object.freeze({ id: randomUUID(), sequence: ++sequence, type, ...(sessionId ? { sessionId } : {}), ...(actionId ? { actionId } : {}), ...(requestId ? { requestId } : {}), data: normalizedData, createdAt: clock().toISOString() });
     events.push(event);
     if (events.length > limit) events.splice(0, events.length - limit);
     try { persist(); } catch (error) { events.splice(0, events.length, ...previousEvents); sequence = previousSequence; throw error; }
