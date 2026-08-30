@@ -125,3 +125,19 @@ test('执行失败的命令提案保存终态，而不是被重启误判为待�
     assert.equal(record.body.recovery, undefined);
   } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('重启后事件 API 把历史事件标记为 recovered，且维持全局 sequence', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-events-recovery-'));
+  const first = createWorkbenchServer({ root, token: 'test-token' });
+  const firstAddress = await first.listen();
+  await request(firstAddress, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+  await first.close();
+  const second = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await second.listen();
+  try {
+    const events = await request(address, '/v1/events?after=0&limit=10');
+    assert.equal(events.body.recovered, true);
+    assert.equal(events.body.events[0].recovered, true);
+    assert.equal(events.body.events[0].sequence, 1);
+  } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
+});

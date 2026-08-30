@@ -45,7 +45,7 @@ function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
-export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0, runAgentFn, eventBus = createEventBus() } = {}) {
+export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0, runAgentFn, eventBus = createEventBus({ root }) } = {}) {
   if (!root) throw new Error('root is required');
   const proposals = new Map();
   const proposalStore = createProposalStore({ root });
