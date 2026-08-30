@@ -38,7 +38,7 @@ export function runAgent(options, { command = 'openclaw', timeoutMs = DEFAULT_TI
   const argv = buildAgentArgv(options);
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new AdapterError('ABORTED', 'Agent run aborted'));
-    const child = spawn(command, argv, { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+    const child = spawn(command, argv, { stdio: ['ignore', 'pipe', 'pipe'], shell: false, detached: process.platform !== 'win32' });
     let stdout = '';
     let stderr = '';
     let outputBytes = 0;
@@ -48,31 +48,34 @@ export function runAgent(options, { command = 'openclaw', timeoutMs = DEFAULT_TI
       outputBytes += chunk.byteLength;
       if (outputBytes > maxOutputBytes) {
         outputTruncated = true;
-        child.kill('SIGTERM');
+        terminate();
         return target;
       }
       return target + chunk.toString();
     };
     let settled = false;
-    const finish = (fn, value) => { if (!settled) { settled = true; fn(value); } };
+    const terminate = () => {
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGTERM');
+        else child.kill('SIGTERM');
+      } catch {}
+    };
+    const finish = (fn, value) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); fn(value); } };
     const timer = setTimeout(() => {
-      child.kill('SIGTERM');
+      terminate();
       finish(reject, new AdapterError('TIMEOUT', `OpenClaw agent exceeded ${timeoutMs}ms`));
     }, timeoutMs);
     const abort = () => {
-      child.kill('SIGTERM');
+      terminate();
       finish(reject, new AdapterError('ABORTED', 'Agent run aborted'));
     };
     signal?.addEventListener('abort', abort, { once: true });
     child.stdout.on('data', (chunk) => { stdout = appendOutput(stdout, chunk); });
     child.stderr.on('data', (chunk) => { stderr = appendOutput(stderr, chunk); });
     child.on('error', (error) => {
-      clearTimeout(timer);
       finish(reject, new AdapterError('SPAWN_FAILED', error.message));
     });
     child.on('close', (code, signalName) => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', abort);
       if (settled) return;
       if (outputTruncated) return finish(reject, new AdapterError('OUTPUT_LIMIT', `OpenClaw output exceeded ${maxOutputBytes} bytes`, { code, signal: signalName }));
       if (code !== 0) return finish(reject, new AdapterError('PROCESS_FAILED', `OpenClaw exited with code ${code}`, { code, signal: signalName, stderr }));

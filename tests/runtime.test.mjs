@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { decide } from '../runtime/policy.mjs';
@@ -23,6 +23,19 @@ test('Adapter 在启动前收到取消信号时不创建子进程', async () => 
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(() => runAgent({ message: 'x', agent: 'main' }, { signal: controller.signal }), (error) => error.code === 'ABORTED');
+});
+
+test('Adapter 超时会终止执行组，而不是等待其后代自然退出', { timeout: 5_000 }, async () => {
+  if (process.platform === 'win32') return;
+  const dir = await mkdtemp(path.join(tmpdir(), 'ocw-adapter-timeout-'));
+  const command = path.join(dir, 'agent-stub');
+  try {
+    await writeFile(command, '#!/bin/sh\nsleep 2 &\nwait\n');
+    await chmod(command, 0o700);
+    const startedAt = Date.now();
+    await assert.rejects(() => runAgent({ message: 'x', agent: 'main' }, { command, timeoutMs: 50 }), (error) => error instanceof AdapterError && error.code === 'TIMEOUT');
+    assert.ok(Date.now() - startedAt < 1_000);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('Ask 只能读取，Plan 不能修改，Code 修改必须审批', () => {

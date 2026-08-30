@@ -104,6 +104,10 @@ Content-Type: application/json
 
 所有写接口的请求体必须是 JSON 对象。数组、`null`、字符串、数字和布尔值会以 `INVALID_BODY` 拒绝；格式非法的 JSON 以 `INVALID_JSON` 拒绝，不会进入会话、提案或执行参数。
 
+## Adapter 进程生命周期
+
+在 POSIX 平台，Adapter 会以独立进程组启动 OpenClaw 子进程。超时、取消或输出超限时，会向整个进程组发送终止信号，而非只终止直接父进程；这避免模型调用或包装脚本留下后代进程。Windows 保持直接子进程终止行为。
+
 ## 鉴权比较
 
 配置了 token 时，控制面仅接受精确的 `Authorization: Bearer <token>`。服务端对期望值和收到的认证值分别做 SHA-256 后进行恒定时间比较；前缀、后缀、认证方案或类型不匹配均按未授权处理。
