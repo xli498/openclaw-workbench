@@ -49,6 +49,44 @@ test('读取 Git revision；非 Git 工作区返回 null', async () => {
   assert.equal(await ws.gitRevision(), null);
 });
 
+test('非 Git 工作区 revision 绑定普通内容变化并忽略内部状态和敏感文件', async () => {
+  const root = await fixture();
+  const ws = await createWorkspace(root);
+  const initial = await ws.workspaceRevision();
+  assert.match(initial, /^sha256:[a-f0-9]{64}$/);
+  await writeFile(path.join(root, 'ok.txt'), 'changed');
+  const changed = await ws.workspaceRevision();
+  assert.notEqual(changed, initial);
+  await mkdir(path.join(root, '.openclaw-workbench'));
+  await writeFile(path.join(root, '.openclaw-workbench', 'runtime.json'), 'volatile');
+  await writeFile(path.join(root, '.env'), 'SECRET=changed');
+  assert.equal(await ws.workspaceRevision(), changed);
+});
+
+test('非 Git 工作区 revision 拒绝指向工作区外的符号链接', async () => {
+  const root = await fixture();
+  const outside = await mkdtemp(path.join(tmpdir(), 'ocw-revision-outside-'));
+  await writeFile(path.join(outside, 'secret.txt'), 'outside');
+  await symlink(path.join(outside, 'secret.txt'), path.join(root, 'escape.txt'));
+  const ws = await createWorkspace(root);
+  await assert.rejects(() => ws.workspaceRevision(), (error) => error.code === 'SYMLINK_ESCAPE');
+});
+
+test('非 Git 工作区 revision 拒绝经别名读取敏感文件', async () => {
+  const root = await fixture();
+  await symlink(path.join(root, '.env'), path.join(root, 'innocent.txt'));
+  const ws = await createWorkspace(root);
+  await assert.rejects(() => ws.workspaceRevision(), (error) => error.code === 'SENSITIVE_PATH');
+});
+
+test('workspace revision 对扫描条目和字节数设置硬上限', async () => {
+  const root = await fixture();
+  const entriesLimited = await createWorkspace(root, { maxRevisionEntries: 1 });
+  await assert.rejects(() => entriesLimited.workspaceRevision(), (error) => error.code === 'REVISION_LIMIT');
+  const bytesLimited = await createWorkspace(root, { maxRevisionBytes: 2 });
+  await assert.rejects(() => bytesLimited.workspaceRevision(), (error) => error.code === 'REVISION_LIMIT');
+});
+
 test('工作区内容 revision 识别修改、新增和删除', async () => {
   const root = await fixture();
   await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
@@ -65,4 +103,23 @@ test('工作区内容 revision 识别修改、新增和删除', async () => {
   await rm(path.join(root, 'ok.txt'));
   const deleted = await ws.workspaceRevision();
   assert.notEqual(deleted, added);
+});
+
+test('Git 工作区 revision 拒绝经已跟踪别名读取敏感文件', async () => {
+  const root = await fixture();
+  await symlink(path.join(root, '.env'), path.join(root, 'alias.txt'));
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['add', 'alias.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'alias'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  const ws = await createWorkspace(root);
+  await assert.rejects(() => ws.workspaceRevision(), (error) => error.code === 'SENSITIVE_PATH');
+});
+
+test('Git 工作区 revision 同样执行条目与字节预算', async () => {
+  const root = await fixture();
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['add', 'ok.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'budget'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await assert.rejects(() => createWorkspace(root, { maxRevisionEntries: 0 }).then((ws) => ws.workspaceRevision()), (error) => error.code === 'REVISION_LIMIT');
+  await assert.rejects(() => createWorkspace(root, { maxRevisionBytes: 2 }).then((ws) => ws.workspaceRevision()), (error) => error.code === 'REVISION_LIMIT');
 });

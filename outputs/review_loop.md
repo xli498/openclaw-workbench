@@ -118,3 +118,24 @@
 - Pure Node still lacks strict fd-relative compare-and-swap rename primitives; the final hash-check-to-rename window is reduced, not eliminated.
 - Snapshot persistence queueing and terminal cwd FD execution remain separate architectural work.
 - Final state remains `WARN`.
+
+## Round 7 — 2026-08-30
+
+**Result:** WARN
+
+### Additional fix
+- Non-Git workspaces now receive a deterministic content-based `sha256:` revision instead of the constant `working-tree` sentinel.
+- The fallback revision recursively binds regular files, directory structure, and safe in-workspace symlinks while excluding sensitive paths and `.openclaw-workbench` runtime state.
+- Symlinks that resolve outside the workspace fail closed.
+- The fallback rejects aliases into sensitive/internal state and enforces bounded entry/byte budgets to avoid unbounded revision scans.
+- Independent review found and closed equivalent Git-worktree gaps: tracked aliases into sensitive state now fail closed, Git entries share the same hard budgets, and regular files are opened with `O_NOFOLLOW`, streamed only after size preflight, and checked for identity/size/mtime stability.
+
+### Residual boundary
+- The recursive Node.js fallback is still path-based and cannot provide an atomic whole-tree snapshot against a hostile concurrent writer.
+- Snapshot store locking and terminal cwd FD execution remain separate architectural work.
+
+### Independent final review
+- Result: `WARN`, with no blocking `FAIL`.
+- Confirmed closed: Git aliases into sensitive/internal state, asymmetric Git entry/byte budgets, read-before-budget allocation, final-component symlink following, and unstable-file error classification.
+- Verification: `153/153` tests passed and `git diff --check` passed.
+- Remaining non-blocking limits: millisecond `mtime` checks are best-effort rather than hostile-writer proof; extreme Git path lists may hit the bounded `execFile` buffer and fail as `GIT_UNAVAILABLE`; whole-tree revision scanning is not atomic.

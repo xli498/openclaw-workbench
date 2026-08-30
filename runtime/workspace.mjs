@@ -1,4 +1,5 @@
-import { realpath, stat, readFile } from 'node:fs/promises';
+import { lstat, open, readFile, readlink, readdir, realpath, stat } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -6,6 +7,9 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_BYTES = 1_048_576;
+const DEFAULT_MAX_REVISION_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_REVISION_ENTRIES = 100_000;
+const INTERNAL_STATE_DIRECTORY = '.openclaw-workbench';
 const DEFAULT_SENSITIVE = [
   /(^|[\\/])\.env(?:\.|$)/i,
   /(^|[\\/])\.git([\\/]|$)/i,
@@ -40,7 +44,7 @@ function assertRelative(relativePath) {
   return normalized;
 }
 
-export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSITIVE, maxReadBytes = DEFAULT_MAX_BYTES } = {}) {
+export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSITIVE, maxReadBytes = DEFAULT_MAX_BYTES, maxRevisionBytes = DEFAULT_MAX_REVISION_BYTES, maxRevisionEntries = DEFAULT_MAX_REVISION_ENTRIES } = {}) {
   const rootReal = await realpath(root).catch((error) => {
     throw new WorkspaceError('ROOT_UNAVAILABLE', `workspace root unavailable: ${error.message}`);
   });
@@ -89,6 +93,50 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
       }
     },
     async workspaceRevision() {
+      let revisionBytes = 0;
+      let revisionEntries = 0;
+      const accountEntry = (bytes = 0) => {
+        revisionEntries += 1;
+        revisionBytes += bytes;
+        if (revisionEntries > maxRevisionEntries || revisionBytes > maxRevisionBytes) {
+          throw new WorkspaceError('REVISION_LIMIT', 'workspace is too large to compute a bounded revision', { revisionEntries, revisionBytes, maxRevisionEntries, maxRevisionBytes });
+        }
+      };
+      const accountBytes = (bytes) => {
+        revisionBytes += bytes;
+        if (revisionBytes > maxRevisionBytes) {
+          throw new WorkspaceError('REVISION_LIMIT', 'workspace is too large to compute a bounded revision', { revisionEntries, revisionBytes, maxRevisionEntries, maxRevisionBytes });
+        }
+      };
+      const hashRegularFile = async (digest, filePath, expectedInfo, relativePath) => {
+        accountBytes(expectedInfo.size);
+        let handle;
+        try {
+          handle = await open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+          const opened = await handle.stat();
+          if (!opened.isFile() || opened.dev !== expectedInfo.dev || opened.ino !== expectedInfo.ino || opened.size !== expectedInfo.size) {
+            throw new WorkspaceError('REVISION_RACE', 'workspace file changed during revision scan', { path: relativePath });
+          }
+          const buffer = Buffer.allocUnsafe(64 * 1024);
+          let position = 0;
+          while (position < opened.size) {
+            const length = Math.min(buffer.length, opened.size - position);
+            const { bytesRead } = await handle.read(buffer, 0, length, position);
+            if (bytesRead === 0) throw new WorkspaceError('REVISION_RACE', 'workspace file changed during revision scan', { path: relativePath });
+            digest.update(buffer.subarray(0, bytesRead));
+            position += bytesRead;
+          }
+          const after = await handle.stat();
+          if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+            throw new WorkspaceError('REVISION_RACE', 'workspace file changed during revision scan', { path: relativePath });
+          }
+        } catch (error) {
+          if (error instanceof WorkspaceError) throw error;
+          throw new WorkspaceError('REVISION_RACE', `workspace file became unstable during revision scan: ${error.message}`, { path: relativePath });
+        } finally {
+          await handle?.close();
+        }
+      };
       try {
         const [{ stdout: head }, { stdout: tracked }, { stdout: untracked }] = await Promise.all([
           execFileAsync('/usr/bin/git', ['-C', rootReal, 'rev-parse', 'HEAD'], { timeout: 5_000, maxBuffer: 64 * 1024 }),
@@ -98,18 +146,73 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         const digest = createHash('sha256').update(head).update('\0');
         for (const relativePath of [...new Set([...tracked.split('\0'), ...untracked.split('\0')].filter(Boolean))].sort()) {
           if (isSensitive(relativePath) || relativePath === '.openclaw-workbench' || relativePath.startsWith(`.openclaw-workbench${path.sep}`)) continue;
+          accountEntry();
           const resolved = await resolveSafe(relativePath, { allowMissing: true });
+          const targetRelative = path.relative(rootReal, resolved.targetReal);
+          if (targetRelative === INTERNAL_STATE_DIRECTORY || targetRelative.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(targetRelative)) {
+            throw new WorkspaceError('SENSITIVE_PATH', 'workspace revision encountered an alias to excluded state', { path: relativePath, target: targetRelative });
+          }
           const info = await stat(resolved.targetReal).catch((error) => {
             if (error.code === 'ENOENT') return null;
             throw error;
           });
           if (!info) { digest.update(relativePath).update('\0deleted\0'); continue; }
           if (!info.isFile()) continue;
-          digest.update(relativePath).update('\0').update(await readFile(resolved.targetReal)).update('\0');
+          digest.update(relativePath).update('\0');
+          await hashRegularFile(digest, resolved.targetReal, info, relativePath);
+          digest.update('\0');
         }
         return `sha256:${digest.digest('hex')}`;
       } catch (error) {
-        if (error.code === 128 || /not a git repository/i.test(error.stderr ?? '')) return 'working-tree';
+        if (error instanceof WorkspaceError) throw error;
+        if (error.code === 128 || /not a git repository/i.test(error.stderr ?? '')) {
+          const digest = createHash('sha256').update('non-git\0');
+          const visitedDirectories = new Set();
+          const scan = async (directory, prefix = '') => {
+            const directoryReal = await realpath(directory);
+            if (visitedDirectories.has(directoryReal)) { digest.update(prefix).update('\0directory-cycle\0'); return; }
+            if (directoryReal !== rootReal && !directoryReal.startsWith(`${rootReal}${path.sep}`)) throw new WorkspaceError('SYMLINK_ESCAPE', 'workspace revision encountered a directory outside the workspace', { path: prefix });
+            visitedDirectories.add(directoryReal);
+            const entries = await readdir(directory, { withFileTypes: true });
+            for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+              const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
+              if (relativePath === INTERNAL_STATE_DIRECTORY || relativePath.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(relativePath)) continue;
+              accountEntry();
+              const absolutePath = path.join(directory, entry.name);
+              const info = await lstat(absolutePath);
+              if (info.isSymbolicLink()) {
+                const link = await readlink(absolutePath);
+                const targetReal = await realpath(absolutePath);
+                if (targetReal !== rootReal && !targetReal.startsWith(`${rootReal}${path.sep}`)) throw new WorkspaceError('SYMLINK_ESCAPE', 'workspace revision encountered a symlink outside the workspace', { path: relativePath });
+                const targetRelative = path.relative(rootReal, targetReal);
+                if (targetRelative === INTERNAL_STATE_DIRECTORY || targetRelative.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(targetRelative)) {
+                  throw new WorkspaceError('SENSITIVE_PATH', 'workspace revision encountered a symlink to excluded state', { path: relativePath, target: targetRelative });
+                }
+                digest.update(relativePath).update('\0symlink\0').update(link).update('\0');
+                const targetInfo = await stat(targetReal);
+                if (targetInfo.isFile()) {
+                  await hashRegularFile(digest, targetReal, targetInfo, relativePath);
+                  digest.update('\0');
+                }
+                else if (targetInfo.isDirectory()) await scan(targetReal, relativePath);
+              } else if (info.isDirectory()) {
+                digest.update(relativePath).update('\0directory\0');
+                await scan(absolutePath, relativePath);
+              } else if (info.isFile()) {
+                digest.update(relativePath).update('\0file\0');
+                await hashRegularFile(digest, absolutePath, info, relativePath);
+                digest.update('\0');
+              } else {
+                digest.update(relativePath).update('\0special\0');
+              }
+            }
+          };
+          await scan(rootReal);
+          return `sha256:${digest.digest('hex')}`;
+        }
+        if (['ENOENT', 'ELOOP', 'ENOTDIR', 'ESTALE'].includes(error.code)) {
+          throw new WorkspaceError('REVISION_RACE', `workspace changed during revision scan: ${error.message}`);
+        }
         throw new WorkspaceError('GIT_UNAVAILABLE', `cannot compute workspace revision: ${error.message}`);
       }
     },
