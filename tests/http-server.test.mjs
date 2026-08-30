@@ -53,6 +53,20 @@ test('本地控制面只接受受限格式的请求 ID，非法值会替换为�
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('事件游标和页面大小只接受安全的十进制整数', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-event-query-'));
+  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await app.listen();
+  try {
+    assert.equal((await request(address, '/v1/events?after=0&limit=10')).status, 200);
+    for (const query of ['after= 0&limit=10', 'after=0x10&limit=10', 'after=1e2&limit=10', 'after=1.5&limit=10', 'after=0&limit=01', 'after=9007199254740992&limit=10']) {
+      const response = await request(address, `/v1/events?${query}`);
+      assert.equal(response.status, 400, query);
+      assert.equal(response.body.error, 'INVALID_QUERY_INTEGER');
+    }
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面提供 Chat 会话并把模式绑定到 Adapter', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-chat-'));
   const calls = [];

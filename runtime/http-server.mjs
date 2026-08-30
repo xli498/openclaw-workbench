@@ -9,9 +9,26 @@ import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const DECIMAL_INTEGER_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 
 function requestIdOf(value) {
   return typeof value === 'string' && REQUEST_ID_PATTERN.test(value) ? value : randomUUID();
+}
+
+function decimalIntegerOf(value, fallback, field) {
+  if (value === null) return fallback;
+  if (!DECIMAL_INTEGER_PATTERN.test(value)) {
+    const error = new Error(`${field} must be a decimal integer`);
+    error.code = 'INVALID_QUERY_INTEGER';
+    throw error;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    const error = new Error(`${field} must be a safe integer`);
+    error.code = 'INVALID_QUERY_INTEGER';
+    throw error;
+  }
+  return parsed;
 }
 
 function json(response, status, body) {
@@ -38,7 +55,7 @@ function errorResponse(error) {
   if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error instanceof EventBusError) return { status: 400, body: { error: error.code, message: error.message } };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : 400, body: { error: error.code, message: error.message } };
-  return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
+  return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_QUERY_INTEGER' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
 }
 
 function requireToken(request, token) {
@@ -63,7 +80,7 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
     response.setHeader('x-request-id', requestId);
     try {
       if (!requireToken(request, token)) return json(response, 401, { error: 'UNAUTHORIZED', message: 'bearer token required' });
-      if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: Number(url.searchParams.get('after') ?? 0), limit: Number(url.searchParams.get('limit') ?? 100) }));
+      if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: decimalIntegerOf(url.searchParams.get('after'), 0, 'after'), limit: decimalIntegerOf(url.searchParams.get('limit'), 100, 'limit') }));
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startWorkbench({ root, audit })), root, persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
       if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }

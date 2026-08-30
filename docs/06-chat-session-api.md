@@ -100,6 +100,8 @@ Content-Type: application/json
 
 `X-Request-Id` 仅接受 1—128 个 ASCII 字符：首位为字母数字，后续仅允许字母数字、`.`、`_`、`:`、`-`。不满足格式的值会被服务端 UUID 替换；未经限制的请求头值不会进入响应头、事件数据或本地快照。
 
+事件查询的 `after` 与 `limit` 只接受安全范围内、无前导零的十进制整数；空白、十六进制、科学计数法、小数、前导零与超出 JavaScript 安全整数范围的值都会以 `INVALID_QUERY_INTEGER` 拒绝。
+
 ## 鉴权比较
 
 配置了 token 时，控制面仅接受精确的 `Authorization: Bearer <token>`。服务端对期望值和收到的认证值分别做 SHA-256 后进行恒定时间比较；前缀、后缀、认证方案或类型不匹配均按未授权处理。
