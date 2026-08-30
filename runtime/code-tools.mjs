@@ -1,4 +1,5 @@
 import { createPatchProposal, createCommandProposal, WorkflowError } from './workflow.mjs';
+import { createWorkspace } from './workspace.mjs';
 
 export const CODE_TOOLS = Object.freeze(['patch', 'command']);
 
@@ -8,6 +9,8 @@ export async function createCodeToolProposal({ mode, tool, input, root, audit } 
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new WorkflowError('INVALID_TOOL_INPUT', 'tool input must be an object');
   const sessionId = input.sessionId;
   if (!sessionId) throw new WorkflowError('SESSION_REQUIRED', 'sessionId is required');
-  if (tool === 'patch') return createPatchProposal({ ...input, root, audit, mode: 'Code' });
-  return createCommandProposal({ ...input, root, audit, mode: 'Terminal' });
+  const workspace = await createWorkspace(root);
+  const currentRevision = await workspace.workspaceRevision();
+  if (tool === 'patch') return createPatchProposal({ ...input, root, audit, mode: 'Code', currentRevision });
+  return createCommandProposal({ ...input, root, audit, mode: 'Terminal', currentRevision });
 }

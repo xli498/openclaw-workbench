@@ -134,6 +134,15 @@ test('拒绝非法或损坏事务清单', async () => {
   await assert.rejects(() => scanPendingTransactions({ root }), (e) => e.code === 'MANIFEST_INVALID');
 });
 
+test('恢复扫描拒绝 transactions 目录符号链接', async () => {
+  const root = await fixture();
+  const stateRoot = path.join(root, '.openclaw-workbench');
+  const outside = await mkdtemp(path.join(tmpdir(), 'ocw-transactions-outside-'));
+  await mkdir(stateRoot, { recursive: true });
+  await symlink(outside, path.join(stateRoot, 'transactions'));
+  await assert.rejects(() => scanPendingTransactions({ root }), (error) => error.code === 'SCAN_FAILED');
+});
+
 test('恢复清单拒绝工作区外路径', async () => {
   const root = await fixture();
   assert.throws(() => validateTransactionManifest({ root, manifest: { transactionId: 'x', state: 'committing', files: [{ relativePath: 'a.txt', target: '/tmp/escape', snapshot: path.join(root, 'snap') }] } }), (e) => e.code === 'MANIFEST_PATH_INVALID');

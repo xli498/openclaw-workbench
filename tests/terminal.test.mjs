@@ -17,7 +17,7 @@ test('终端执行需要明确审批，并使用工作区 cwd', async () => {
 
 test('拒绝 shell 字符串、越界 cwd 和 cwd 逃逸符号链接', async () => {
   const root = await fixture();
-  await assert.rejects(() => runControlledCommand({ root, argv: ['echo hi'], approved: true }), (error) => error.code === 'SPAWN_FAILED' || error.code === 'INVALID_COMMAND');
+  await assert.rejects(() => runControlledCommand({ root, argv: ['echo hi'], approved: true }), (error) => error.code === 'SPAWN_FAILED' || error.code === 'INVALID_COMMAND' || error.code === 'EXECUTABLE_UNAVAILABLE');
   await assert.rejects(() => runControlledCommand({ root, argv: ['echo', 'x'], cwd: '../outside', approved: true }), (error) => error.code === 'PATH_ESCAPE');
 });
 
@@ -42,6 +42,14 @@ test('命令环境不接受调用方覆盖 PATH', async () => {
   const root = await fixture();
   const result = await runControlledCommand({ root, argv: ['node', '-e', 'console.log(process.env.PATH === process.argv[1])', process.env.PATH], approved: true, env: { PATH: '/untrusted/bin' } });
   assert.equal(result.stdout.trim(), 'true');
+});
+
+test('命令解析忽略调用方 PATH 中的同名可执行文件', async () => {
+  const root = await fixture();
+  const fakeBin = await mkdtemp(path.join(tmpdir(), 'ocw-fake-bin-'));
+  await writeFile(path.join(fakeBin, 'pwd'), '#!/bin/sh\necho hijacked\n', { mode: 0o755 });
+  const result = await runControlledCommand({ root, argv: ['pwd'], approved: true, env: { PATH: fakeBin } });
+  assert.equal(result.stdout.trim(), root);
 });
 
 test('命令环境不接受调用方覆盖 HOME 和 TMPDIR', async () => {

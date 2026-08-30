@@ -21,7 +21,7 @@ export async function createPatchProposal({ root, patch, sessionId, declaredPath
   const parsedPatch = parseUnifiedPatch(patch);
   validatePatchTargets(parsedPatch, declaredPaths);
   const workspace = await createWorkspace(root);
-  const actualRevision = revisionForAction(currentRevision ?? await workspace.gitRevision());
+  const actualRevision = revisionForAction(currentRevision ?? await workspace.workspaceRevision());
   if (expectedRevision !== undefined && actualRevision !== expectedRevision) throw new WorkflowError('REVISION_MISMATCH', 'workspace changed before proposal');
   const immutable = { type: 'patch', sessionId, workspaceRevision: actualRevision, target: parsedPatch.paths, preview: patch, risk: 'medium' };
   const action = createAction(immutable);
@@ -45,7 +45,7 @@ export async function approveAndApplyPatch({ proposal, root, declaredPaths, appr
   if (JSON.stringify(approvedPatch.paths) !== JSON.stringify(action.target)) {
     throw new WorkflowError('PATCH_TARGET_MISMATCH', 'patch targets do not match the approved action');
   }
-  const current = revisionForAction(currentRevision ?? (getCurrentRevision ? await getCurrentRevision() : proposal.workspaceRevision));
+  const current = revisionForAction(getCurrentRevision ? await getCurrentRevision() : (currentRevision ?? proposal.workspaceRevision));
   if (current !== action.workspaceRevision) throw new WorkflowError('REVISION_MISMATCH', 'workspace changed after approval');
   const approvedAction = transition(action, 'approved', { expectedHash: actionHash({ type: action.type, sessionId: action.sessionId, workspaceRevision: action.workspaceRevision, target: action.target, preview: action.preview, risk: action.risk },) });
   if (audit) await audit.append({ type: 'action.approved', actor: 'user', actionId: approvedAction.id, sessionId: approvedAction.sessionId, actionHash: approvedAction.actionHash });
@@ -62,13 +62,14 @@ export async function approveAndApplyPatch({ proposal, root, declaredPaths, appr
   return Object.freeze({ action: verified, transaction: result });
 }
 
-export function createCommandProposal({ root, argv, sessionId, mode = 'Terminal', cwd = '.', timeoutMs, maxOutputBytes, currentRevision = 'working-tree', audit } = {}) {
+export function createCommandProposal({ root, argv, sessionId, mode = 'Terminal', cwd = '.', timeoutMs, maxOutputBytes, currentRevision, audit } = {}) {
   if (!sessionId) throw new WorkflowError('SESSION_REQUIRED', 'sessionId is required');
   const policy = decide({ mode, actionType: 'command' });
   if (policy.reason === 'mode_insufficient') throw new WorkflowError('MODE_INSUFFICIENT', 'current mode cannot create a command proposal');
   try { validateCommandLimits({ argv, timeoutMs, maxOutputBytes }); } catch (error) { throw new WorkflowError(error.code, error.message, error.details); }
   const commandPolicy = classifyCommand(argv);
   if (commandPolicy.class === 'blocked') throw new WorkflowError('COMMAND_POLICY_DENIED', `command is blocked by policy: ${commandPolicy.command ?? 'invalid'}`, { commandPolicy });
+  if (typeof currentRevision !== 'string' || !currentRevision) throw new WorkflowError('CURRENT_REVISION_REQUIRED', 'command proposal requires a server-computed workspace revision');
   const preview = Object.freeze({ argv: [...argv], cwd, ...(timeoutMs === undefined ? {} : { timeoutMs }), ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }) });
   const actionPreview = Object.freeze({ ...preview, policy: commandPolicy });
   const action = transition(transition(createAction({ type: 'command', sessionId, workspaceRevision: revisionForAction(currentRevision), target: cwd, preview: actionPreview, risk: 'high' }), 'inspected'), 'awaiting_approval');
@@ -76,12 +77,13 @@ export function createCommandProposal({ root, argv, sessionId, mode = 'Terminal'
   return Object.freeze({ action, command: preview, workspaceRevision: revisionForAction(currentRevision), policy, commandPolicy, root });
 }
 
-export async function approveAndRunCommand({ proposal, root = proposal?.root, approved = false, audit, currentRevision = proposal?.workspaceRevision, signal } = {}) {
+export async function approveAndRunCommand({ proposal, root = proposal?.root, approved = false, audit, currentRevision, getCurrentRevision, signal } = {}) {
   if (!proposal?.action || !proposal?.command) throw new WorkflowError('PROPOSAL_INVALID', 'command proposal is required');
   if (!approved) throw new WorkflowError('APPROVAL_REQUIRED', 'terminal execution requires explicit approval');
   const action = proposal.action;
   try { validateCommandLimits(proposal.command); } catch (error) { throw new WorkflowError(error.code, error.message, error.details); }
-  if (revisionForAction(currentRevision) !== action.workspaceRevision) throw new WorkflowError('REVISION_MISMATCH', 'workspace changed after approval');
+  const actualRevision = revisionForAction(getCurrentRevision ? await getCurrentRevision() : (currentRevision ?? await (await createWorkspace(root)).workspaceRevision()));
+  if (actualRevision !== action.workspaceRevision) throw new WorkflowError('REVISION_MISMATCH', 'workspace changed after approval');
   const commandPolicy = classifyCommand(proposal.command.argv);
   if (commandPolicy.class === 'blocked') throw new WorkflowError('COMMAND_POLICY_DENIED', `command is blocked by policy: ${commandPolicy.command ?? 'invalid'}`, { commandPolicy });
   if (proposal.commandPolicy && JSON.stringify(proposal.commandPolicy) !== JSON.stringify(commandPolicy)) throw new WorkflowError('COMMAND_POLICY_CHANGED', 'command policy changed after proposal', { proposed: proposal.commandPolicy, current: commandPolicy });

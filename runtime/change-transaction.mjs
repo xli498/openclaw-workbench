@@ -49,15 +49,65 @@ async function writeManifest(filePath, manifest) {
   await rename(temp, filePath);
 }
 
-async function restoreFileAtomically(target, content) {
+async function restoreFileAtomically(root, target, content) {
   const temp = `${target}.ocw-rollback-${randomUUID()}.tmp`;
   try {
     await writeFile(temp, content, { flag: 'wx' });
-    await rename(temp, target);
+    await replaceWithinStableParent({ root, source: temp, target, expectedSourceHash: digest(content), expectedAfterHash: digest(content) });
   } catch (error) {
     await unlink(temp).catch(() => {});
     throw error;
   }
+}
+
+async function readStableRegular(filePath, label) {
+  let handle;
+  try {
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await handle.stat();
+    if (!info.isFile()) throw new TransactionError('TARGET_CHANGED', `${label} is not a regular file`);
+    return await handle.readFile();
+  } catch (error) {
+    if (error instanceof TransactionError) throw error;
+    throw new TransactionError('TARGET_CHANGED', `${label} changed: ${error.message}`);
+  } finally { await handle?.close().catch(() => {}); }
+}
+
+export async function openStableParent(root, candidate) {
+  const base = await realpath(root).catch((error) => { throw new TransactionError('ROOT_UNAVAILABLE', error.message); });
+  const candidatePath = path.resolve(candidate);
+  const parentPath = path.dirname(candidatePath);
+  if (parentPath !== base && !parentPath.startsWith(`${base}${path.sep}`)) throw new TransactionError('PATH_ESCAPE', candidatePath);
+  const parentReal = await realpath(parentPath).catch((error) => { throw new TransactionError('TARGET_PARENT_UNAVAILABLE', error.message); });
+  if (parentReal !== parentPath || (parentReal !== base && !parentReal.startsWith(`${base}${path.sep}`))) throw new TransactionError('TARGET_PARENT_CHANGED', candidatePath);
+  const directory = await open(parentPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+    .catch((error) => { throw new TransactionError('STABLE_DIRECTORY_UNAVAILABLE', error.message); });
+  try {
+    const stableParent = `/proc/self/fd/${directory.fd}`;
+    const openedParentReal = await realpath(stableParent).catch((error) => { throw new TransactionError('STABLE_DIRECTORY_UNAVAILABLE', error.message); });
+    if (openedParentReal !== parentReal) throw new TransactionError('TARGET_PARENT_CHANGED', candidatePath);
+    return { directory, stableParent, candidatePath, stablePath: path.join(stableParent, path.basename(candidatePath)) };
+  } catch (error) {
+    await directory.close().catch(() => {});
+    throw error;
+  }
+}
+
+export async function replaceWithinStableParent({ root, source, target, renameFile = rename, expectedSourceHash, expectedTargetHash, expectedAfterHash } = {}) {
+  const sourcePath = path.resolve(source);
+  const targetPath = path.resolve(target);
+  const parentPath = path.dirname(targetPath);
+  if (path.dirname(sourcePath) !== parentPath) throw new TransactionError('PATH_ESCAPE', 'atomic replacement must stay in one workspace directory');
+  let stable;
+  try {
+    stable = await openStableParent(root, targetPath);
+    const stableSource = path.join(stable.stableParent, path.basename(sourcePath));
+    const stableTarget = stable.stablePath;
+    if (expectedSourceHash !== undefined && digest(await readStableRegular(stableSource, 'replacement source')) !== expectedSourceHash) throw new TransactionError('SOURCE_CHANGED', 'replacement source changed before commit');
+    if (expectedTargetHash !== undefined && digest(await readStableRegular(stableTarget, 'replacement target')) !== expectedTargetHash) throw new TransactionError('TARGET_CHANGED', 'replacement target changed before commit');
+    await renameFile(stableSource, stableTarget);
+    if (expectedAfterHash !== undefined && digest(await readStableRegular(stableTarget, 'committed target')) !== expectedAfterHash) throw new TransactionError('POST_VERIFY_FAILED', 'committed content hash mismatch', { replaced: true });
+  } finally { await stable?.directory.close().catch(() => {}); }
 }
 
 export async function acquireWorkspaceWriteLock(root, { staleAfterMs = 10 * 60 * 1000, now = Date.now(), isProcessAlive = defaultProcessAlive } = {}) {
@@ -163,16 +213,21 @@ export async function applyPatchTransaction({ root, parsedPatch, declaredPaths, 
     if (audit) await audit.append({ type: 'transaction.committing', actor: 'system', transactionId, files: manifestFiles().map((file) => file.relativePath) });
     const committed = [];
     try {
-      for (const item of staged) { await renameFile(item.temp, item.target); committed.push(item); }
       for (const item of staged) {
-        const committedContent = await readFile(item.target);
-        if (digest(committedContent) !== item.afterHash) throw new TransactionError('POST_VERIFY_FAILED', 'committed content hash mismatch', { path: item.relativePath });
+        const snap = snapshots.find((snapshot) => snapshot.target === item.target);
+        try {
+          await replaceWithinStableParent({ root: base, source: item.temp, target: item.target, renameFile, expectedSourceHash: item.afterHash, expectedTargetHash: snap.beforeHash, expectedAfterHash: item.afterHash });
+          committed.push(item);
+        } catch (error) {
+          if (error.details?.replaced) committed.push(item);
+          throw error;
+        }
       }
     } catch (error) {
       const rollbackErrors = [];
       for (const item of committed) {
         const snap = snapshots.find((s) => s.target === item.target);
-        try { await restoreFileAtomically(item.target, snap.before); } catch (rollbackError) { rollbackErrors.push({ path: item.relativePath, error: rollbackError.message }); }
+        try { await restoreFileAtomically(base, item.target, snap.before); } catch (rollbackError) { rollbackErrors.push({ path: item.relativePath, error: rollbackError.message }); }
       }
       const rollbackState = rollbackErrors.length ? 'rollback_partial' : 'rolled_back';
       await writeManifest(manifestPath, { transactionId, state: rollbackState, files: manifestFiles(), rollbackErrors });

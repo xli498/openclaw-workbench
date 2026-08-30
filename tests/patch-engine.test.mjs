@@ -25,6 +25,12 @@ test('拒绝路径穿越、重复文件和没有 hunk 的 patch', () => {
   assert.throws(() => parseUnifiedPatch('--- a/a.txt\n+++ b/a.txt\n'), (e) => e.code === 'PATCH_NO_HUNKS');
 });
 
+test('拒绝修改工作区敏感文件', () => {
+  for (const target of ['.env', 'nested/.env.local', '.git/config', 'credentials.json', 'keys/id_rsa', 'server.pem']) {
+    assert.throws(() => parseUnifiedPatch(`--- a/${target}\n+++ b/${target}\n@@ -1 +1 @@\n-old\n+new\n`), (e) => e.code === 'PATCH_SENSITIVE_PATH', target);
+  }
+});
+
 test('拒绝 hunk 行数与 header 不一致', () => {
   assert.throws(() => parseUnifiedPatch('--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,1 @@\n-old\n+new\n'), (e) => e.code === 'HUNK_COUNT_MISMATCH');
 });

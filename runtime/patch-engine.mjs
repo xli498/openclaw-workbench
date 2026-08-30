@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isSensitiveWorkspacePath } from './workspace.mjs';
 
 export class PatchError extends Error {
   constructor(code, message, details = {}) {
@@ -14,6 +15,9 @@ const hash = (value) => createHash('sha256').update(value).digest('hex');
 function pathCheck(filePath) {
   if (typeof filePath !== 'string' || !filePath || filePath.startsWith('/') || filePath.includes('\\') || filePath.split('/').includes('..')) {
     throw new PatchError('PATCH_PATH_INVALID', `invalid patch path: ${filePath}`);
+  }
+  if (isSensitiveWorkspacePath(filePath)) {
+    throw new PatchError('PATCH_SENSITIVE_PATH', `patch target is sensitive: ${filePath}`);
   }
   return filePath;
 }

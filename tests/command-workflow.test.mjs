@@ -10,6 +10,7 @@ async function fixture() { return mkdtemp(path.join(tmpdir(), 'ocw-command-workf
 test('命令提案必须处于 Terminal 模式并经明确审批', async () => {
   const root = await fixture();
   assert.throws(() => createCommandProposal({ root, argv: ['echo', 'ok'], sessionId: 's', mode: 'Code' }), (error) => error.code === 'MODE_INSUFFICIENT');
+  assert.throws(() => createCommandProposal({ root, argv: ['pwd'], sessionId: 's' }), (error) => error.code === 'CURRENT_REVISION_REQUIRED');
   const proposal = createCommandProposal({ root, argv: ['pwd'], sessionId: 's', currentRevision: 'r1' });
   await assert.rejects(() => approveAndRunCommand({ proposal, root, currentRevision: 'r1' }), (error) => error.code === 'APPROVAL_REQUIRED');
   assert.throws(() => createCommandProposal({ root, argv: ['echo', 'ok'], sessionId: 's', timeoutMs: 600001 }), (error) => error.code === 'INVALID_TIMEOUT');
@@ -30,7 +31,7 @@ test('审批后执行命令并进入 verified', async () => {
 test('命令失败、超时和取消会返回带终态 action 的错误', async () => {
   const root = await fixture();
   const make = (argv, extra = {}) => createCommandProposal({ root, argv, sessionId: Math.random().toString(), currentRevision: 'r1', ...extra });
-  await assert.rejects(() => approveAndRunCommand({ proposal: make(['git', 'status', '--bad-option']), root, approved: true, currentRevision: 'r1' }), (error) => error instanceof WorkflowError && error.code === 'PROCESS_FAILED' && error.details.action.status === 'failed');
+  await assert.rejects(() => approveAndRunCommand({ proposal: make(['git', 'rev-parse', 'HEAD']), root, approved: true, currentRevision: 'r1' }), (error) => error instanceof WorkflowError && error.code === 'PROCESS_FAILED' && error.details.action.status === 'failed');
   const controller = new AbortController();
   const pending = approveAndRunCommand({ proposal: make(['pwd']), root, approved: true, currentRevision: 'r1', signal: controller.signal });
   controller.abort();

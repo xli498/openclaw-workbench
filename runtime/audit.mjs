@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
-import { mkdir, open, readFile, realpath, rm } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 export function createAuditLog({ clock = () => new Date() } = {}) {
   const events = [];
@@ -67,16 +67,45 @@ export async function createFileAuditLog({ root, filePath, clock = () => new Dat
   const lockPath = `${safePath}.lock`;
   async function withLock(operation) {
     let acquired = false;
+    let token;
     for (let attempt = 0; attempt < 200; attempt += 1) {
-      try { await mkdir(lockPath); acquired = true; break; }
+      try {
+        await mkdir(lockPath);
+        token = randomUUID();
+        try {
+          await writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), { flag: 'wx', mode: 0o600 });
+        } catch (error) {
+          await rm(lockPath, { recursive: true, force: true });
+          throw error;
+        }
+        acquired = true;
+        break;
+      }
       catch (error) {
         if (error.code !== 'EEXIST') throw error;
+        try {
+          const owner = JSON.parse(await readFile(path.join(lockPath, 'owner.json'), 'utf8'));
+          const expired = Number.isFinite(owner.createdAt) && Date.now() - owner.createdAt >= 60_000;
+          let alive = true;
+          if (Number.isInteger(owner.pid)) { try { process.kill(owner.pid, 0); } catch (checkError) { alive = checkError.code === 'EPERM'; } }
+          if (expired && !alive) {
+            const quarantine = `${lockPath}.stale-${randomUUID()}`;
+            await rename(lockPath, quarantine);
+            await rm(quarantine, { recursive: true, force: true });
+            continue;
+          }
+        } catch (lockError) { if (lockError.code === 'ENOENT') continue; }
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
     }
     if (!acquired) throw new Error('audit_lock_timeout');
     try { return await operation(); }
-    finally { await rm(lockPath, { recursive: true, force: true }); }
+    finally {
+      try {
+        const owner = JSON.parse(await readFile(path.join(lockPath, 'owner.json'), 'utf8'));
+        if (owner.token === token) await rm(lockPath, { recursive: true, force: true });
+      } catch { /* never remove a lock whose ownership cannot be proven */ }
+    }
   }
   let previousHash = 'GENESIS';
   try {

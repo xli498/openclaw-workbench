@@ -8,6 +8,7 @@ import path from 'node:path';
 
 test('命令策略只允许明确列出的只读命令', () => {
   assert.equal(classifyCommand(['git', 'status']).class, 'readonly');
+  assert.equal(classifyCommand(['git', 'status', '--porcelain']).class, 'readonly');
   assert.equal(classifyCommand(['node', '--version']).reason, 'not_allowlisted');
   assert.equal(classifyCommand(['python3', '-c', 'print(1)']).reason, 'not_allowlisted');
   assert.equal(classifyCommand(['rm', '-rf', '.']).class, 'blocked');
@@ -15,6 +16,9 @@ test('命令策略只允许明确列出的只读命令', () => {
   assert.equal(classifyCommand(['git', 'reset', '--hard']).reason, 'destructive_git_operation');
   assert.equal(classifyCommand(['npm', 'publish']).reason, 'package_publish');
   assert.equal(classifyCommand(['node', '--version', '&&']).reason, 'shell_syntax');
+  assert.equal(classifyCommand(['/tmp/git', 'status']).reason, 'command_path_not_allowed');
+  assert.equal(classifyCommand(['git', 'show', 'HEAD:.env']).reason, 'git_arguments_not_allowlisted');
+  assert.equal(classifyCommand(['git', 'diff', '--no-index', '.env', '/etc/passwd']).reason, 'git_arguments_not_allowlisted');
 });
 
 test('明确禁止命令在提案阶段即被阻断，不能靠审批绕过', async () => {

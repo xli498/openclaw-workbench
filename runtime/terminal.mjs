@@ -10,6 +10,7 @@ const MAX_ARG_COUNT = 256;
 const MAX_ARG_BYTES = 64 * 1024;
 const MAX_SINGLE_ARG_BYTES = 16 * 1024;
 const SAFE_ENV_KEYS = new Set(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']);
+const TRUSTED_EXECUTABLE_DIRECTORIES = Object.freeze(['/usr/bin', '/bin']);
 
 export class TerminalError extends Error {
   constructor(code, message, details = {}) { super(message); this.name = 'TerminalError'; this.code = code; this.details = details; }
@@ -40,13 +41,29 @@ async function safeCwd(root, cwd) {
   return cwdReal;
 }
 
+async function resolveExecutable(command) {
+  if (command === 'node') return process.execPath;
+  if (path.isAbsolute(command)) {
+    const resolved = await realpath(command).catch((error) => { throw new TerminalError('EXECUTABLE_UNAVAILABLE', error.message); });
+    if (resolved === process.execPath || TRUSTED_EXECUTABLE_DIRECTORIES.some((directory) => resolved.startsWith(`${directory}${path.sep}`))) return resolved;
+    throw new TerminalError('EXECUTABLE_UNTRUSTED', 'executable must be in a trusted system directory');
+  }
+  if (command.includes('/') || command.includes('\\')) throw new TerminalError('EXECUTABLE_UNTRUSTED', 'executable path must not be relative');
+  for (const directory of TRUSTED_EXECUTABLE_DIRECTORIES) {
+    const resolved = await realpath(path.join(directory, command)).catch(() => null);
+    if (resolved && (resolved === process.execPath || TRUSTED_EXECUTABLE_DIRECTORIES.some((trusted) => resolved.startsWith(`${trusted}${path.sep}`)))) return resolved;
+  }
+  throw new TerminalError('EXECUTABLE_UNAVAILABLE', `trusted executable not found: ${command}`);
+}
+
 export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = DEFAULT_TIMEOUT_MS, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, signal, approved = false } = {}) {
   if (!approved) throw new TerminalError('APPROVAL_REQUIRED', 'terminal execution requires explicit approval');
   validateCommandLimits({ argv, timeoutMs, maxOutputBytes });
   const commandCwd = await safeCwd(root, cwd);
+  const executable = await resolveExecutable(argv[0]);
   if (signal?.aborted) throw new TerminalError('ABORTED', 'command aborted before start');
   return new Promise((resolve, reject) => {
-    const child = spawn(argv[0], argv.slice(1), { cwd: commandCwd, env: safeEnv(env), shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, argv.slice(1), { cwd: commandCwd, env: safeEnv(env), shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = ''; let outputBytes = 0; let settled = false; let timedOut = false; let outputLimited = false;
     const kill = () => { try { process.kill(-child.pid, 'SIGTERM'); } catch {} };
     const finish = (fn, value) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); fn(value); } };

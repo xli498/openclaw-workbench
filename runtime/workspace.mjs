@@ -1,4 +1,5 @@
 import { realpath, stat, readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -6,12 +7,18 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_BYTES = 1_048_576;
 const DEFAULT_SENSITIVE = [
-  /^\.env(?:\.|$)/i,
+  /(^|[\\/])\.env(?:\.|$)/i,
   /(^|[\\/])\.git([\\/]|$)/i,
   /(^|[\\/])id_[^/\\]+$/i,
   /\.(pem|key|p12|pfx|kdbx)$/i,
   /(^|[\\/])credentials?\.(json|ya?ml|toml)$/i,
 ];
+
+export function isSensitiveWorkspacePath(relativePath, patterns = DEFAULT_SENSITIVE) {
+  if (typeof relativePath !== 'string') return false;
+  const normalized = relativePath.replaceAll('\\', '/');
+  return patterns.some((pattern) => pattern.test(normalized));
+}
 
 export class WorkspaceError extends Error {
   constructor(code, message, details = {}) {
@@ -37,7 +44,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
   const rootReal = await realpath(root).catch((error) => {
     throw new WorkspaceError('ROOT_UNAVAILABLE', `workspace root unavailable: ${error.message}`);
   });
-  const isSensitive = (relativePath) => sensitivePatterns.some((pattern) => pattern.test(relativePath));
+  const isSensitive = (relativePath) => isSensitiveWorkspacePath(relativePath, sensitivePatterns);
   const resolveSafe = async (relativePath, { allowMissing = false } = {}) => {
     const normalized = assertRelative(relativePath);
     if (isSensitive(normalized)) throw new WorkspaceError('SENSITIVE_PATH', 'access to sensitive path is denied', { path: normalized });
@@ -79,6 +86,31 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
       } catch (error) {
         if (error.code === 128 || /not a git repository/i.test(error.stderr ?? '')) return null;
         throw new WorkspaceError('GIT_UNAVAILABLE', `cannot read git revision: ${error.message}`);
+      }
+    },
+    async workspaceRevision() {
+      try {
+        const [{ stdout: head }, { stdout: tracked }, { stdout: untracked }] = await Promise.all([
+          execFileAsync('/usr/bin/git', ['-C', rootReal, 'rev-parse', 'HEAD'], { timeout: 5_000, maxBuffer: 64 * 1024 }),
+          execFileAsync('/usr/bin/git', ['-C', rootReal, 'ls-files', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
+          execFileAsync('/usr/bin/git', ['-C', rootReal, 'ls-files', '--others', '--exclude-standard', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
+        ]);
+        const digest = createHash('sha256').update(head).update('\0');
+        for (const relativePath of [...new Set([...tracked.split('\0'), ...untracked.split('\0')].filter(Boolean))].sort()) {
+          if (isSensitive(relativePath) || relativePath === '.openclaw-workbench' || relativePath.startsWith(`.openclaw-workbench${path.sep}`)) continue;
+          const resolved = await resolveSafe(relativePath, { allowMissing: true });
+          const info = await stat(resolved.targetReal).catch((error) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          });
+          if (!info) { digest.update(relativePath).update('\0deleted\0'); continue; }
+          if (!info.isFile()) continue;
+          digest.update(relativePath).update('\0').update(await readFile(resolved.targetReal)).update('\0');
+        }
+        return `sha256:${digest.digest('hex')}`;
+      } catch (error) {
+        if (error.code === 128 || /not a git repository/i.test(error.stderr ?? '')) return 'working-tree';
+        throw new WorkspaceError('GIT_UNAVAILABLE', `cannot compute workspace revision: ${error.message}`);
       }
     },
   });

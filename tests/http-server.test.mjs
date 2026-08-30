@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
@@ -58,6 +59,27 @@ test('控制面拒绝无 token、弱 token 或非回环绑定，并要求独立�
       assert.equal(mismatch.body.error, 'ACTION_HASH_MISMATCH');
     } finally { await app.close(); }
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('审批请求不能用 currentRevision 覆盖服务端工作区版本', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-revision-binding-'));
+  await writeFile(path.join(root, 'tracked.txt'), 'before');
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['add', 'tracked.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'revision-binding', argv: ['pwd'] }) });
+    await writeFile(path.join(root, 'tracked.txt'), 'after');
+    const approval = await request(address, `/v1/proposals/${proposal.body.proposal.action.id}/approve`, {
+      method: 'POST',
+      headers: { 'x-approval-token': 'approve-token-012345' },
+      body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash, currentRevision: proposal.body.proposal.action.workspaceRevision }),
+    });
+    assert.equal(approval.status, 400);
+    assert.equal(approval.body.error, 'REVISION_MISMATCH');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test('本地控制面只接受受限格式的请求 ID，非法值会替换为服务端 UUID', async () => {
@@ -204,7 +226,7 @@ test('执行失败的命令提案保存终态，而不是被重启误判为待�
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-proposal-terminal-'));
   const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const firstAddress = await first.listen();
-  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: ['git', 'status', '--bad-option'] }) });
+  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: ['git', 'rev-parse', 'HEAD'] }) });
   const failed = await request(firstAddress, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
   assert.equal(failed.status, 400);
   await first.close();

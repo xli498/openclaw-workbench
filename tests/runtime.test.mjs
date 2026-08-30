@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { decide } from '../runtime/policy.mjs';
@@ -113,6 +113,18 @@ test('文件审计日志并发追加保持单一哈希链', async () => {
   await Promise.all(logs.map((log, index) => log.append({ type: 'concurrent.test', actor: `worker-${index}` })));
   const records = await logs[0].list();
   assert.equal(records.length, 8);
+  assert.equal(verifyAuditChain(records), true);
+});
+
+test('文件审计日志可接管已过期且进程不存在的锁', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-audit-stale-lock-'));
+  const lockPath = path.join(root, 'audit.jsonl.lock');
+  await mkdir(lockPath);
+  await writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({ pid: 999999, token: 'stale-owner-token', createdAt: Date.now() - 120_000 }));
+  const log = await createFileAuditLog({ root, filePath: 'audit.jsonl' });
+  await log.append({ type: 'stale-lock.recovered', actor: 'test' });
+  const records = await log.list();
+  assert.equal(records.length, 1);
   assert.equal(verifyAuditChain(records), true);
 });
 
