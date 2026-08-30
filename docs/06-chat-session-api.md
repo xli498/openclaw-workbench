@@ -52,6 +52,10 @@ Authorization: Bearer <token>
 
 事件读取接口仅轮询内存中的最近事件，支持递增 `sequence` 游标；默认最多保留 500 条。当前事件包括 `session.created`、`chat.completed`、`plan.completed`、`proposal.created` 和 `proposal.verified`。它是只读接口，不提供 SSE/WebSocket，不携带执行凭据，也不能批准或执行提案。
 
+## 会话安全恢复
+
+会话快照写入工作区 `.openclaw-workbench/sessions.json`，通过临时文件与原子 rename 更新。启动时只恢复历史、`active` 和 `closed` 会话；快照记录为 `running` 的会话会被降级为 `manual_review` 并标注 `interrupted_turn`，不会重新调用模型、重放消息或执行任何工具。损坏或不兼容快照将拒绝恢复，而不是猜测性修复。
+
 ## Plan 多模型复核
 
 ```http
