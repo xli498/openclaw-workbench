@@ -26,6 +26,19 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('本地控制面拒绝部分匹配和错误类型的 Bearer token', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-auth-'));
+  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await app.listen();
+  try {
+    for (const authorization of ['Bearer test-toke', 'Bearer test-token-extra', 'Basic test-token', 'Bearer ', 'test-token']) {
+      const response = await fetch(`http://${address.address}:${address.port}/health`, { headers: { authorization } });
+      assert.equal(response.status, 401, authorization);
+    }
+    assert.equal((await request(address, '/health')).status, 200);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面只接受受限格式的请求 ID，非法值会替换为服务端 UUID', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-request-id-'));
   const app = createWorkbenchServer({ root, token: 'test-token' });

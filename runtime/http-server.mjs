@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { startWorkbench } from './index.mjs';
 import { createPatchProposal, approveAndApplyPatch, createCommandProposal, approveAndRunCommand, WorkflowError } from './workflow.mjs';
 import { createChatSessionManager, SessionError } from './session.mjs';
@@ -43,7 +43,9 @@ function errorResponse(error) {
 
 function requireToken(request, token) {
   if (!token) return true;
-  return request.headers.authorization === `Bearer ${token}`;
+  const expected = createHash('sha256').update(`Bearer ${token}`).digest();
+  const received = createHash('sha256').update(request.headers.authorization ?? '').digest();
+  return timingSafeEqual(expected, received);
 }
 
 function publicProposal(proposal) {
