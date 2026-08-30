@@ -8,6 +8,11 @@ import { createEventBus, EventBusError } from './event-bus.mjs';
 import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function requestIdOf(value) {
+  return typeof value === 'string' && REQUEST_ID_PATTERN.test(value) ? value : randomUUID();
+}
 
 function json(response, status, body) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -52,7 +57,7 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
   const sessions = createChatSessionManager({ root, runAgentFn });
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
-    const requestId = request.headers['x-request-id'] ?? randomUUID();
+    const requestId = requestIdOf(request.headers['x-request-id']);
     response.setHeader('x-request-id', requestId);
     try {
       if (!requireToken(request, token)) return json(response, 401, { error: 'UNAUTHORIZED', message: 'bearer token required' });

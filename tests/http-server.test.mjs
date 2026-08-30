@@ -7,7 +7,7 @@ import { createWorkbenchServer } from '../runtime/http-server.mjs';
 
 async function request(address, pathname, options = {}) {
   const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token', ...(options.headers ?? {}) } });
-  return { status: response.status, body: await response.json() };
+  return { status: response.status, headers: response.headers, body: await response.json() };
 }
 
 test('本地控制面提供健康检查、鉴权和命令提案审批执行', async () => {
@@ -23,6 +23,20 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
     const approved = await request(address, `/v1/proposals/${proposal.body.proposal.action.id}/approve`, { method: 'POST', body: '{}' });
     assert.equal(approved.status, 200);
     assert.equal(approved.body.action.status, 'verified');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('本地控制面只接受受限格式的请求 ID，非法值会替换为服务端 UUID', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-request-id-'));
+  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await app.listen();
+  try {
+    const accepted = await request(address, '/health', { headers: { 'x-request-id': 'client.trace-01:part' } });
+    assert.equal(accepted.headers.get('x-request-id'), 'client.trace-01:part');
+    const replaced = await request(address, '/health', { headers: { 'x-request-id': 'contains space' } });
+    assert.match(replaced.headers.get('x-request-id'), /^[0-9a-f-]{36}$/);
+    const overlong = await request(address, '/health', { headers: { 'x-request-id': `x${'a'.repeat(128)}` } });
+    assert.match(overlong.headers.get('x-request-id'), /^[0-9a-f-]{36}$/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

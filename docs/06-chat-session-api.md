@@ -95,3 +95,7 @@ Content-Type: application/json
 ## 当前实现边界
 
 本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复。仍不包含 Gateway WebSocket Adapter、OpenClaw channel 生命周期接入、MCP 管理、桌面 UI 或公网 Bridge；不能从本地 HTTP 接口推断这些能力已实现。
+
+## 请求关联 ID
+
+`X-Request-Id` 仅接受 1—128 个 ASCII 字符：首位为字母数字，后续仅允许字母数字、`.`、`_`、`:`、`-`。不满足格式的值会被服务端 UUID 替换；未经限制的请求头值不会进入响应头、事件数据或本地快照。
