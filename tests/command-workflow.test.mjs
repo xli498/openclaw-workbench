@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { approveAndRunCommand, createCommandProposal, WorkflowError } from '../runtime/workflow.mjs';
@@ -43,4 +43,19 @@ test('命令 action 跨进程持久化防重放且启动不自动执行', async 
   await approveAndRunCommand({ proposal, root, approved: true, currentRevision: 'r1' });
   const freshProposal = { ...proposal, action: { ...proposal.action }, command: { ...proposal.command } };
   await assert.rejects(() => approveAndRunCommand({ proposal: freshProposal, root, approved: true, currentRevision: 'r1' }), (error) => error.code === 'COMMAND_REPLAYED');
+});
+
+test('伪造或符号链接命令账本记录不能阻断审批执行', async () => {
+  const root = await fixture();
+  const proposal = createCommandProposal({ root, argv: ['pwd'], sessionId: 'ledger-bound', currentRevision: 'r1' });
+  const directory = path.join(root, '.openclaw-workbench', 'commands');
+  await mkdir(directory, { recursive: true });
+  const file = path.join(directory, `${proposal.action.actionHash}.json`);
+  await writeFile(file, JSON.stringify({ actionId: 'forged', actionHash: proposal.action.actionHash, sessionId: 'forged', status: 'verified', command: {} }));
+  await assert.rejects(() => approveAndRunCommand({ proposal, root, approved: true, currentRevision: 'r1' }), (error) => error.code === 'COMMAND_LEDGER_FAILED');
+  await (await import('node:fs/promises')).unlink(file);
+  const outside = path.join(root, 'outside-ledger.json');
+  await writeFile(outside, '{}');
+  await symlink(outside, file);
+  await assert.rejects(() => approveAndRunCommand({ proposal, root, approved: true, currentRevision: 'r1' }), (error) => error.code === 'COMMAND_LEDGER_FAILED');
 });

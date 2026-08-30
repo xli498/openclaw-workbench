@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { decide } from '../runtime/policy.mjs';
@@ -72,12 +72,12 @@ test('Action hash 绑定不可变输入，hash 不匹配时拒绝', () => {
 });
 
 test('持久化审计日志追加哈希链，并可重新加载', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'ocw-audit-'));
-  const filePath = path.join(dir, 'audit.jsonl');
-  const first = await createFileAuditLog({ filePath, clock: () => new Date('2026-08-29T00:00:00Z') });
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-audit-'));
+  const filePath = path.join(root, 'audit.jsonl');
+  const first = await createFileAuditLog({ root, filePath: 'audit.jsonl', clock: () => new Date('2026-08-29T00:00:00Z') });
   const a = await first.append({ type: 'action.created', actor: 'user', actionId: 'a1' });
   assert.equal(a.previousHash, 'GENESIS');
-  const second = await createFileAuditLog({ filePath, clock: () => new Date('2026-08-29T00:00:01Z') });
+  const second = await createFileAuditLog({ root, filePath: 'audit.jsonl', clock: () => new Date('2026-08-29T00:00:01Z') });
   const b = await second.append({ type: 'action.approved', actor: 'user', actionId: 'a1' });
   assert.equal(b.previousHash, a.recordHash);
   const lines = (await readFile(filePath, 'utf8')).trim().split('\n');
@@ -107,11 +107,20 @@ test('审计日志追加后不可通过 list 结果反向修改内部状态', ()
 });
 
 test('文件审计日志并发追加保持单一哈希链', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'ocw-audit-concurrent-'));
-  const filePath = path.join(dir, 'audit.jsonl');
-  const logs = await Promise.all(Array.from({ length: 8 }, () => createFileAuditLog({ filePath })));
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-audit-concurrent-'));
+  const filePath = path.join(root, 'audit.jsonl');
+  const logs = await Promise.all(Array.from({ length: 8 }, () => createFileAuditLog({ root, filePath: 'audit.jsonl' })));
   await Promise.all(logs.map((log, index) => log.append({ type: 'concurrent.test', actor: `worker-${index}` })));
   const records = await logs[0].list();
   assert.equal(records.length, 8);
   assert.equal(verifyAuditChain(records), true);
+});
+
+test('文件审计日志拒绝路径逃逸和已存在的符号链接', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-audit-safe-'));
+  await assert.rejects(() => createFileAuditLog({ root, filePath: '../outside.jsonl' }), /audit_invalid_path/);
+  const outside = path.join(root, 'outside.jsonl');
+  await writeFile(outside, '');
+  await symlink(outside, path.join(root, 'audit-link.jsonl'));
+  await assert.rejects(() => createFileAuditLog({ root, filePath: 'audit-link.jsonl' }), /audit_path_escape/);
 });

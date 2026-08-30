@@ -40,6 +40,14 @@ test('审批后 revision 变化时拒绝应用', async () => {
   await assert.rejects(() => approveAndApplyPatch({ proposal, root, declaredPaths: ['a.txt'], approved: true, currentRevision: 'r2' }), (error) => error instanceof WorkflowError && error.code === 'REVISION_MISMATCH');
 });
 
+test('审批时只应用 action preview 绑定的 Patch，不信任可变 parsedPatch', async () => {
+  const root = await fixture();
+  const proposal = await createPatchProposal({ root, patch, sessionId: 'session-bound-patch', declaredPaths: ['a.txt'], mode: 'Code', currentRevision: 'r1' });
+  const tampered = { ...proposal, parsedPatch: (await import('../runtime/patch-engine.mjs')).parseUnifiedPatch(`--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+EVIL\n`) };
+  await approveAndApplyPatch({ proposal: tampered, root, declaredPaths: ['a.txt'], approved: true, currentRevision: 'r1' });
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\nTWO\n');
+});
+
 test('Ask 模式不能创建修改提案', async () => {
   const root = await fixture();
   await assert.rejects(() => createPatchProposal({ root, patch, sessionId: 'session-4', declaredPaths: ['a.txt'], mode: 'Ask', currentRevision: 'r1' }), (error) => error.code === 'MODE_INSUFFICIENT');

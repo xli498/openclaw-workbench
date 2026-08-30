@@ -16,6 +16,10 @@ function inside(root, candidate) {
   return target.startsWith(`${base}${path.sep}`);
 }
 
+function safeRelativePath(value) {
+  return typeof value === 'string' && value.length > 0 && !value.startsWith('/') && !value.includes('\\') && !value.split('/').includes('..');
+}
+
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
 
 async function assertSafeExistingPath(root, candidate, label) {
@@ -73,7 +77,7 @@ export function validateTransactionManifest({ root, manifest }) {
     throw new RecoveryError('MANIFEST_INVALID', 'invalid transaction manifest');
   }
   for (const file of manifest.files) {
-    if (!file.relativePath || !file.target || !inside(root, file.target) || (file.snapshot && !inside(root, file.snapshot))) {
+    if (!safeRelativePath(file.relativePath) || !file.target || path.resolve(file.target) !== path.resolve(root, file.relativePath) || !inside(root, file.target) || (file.snapshot && !inside(root, file.snapshot))) {
       throw new RecoveryError('MANIFEST_PATH_INVALID', file.relativePath ?? 'unknown');
     }
     if (file.temp && !inside(root, file.temp)) throw new RecoveryError('MANIFEST_PATH_INVALID', file.relativePath);

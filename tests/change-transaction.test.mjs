@@ -139,6 +139,11 @@ test('恢复清单拒绝工作区外路径', async () => {
   assert.throws(() => validateTransactionManifest({ root, manifest: { transactionId: 'x', state: 'committing', files: [{ relativePath: 'a.txt', target: '/tmp/escape', snapshot: path.join(root, 'snap') }] } }), (e) => e.code === 'MANIFEST_PATH_INVALID');
 });
 
+test('恢复清单拒绝 relativePath 与实际 target 不一致', async () => {
+  const root = await fixture();
+  assert.throws(() => validateTransactionManifest({ root, manifest: { transactionId: 'x', state: 'committing', files: [{ relativePath: 'a.txt', target: path.join(root, 'b.txt') }] } }), (e) => e.code === 'MANIFEST_PATH_INVALID');
+});
+
 test('检查恢复材料时拒绝符号链接逃逸', async () => {
   const root = await fixture();
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-outside-'));

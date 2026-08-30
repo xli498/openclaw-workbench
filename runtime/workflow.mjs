@@ -32,9 +32,19 @@ export async function createPatchProposal({ root, patch, sessionId, declaredPath
 }
 
 export async function approveAndApplyPatch({ proposal, root, declaredPaths, approved = false, audit, getCurrentRevision, currentRevision, snapshotDir, transactionDir, renameFile } = {}) {
-  if (!proposal?.action || !proposal?.parsedPatch) throw new WorkflowError('PROPOSAL_INVALID', 'patch proposal is required');
+  if (!proposal?.action || typeof proposal.action.preview !== 'string') throw new WorkflowError('PROPOSAL_INVALID', 'patch proposal is required');
   if (!approved) throw new WorkflowError('APPROVAL_REQUIRED', 'patch application requires explicit approval');
   const action = proposal.action;
+  let approvedPatch;
+  try {
+    approvedPatch = parseUnifiedPatch(action.preview);
+    validatePatchTargets(approvedPatch, declaredPaths);
+  } catch (error) {
+    throw new WorkflowError(error.code ?? 'PATCH_INVALID', error.message, { cause: error });
+  }
+  if (JSON.stringify(approvedPatch.paths) !== JSON.stringify(action.target)) {
+    throw new WorkflowError('PATCH_TARGET_MISMATCH', 'patch targets do not match the approved action');
+  }
   const current = revisionForAction(currentRevision ?? (getCurrentRevision ? await getCurrentRevision() : proposal.workspaceRevision));
   if (current !== action.workspaceRevision) throw new WorkflowError('REVISION_MISMATCH', 'workspace changed after approval');
   const approvedAction = transition(action, 'approved', { expectedHash: actionHash({ type: action.type, sessionId: action.sessionId, workspaceRevision: action.workspaceRevision, target: action.target, preview: action.preview, risk: action.risk },) });
@@ -42,7 +52,7 @@ export async function approveAndApplyPatch({ proposal, root, declaredPaths, appr
   const executing = transition(approvedAction, 'executing');
   let result;
   try {
-    result = await applyPatchTransaction({ root, parsedPatch: proposal.parsedPatch, declaredPaths, expectedRevision: action.workspaceRevision, currentRevision: current, getCurrentRevision, snapshotDir, transactionDir, audit, renameFile });
+    result = await applyPatchTransaction({ root, parsedPatch: approvedPatch, declaredPaths, expectedRevision: action.workspaceRevision, currentRevision: current, getCurrentRevision, snapshotDir, transactionDir, audit, renameFile });
   } catch (error) {
     if (audit) await audit.append({ type: 'action.failed', actor: 'system', actionId: action.id, code: error.code ?? 'PATCH_APPLY_FAILED' });
     throw new WorkflowError(error.code ?? 'PATCH_APPLY_FAILED', error.message, { cause: error, action: executing });
