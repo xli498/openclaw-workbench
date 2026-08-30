@@ -1,0 +1,94 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { decide } from '../runtime/policy.mjs';
+import { actionHash, assertWorkspaceRevision, createAction, transition } from '../runtime/action.mjs';
+import { createAuditLog, createFileAuditLog, verifyAuditChain } from '../runtime/audit.mjs';
+import { AdapterError, buildAgentArgv, parseAgentJson, runAgent } from '../runtime/openclaw-adapter.mjs';
+
+test('Adapter 使用 argv 参数，不启用 shell，并要求明确会话目标', () => {
+  const argv = buildAgentArgv({ message: '只输出状态', sessionKey: 'workbench-test', thinking: 'minimal', local: true });
+  assert.deepEqual(argv, ['agent', '--json', '--message', '只输出状态', '--session-key', 'workbench-test', '--thinking', 'minimal', '--local']);
+  assert.throws(() => buildAgentArgv({ message: 'x' }), /sessionKey or agent/);
+});
+
+test('Adapter 只接受 JSON 对象响应，并分类坏响应', () => {
+  assert.deepEqual(parseAgentJson('{"payloads":[]}'), { payloads: [] });
+  assert.throws(() => parseAgentJson('not-json'), (error) => error instanceof AdapterError && error.code === 'INVALID_RESPONSE');
+});
+
+test('Adapter 在启动前收到取消信号时不创建子进程', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(() => runAgent({ message: 'x', agent: 'main' }, { signal: controller.signal }), (error) => error.code === 'ABORTED');
+});
+
+test('Ask 只能读取，Plan 不能修改，Code 修改必须审批', () => {
+  assert.deepEqual(decide({ mode: 'Ask', actionType: 'read' }).allowed, true);
+  assert.equal(decide({ mode: 'Ask', actionType: 'patch' }).reason, 'mode_insufficient');
+  assert.equal(decide({ mode: 'Plan', actionType: 'patch' }).reason, 'mode_insufficient');
+  assert.equal(decide({ mode: 'Code', actionType: 'patch' }).reason, 'approval_required');
+  assert.equal(decide({ mode: 'Code', actionType: 'patch', approved: true }).allowed, true);
+});
+
+test('敏感目标即使只读也需要审批', () => {
+  assert.equal(decide({ mode: 'Ask', actionType: 'read', targetSensitive: true }).reason, 'approval_required');
+});
+
+test('Action 必须按状态机推进，终态不可继续修改', () => {
+  const action = createAction({ type: 'patch', sessionId: 's1', workspaceRevision: 'r1', target: ['a.txt'], preview: 'diff', now: new Date('2026-08-29T00:00:00Z') });
+  assert.equal(action.status, 'proposed');
+  const inspected = transition(action, 'inspected');
+  const waiting = transition(inspected, 'awaiting_approval');
+  const approved = transition(waiting, 'approved');
+  const executing = transition(approved, 'executing');
+  const verified = transition(executing, 'verified');
+  assert.throws(() => transition(verified, 'executing'), /action_terminal/);
+  assert.throws(() => transition(action, 'executing'), /invalid_transition/);
+});
+
+test('Action hash 绑定不可变输入，hash 不匹配时拒绝', () => {
+  const input = { type: 'command', sessionId: 's1', workspaceRevision: 'r1', target: 'npm test', preview: '' };
+  const a = createAction(input);
+  assert.equal(a.actionHash, actionHash({ ...input, risk: 'medium' }));
+  assert.throws(() => transition(a, 'inspected', { expectedHash: 'bad' }), /action_hash_mismatch/);
+  assert.equal(assertWorkspaceRevision(a, 'r1'), true);
+  assert.throws(() => transition(a, 'inspected', { currentWorkspaceRevision: 'r2' }), /workspace_revision_mismatch/);
+});
+
+test('持久化审计日志追加哈希链，并可重新加载', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'ocw-audit-'));
+  const filePath = path.join(dir, 'audit.jsonl');
+  const first = await createFileAuditLog({ filePath, clock: () => new Date('2026-08-29T00:00:00Z') });
+  const a = await first.append({ type: 'action.created', actor: 'user', actionId: 'a1' });
+  assert.equal(a.previousHash, 'GENESIS');
+  const second = await createFileAuditLog({ filePath, clock: () => new Date('2026-08-29T00:00:01Z') });
+  const b = await second.append({ type: 'action.approved', actor: 'user', actionId: 'a1' });
+  assert.equal(b.previousHash, a.recordHash);
+  const lines = (await readFile(filePath, 'utf8')).trim().split('\n');
+  assert.equal(lines.length, 2);
+  const records = await second.list();
+  assert.equal(records.length, 2);
+  assert.equal(verifyAuditChain(records), true);
+  records[1] = { ...records[1], actor: 'tampered' };
+  assert.equal(verifyAuditChain(records), false);
+});
+
+test('verifyAuditChain 接受空链并拒绝断链、篡改和缺少 recordHash', () => {
+  assert.equal(verifyAuditChain([]), true);
+  assert.equal(verifyAuditChain([{ previousHash: 'wrong', recordHash: 'x' }]), false);
+  assert.equal(verifyAuditChain([{ previousHash: 'GENESIS', recordHash: 'x', type: 'test' }]), false);
+  assert.equal(verifyAuditChain([{ previousHash: 'GENESIS' }]), false);
+});
+
+test('审计日志追加后不可通过 list 结果反向修改内部状态', () => {
+  const log = createAuditLog({ clock: () => new Date('2026-08-29T00:00:00Z') });
+  log.append({ type: 'action.created', actor: 'user', actionId: 'a1' });
+  const copy = log.list();
+  assert.equal(copy.length, 1);
+  assert.throws(() => log.append({ actor: 'user' }), /audit_event_requires_type/);
+  copy.length = 0;
+  assert.equal(log.list().length, 1);
+});

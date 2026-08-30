@@ -1,0 +1,19 @@
+{
+  "name": "openclaw-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Product runtime foundation for an OpenClaw local Agent workbench",
+  "main": "./runtime/index.mjs",
+  "exports": {
+    ".": "./runtime/index.mjs",
+    "./runtime/*": "./runtime/*.mjs"
+  },
+  "files": ["bin", "runtime", "README.md", "docs", "LICENSE"],
+  "type": "module",
+  "bin": { "openclaw-workbench": "./bin/workbench.mjs" },
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "test": "node --test",
+    "test:watch": "node --test --watch"
+  }
+}
