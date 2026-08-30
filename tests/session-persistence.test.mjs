@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createChatSessionManager, SessionError } from '../runtime/session.mjs';
@@ -70,5 +70,28 @@ test('拒绝重复会话 ID 和非法消息快照', async () => {
       { id: 'duplicate', mode: 'Ask', status: 'active', messages: [{ role: 'tool', content: 'unsafe' }] },
     ] }));
     assert.throws(() => createChatSessionManager({ root }), { code: 'SESSION_STORE_INVALID' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('拒绝指向工作区外的会话快照符号链接', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-symlink-'));
+  const outside = await mkdtemp(join(tmpdir(), 'ocw-session-outside-'));
+  try {
+    await mkdir(join(root, '.openclaw-workbench'));
+    const target = join(outside, 'sessions.json');
+    await writeFile(target, JSON.stringify({ version: 1, sessions: [] }));
+    await symlink(target, join(root, '.openclaw-workbench', 'sessions.json'));
+    assert.throws(() => createChatSessionManager({ root }), { code: 'SESSION_STORE_INVALID' });
+  } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
+});
+
+test('会话快照在首次写入和原子覆盖后保持 owner-only 权限', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-mode-'));
+  try {
+    const manager = createChatSessionManager({ root });
+    manager.createSession();
+    assert.equal((await stat(manager.snapshotPath)).mode & 0o777, 0o600);
+    manager.createSession({ mode: 'Code' });
+    assert.equal((await stat(manager.snapshotPath)).mode & 0o777, 0o600);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

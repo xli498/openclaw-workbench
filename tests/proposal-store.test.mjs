@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProposalStore, ProposalStoreError } from '../runtime/proposal-store.mjs';
@@ -52,4 +52,16 @@ test('拒绝重复提案 ID 和伪造恢复标记', async () => {
     ] }));
     assert.throws(() => createProposalStore({ root }), { code: 'PROPOSAL_STORE_INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('拒绝指向工作区外的提案快照符号链接', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-symlink-'));
+  const outside = await mkdtemp(join(tmpdir(), 'ocw-proposal-outside-'));
+  try {
+    await mkdir(join(root, '.openclaw-workbench'));
+    const target = join(outside, 'proposals.json');
+    await writeFile(target, JSON.stringify({ version: 1, proposals: [] }));
+    await symlink(target, join(root, '.openclaw-workbench', 'proposals.json'));
+    assert.throws(() => createProposalStore({ root }), { code: 'PROPOSAL_STORE_INVALID' });
+  } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });

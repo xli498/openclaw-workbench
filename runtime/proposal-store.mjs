@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { assertSafeSnapshotPath, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 const TERMINAL = new Set(['verified', 'failed', 'timed_out', 'cancelled']);
 
@@ -20,13 +21,11 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
   if (!root) throw new ProposalStoreError('ROOT_REQUIRED', 'root is required');
   const records = new Map();
   function persist() {
-    mkdirSync(dirname(storePath), { recursive: true });
-    const temporary = `${storePath}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, JSON.stringify({ version: 1, proposals: [...records.values()] }), { mode: 0o600 });
-    renameSync(temporary, storePath);
+    writeSnapshotAtomically({ root, storePath, payload: JSON.stringify({ version: 1, proposals: [...records.values()] }), ErrorType: ProposalStoreError, code: 'PROPOSAL_STORE_INVALID', message: 'proposal snapshot is invalid; refusing recovery', temporaryName: randomUUID() });
   }
   function restore() {
     try {
+      assertSafeSnapshotPath({ root, storePath, ErrorType: ProposalStoreError, code: 'PROPOSAL_STORE_INVALID', message: 'proposal snapshot is invalid; refusing recovery' });
       const snapshot = JSON.parse(readFileSync(storePath, 'utf8'));
       if (snapshot?.version !== 1 || !Array.isArray(snapshot.proposals)) throw new Error('unsupported proposal snapshot');
       const ids = new Set();

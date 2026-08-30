@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { assertSafeSnapshotPath, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 const DEFAULT_LIMIT = 500;
 
@@ -14,14 +15,12 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
   let sequence = 0;
   function persist() {
     if (!storePath) return;
-    mkdirSync(dirname(storePath), { recursive: true });
-    const temporary = `${storePath}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, JSON.stringify({ version: 1, sequence, events }), { mode: 0o600 });
-    renameSync(temporary, storePath);
+    writeSnapshotAtomically({ root, storePath, payload: JSON.stringify({ version: 1, sequence, events }), ErrorType: EventBusError, code: 'EVENT_STORE_INVALID', message: 'event snapshot is invalid; refusing recovery', temporaryName: randomUUID() });
   }
   function restore() {
     if (!storePath) return false;
     try {
+      assertSafeSnapshotPath({ root, storePath, ErrorType: EventBusError, code: 'EVENT_STORE_INVALID', message: 'event snapshot is invalid; refusing recovery' });
       const snapshot = JSON.parse(readFileSync(storePath, 'utf8'));
       if (snapshot?.version !== 1 || !Number.isInteger(snapshot.sequence) || snapshot.sequence < 0 || !Array.isArray(snapshot.events)) throw new Error('unsupported event snapshot');
       const ids = new Set();

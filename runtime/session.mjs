@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { runAgent } from './openclaw-adapter.mjs';
 import { runPlanReview, PlanError } from './plan.mjs';
+import { assertSafeSnapshotPath, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 export const CHAT_MODES = Object.freeze(['Ask', 'Plan', 'Code']);
 const MAX_MESSAGE_LENGTH = 32 * 1024;
@@ -28,13 +29,11 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
   const sessions = new Map();
   function persist() {
     const payload = JSON.stringify({ version: 1, sessions: [...sessions.values()].map(snapshotSession) });
-    mkdirSync(dirname(storePath), { recursive: true });
-    const temp = `${storePath}.${randomUUID()}.tmp`;
-    writeFileSync(temp, payload, { mode: 0o600 });
-    renameSync(temp, storePath);
+    writeSnapshotAtomically({ root, storePath, payload, ErrorType: SessionError, code: 'SESSION_STORE_INVALID', message: 'session snapshot is invalid; refusing recovery', temporaryName: randomUUID() });
   }
   function restore() {
     try {
+      assertSafeSnapshotPath({ root, storePath, ErrorType: SessionError, code: 'SESSION_STORE_INVALID', message: 'session snapshot is invalid; refusing recovery' });
       const payload = JSON.parse(readFileSync(storePath, 'utf8'));
       if (payload?.version !== 1 || !Array.isArray(payload.sessions)) throw new Error('unsupported snapshot');
       const ids = new Set();
