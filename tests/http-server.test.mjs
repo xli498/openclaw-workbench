@@ -27,6 +27,20 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('并发审批先持久化 claim，第二个请求冲突且不会双执行', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-approval-race-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'approval-race', argv: ['pwd'] }) });
+    const url = `/v1/proposals/${proposal.body.proposal.action.id}/approve`;
+    const options = { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) };
+    const [first, second] = await Promise.all([request(address, url, options), request(address, url, options)]);
+    assert.deepEqual([first.status, second.status].sort((a, b) => a - b), [200, 409]);
+    assert.equal([first.body.error, second.body.error].filter(Boolean)[0], 'PROPOSAL_BUSY');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面拒绝部分匹配和错误类型的 Bearer token', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-auth-'));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
@@ -265,7 +279,7 @@ test('状态 API 汇总重启恢复状态，不暴露会话或提案内容', asy
     const status = await request(address, '/v1/status');
     assert.equal(status.status, 200);
     assert.deepEqual(status.body.persistedState.sessions, { total: 1, active: 0, closed: 0, manualReview: 1, interruptedTurns: 1 });
-    assert.deepEqual(status.body.persistedState.proposals, { total: 0, manualReview: 0, terminal: 0 });
+    assert.deepEqual(status.body.persistedState.proposals, { total: 0, manualReview: 0, executing: 0, terminal: 0 });
     assert.equal(status.body.persistedState.events.recovered, false);
     assert.equal(JSON.stringify(status.body.persistedState).includes('"id"'), false);
     assert.equal(JSON.stringify(status.body.persistedState).includes('"messages"'), false);

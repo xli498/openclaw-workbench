@@ -139,3 +139,123 @@
 - Confirmed closed: Git aliases into sensitive/internal state, asymmetric Git entry/byte budgets, read-before-budget allocation, final-component symlink following, and unstable-file error classification.
 - Verification: `153/153` tests passed and `git diff --check` passed.
 - Remaining non-blocking limits: millisecond `mtime` checks are best-effort rather than hostile-writer proof; extreme Git path lists may hit the bounded `execFile` buffer and fail as `GIT_UNAVAILABLE`; whole-tree revision scanning is not atomic.
+
+## Round 8 — 2026-08-30
+
+**Result:** COMPLETE (Round 8 scope)
+
+### Terminal cwd hardening
+- Terminal execution now opens the requested workspace directory with `O_DIRECTORY | O_NOFOLLOW`, verifies the opened descriptor still resolves inside the workspace, and spawns through `/proc/self/fd/<fd>`.
+- The directory descriptor remains open through `spawn()`, preventing a validated visible path from being replaced with an attacker-controlled directory during the validation-to-spawn window.
+- If Linux procfs cannot provide the descriptor path, execution fails closed instead of falling back to the original pathname.
+- This mechanism is Linux/procfs-specific and is not claimed to be portable.
+
+### Snapshot persistence hardening
+- `snapshot-store` now creates a per-operation `0600` temp name and a lock-directory owner record containing a UUID token and start timestamp.
+- Cleanup removes only a temp name created for this operation and only a lock whose on-disk owner token still matches; this prevents ABA cleanup from removing a replacement lock.
+- Stale recovery is conservative: only a parseable, expired owner record is quarantined by rename before cleanup; malformed/active locks remain busy. Cleanup failures do not replace the primary write/conflict error.
+- Removed post-rename pathname `chmod`; the created temp inode already has `0600` permissions.
+
+### Approval claim and session error handling
+- Proposal approvals persist an `awaiting_approval → executing` claim before an awaited workflow. Claims bind action hash, UUID token, and start time; only the matching token may persist a terminal action. Restarted non-terminal claims recover as `manual_review` and are never replayed.
+- HTTP maps concurrent approval conflicts to `409`, and a concurrency test proves only one approval proceeds.
+- Chat and plan persistence cleanup now preserves the primary agent/review error and attaches persistence failure metadata instead of allowing a `finally` write to mask it.
+
+### Verification
+- Added proposal-claim/restart and concurrent-HTTP-approve tests, plus retained terminal stable-cwd coverage.
+- Focused suites: `27/27` passed.
+- Full suite: `157/157` passed (`npm test`).
+- `git diff --check` passed.
+
+### Remaining WARN
+- Node pathname validation cannot eliminate all hostile-writer TOCTOU between checks and filesystem operations; these paths fail closed where detectable, but descriptor-relative filesystem primitives would be required to close the residual fully.
+- Stable terminal CWD deliberately requires Linux `/proc/self/fd`; unsupported procfs fails closed.
+- Lock stale recovery uses elapsed time plus authenticated-on-disk ownership metadata, not PID liveness; a long paused writer beyond the stale threshold can be conservatively displaced and will fail its ownership-protected cleanup rather than removing the successor lock.
+
+## Round 9 — 2026-08-30
+
+**Result:** COMPLETE (security closure review)
+
+### P1 fixed: snapshot parent-directory replacement
+- `writeSnapshotAtomically` opens and validates the snapshot parent with `O_DIRECTORY | O_NOFOLLOW`, then uses only its Linux `/proc/self/fd/<fd>` anchor for lock creation/opening, owner metadata, current snapshot reads, temporary writes, rename, stale quarantine, and cleanup.
+- The lock directory is independently opened with the same no-follow directory-handle rule. Owner-token and ABA protections remain intact: cleanup removes a lock only when its owner record still has this operation's UUID token.
+- Procfs anchoring is mandatory for these writes. If it is unavailable, the store fails closed rather than reusing the mutable original parent pathname.
+- A direct regression test swaps the visible parent directory for a symlink immediately after the parent FD is opened; output remains in the renamed original inode and nothing is written outside the workspace.
+
+### P2 test closure
+- Added controlled-command coverage that replaces the visible cwd with an outside symlink after FD opening; the child runs in the original opened inode.
+- Existing direct coverage retains owner-only snapshot permissions, busy-lock refusal, stale-owner behavior, malformed/symlink owner refusal, conflict preservation, and terminal timeout/abort/output-limit handling.
+- The focused persistence/terminal suites pass `20/20`; direct snapshot lock coverage passes `2/2`; the full suite is now `161/161`.
+
+### Verification
+- `node --test tests/session-persistence.test.mjs tests/terminal.test.mjs`: `20/20` passed.
+- `npm test`: `161/161` passed.
+- No Python source files are present, so `py_compile` is not applicable.
+- `git diff --check`: passed.
+
+### Residual architecture boundaries (P2, accepted)
+- Pure Node exposes no portable `openat`/fd-relative rename API. This Linux implementation closes the mutable-parent path by resolving all critical names under verified `/proc/self/fd` directory descriptors; non-procfs environments fail closed.
+- Stale recovery remains timestamp-based rather than PID-liveness-based. A paused writer older than the threshold may be quarantined, but its token-bound cleanup cannot remove a successor lock.
+
+### Final review state
+- P0: `0`
+- P1: `0`
+- P2: `2` (documented platform/API boundaries above)
+- Exploration: saturated for the identified snapshot-path and terminal-FD threat surfaces.
+
+## Round 10 — 2026-08-30
+
+**Result:** COMPLETE (final safety closure)
+
+### P1 closure
+- `readSnapshot()` now opens the parent with `O_DIRECTORY | O_NOFOLLOW`, requires its `/proc/self/fd/<fd>` anchor, then opens the basename with `O_NOFOLLOW`, verifies a regular inode with `fstat`, and reads that same FD. Parent rename/external replacement cannot redirect recovery reads; missing parent remains an empty snapshot, while procfs/symlink/non-regular failures fail closed.
+- Snapshot parent creation is now component-by-component from an opened verified root FD. It no longer performs recursive `mkdir()` through a mutable full parent path.
+- Lock owner reads are same-FD `O_NOFOLLOW` reads. Stale cleanup rechecks parent entry dev/inode plus owner token/inode before owner unlink and before `rmdir`; detected ABA successors are retained. Node has no `unlinkat`/CAS, so the unavoidable micro-window is fail-safe by non-empty-directory failure rather than deleting a successor.
+
+### P2 closure
+- If an approval claim succeeds but revision, command-ledger, policy/hash, or audit prerequisites fail without a terminal action, HTTP persists `manual_review` with a bounded error summary and matching claim token, and removes the live in-memory proposal. It cannot remain permanently executable.
+- Existing session `finally` persistence handling preserves the primary error code/message/cause and attaches `details.persistenceError`.
+- Terminal retains procfs fail-closed behavior and its synchronous spawn, async error, abort, FD-close, and single-settlement coverage from prior rounds.
+
+### New regression coverage
+- Production snapshot read: parent rename + external replacement and final-component symlink refusal.
+- Safe nested parent creation and stale quarantine cleanup successor replacement.
+- Existing focused proposal/http tests verify durable claims and only-token completion; full suite covers the established terminal/session fault cases.
+
+### Verification
+- Focused `node --test tests/snapshot-store.test.mjs`: `4/4` passed.
+- Focused `node --test tests/proposal-store.test.mjs tests/http-server.test.mjs`: `26/26` passed.
+- `npm test`: `163/163` passed.
+- No Python source files are present; `py_compile` is not applicable.
+- `git diff --check`: passed.
+
+### Final review state
+- P0: `0`
+- P1: `0`
+- P2: `0` for the scoped actionable defects. Residual platform boundary: Node lacks fd-relative unlink/CAS primitives; this implementation detects substitutions and fails safe, but cannot make filesystem mutation mathematically atomic against a hostile kernel-level racing process.
+- Exploration: saturated for the requested snapshot, claim-terminalization, session-persistence, and terminal lifecycle surfaces.
+
+
+## Round 11 — 2026-08-30
+
+**Result:** COMPLETE (Round 11 final review)
+
+### P1 closure
+- `writeSnapshotAtomically()` now obtains the current digest through the already-verified parent FD and an `O_NOFOLLOW` regular-file FD; it no longer uses pathname `readFileSync(currentPath)`. A production-write hook regression swaps the final digest entry to an external symlink immediately before this open and proves the operation fails closed without changing the external file.
+- Automatic stale-lock quarantine is disabled. Pure Node lacks an atomic compare-and-rename primitive, so a pre-rename inode check cannot prevent quarantining a successor lock. Expired locks now remain busy for manual recovery. Regression coverage replaces the lock immediately after stale candidate verification and proves the successor stays at the live lock name and the writer remains busy.
+
+### P2 closure
+- `markManualReview()` now persists `proposal.action.status: manual_review`, retaining claim/action-hash/token and bounded prerequisite error context. Restart restoration also terminalizes every non-terminal proposal into this non-executing state; recovery summaries no longer count it as executing. Tests cover revision/ledger-audit precondition failure and restart readback.
+- Controlled terminal execution has a minimal private test-only spawn seam. A synchronous spawn throw maps to `SPAWN_FAILED`, closes the stable CWD FD, and settles once; existing async error, abort, timeout, and output-limit coverage remains intact.
+
+### Verification
+- `npm test`: **166/166 passed**.
+- Python sources: none found; `py_compile` not applicable.
+- `git diff --check`: passed.
+
+### Final review state
+- P0: **0**
+- P1: **0**
+- P2: **0**
+- Exploration: saturated for all requested snapshot digest/open, stale-lock ABA, proposal manual-review, and terminal spawn lifecycle branches.
+- Deliberate residual boundary: stale locks require manual recovery because Node does not expose a safe source-identity compare-and-rename operation; this is a fail-closed availability tradeoff, not an unresolved concurrency-write risk.

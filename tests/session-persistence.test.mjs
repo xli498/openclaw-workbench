@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createChatSessionManager, SessionError } from '../runtime/session.mjs';
+import { writeSnapshotAtomically } from '../runtime/snapshot-store.mjs';
 
 test('会话消息可原子持久化并在新 manager 中恢复', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-session-store-'));
@@ -116,4 +118,23 @@ test('两个会话 manager 基于不同快照版本写入时拒绝后写者覆�
     const restored = createChatSessionManager({ root });
     assert.equal(restored.getSession(created.id).id, created.id);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('打开父目录后路径被替换为外部符号链接时，快照仍写入原目录 inode', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-anchor-'));
+  const outside = await mkdtemp(join(tmpdir(), 'ocw-session-anchor-outside-'));
+  try {
+    const storeDir = join(root, '.openclaw-workbench');
+    await mkdir(storeDir);
+    const originalDir = `${storeDir}.old`;
+    const storePath = join(storeDir, 'sessions.json');
+    class SnapshotError extends Error { constructor(code) { super(code); this.code = code; } }
+    writeSnapshotAtomically({
+      root, storePath, payload: 'anchored', expectedDigest: null, ErrorType: SnapshotError,
+      code: 'INVALID', message: 'invalid', busyCode: 'BUSY', busyMessage: 'busy', conflictCode: 'CONFLICT', conflictMessage: 'conflict',
+      __testHooks: { onParentOpened: () => { renameSync(storeDir, originalDir); symlinkSync(outside, storeDir); } },
+    });
+    assert.equal(await readFile(join(originalDir, 'sessions.json'), 'utf8'), 'anchored');
+    assert.equal(await readFile(join(outside, 'sessions.json'), 'utf8').catch(() => null), null);
+  } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });

@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, symlink, writeFile } from 'node:fs/promises';
+import { renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { runControlledCommand } from '../runtime/terminal.mjs';
+import { openStableCwd, runControlledCommand } from '../runtime/terminal.mjs';
 
 async function fixture() { return mkdtemp(path.join(tmpdir(), 'ocw-terminal-')); }
 
@@ -17,8 +18,46 @@ test('终端执行需要明确审批，并使用工作区 cwd', async () => {
 
 test('拒绝 shell 字符串、越界 cwd 和 cwd 逃逸符号链接', async () => {
   const root = await fixture();
+  const outside = await fixture();
+  await symlink(outside, path.join(root, 'escape'));
   await assert.rejects(() => runControlledCommand({ root, argv: ['echo hi'], approved: true }), (error) => error.code === 'SPAWN_FAILED' || error.code === 'INVALID_COMMAND' || error.code === 'EXECUTABLE_UNAVAILABLE');
   await assert.rejects(() => runControlledCommand({ root, argv: ['echo', 'x'], cwd: '../outside', approved: true }), (error) => error.code === 'PATH_ESCAPE');
+  await assert.rejects(() => runControlledCommand({ root, argv: ['pwd'], cwd: 'escape', approved: true }), (error) => error.code === 'SYMLINK_ESCAPE');
+});
+
+test('稳定 cwd 句柄在目录改名后仍锚定原目录', async () => {
+  const root = await fixture();
+  const original = path.join(root, 'work');
+  const moved = path.join(root, 'moved');
+  await mkdir(original);
+  const stable = await openStableCwd(root, 'work');
+  try {
+    await rename(original, moved);
+    const result = await new Promise((resolve, reject) => {
+      import('node:child_process').then(({ spawn }) => {
+        const child = spawn(process.execPath, ['-e', 'console.log(process.cwd())'], { cwd: stable.procPath, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        child.stdout.on('data', (chunk) => { stdout += chunk; });
+        child.on('error', reject);
+        child.on('close', (code) => code === 0 ? resolve(stdout.trim()) : reject(new Error(`exit ${code}`)));
+      }, reject);
+    });
+    assert.equal(result, moved);
+  } finally { await stable.handle.close(); }
+});
+
+test('受控命令在打开 cwd 后替换可见父路径，仍在原目录 inode 中执行', async () => {
+  const root = await fixture();
+  const outside = await fixture();
+  const work = path.join(root, 'work');
+  const moved = path.join(root, 'moved');
+  await mkdir(work);
+  const result = await runControlledCommand({
+    root, cwd: 'work', argv: [process.execPath, '-e', 'console.log(process.cwd())'], approved: true,
+    __testHooks: { onCwdOpened: () => { renameSync(work, moved); symlinkSync(outside, work); } },
+  });
+  assert.equal(result.stdout.trim(), moved);
+  assert.equal(result.cwd, work);
 });
 
 test('命令超时、取消和输出超限都会终止执行', async () => {
@@ -29,6 +68,15 @@ test('命令超时、取消和输出超限都会终止执行', async () => {
   controller.abort();
   await assert.rejects(() => pending, (error) => error.code === 'ABORTED');
   await assert.rejects(() => runControlledCommand({ root, argv: [process.execPath, '-e', 'process.stdout.write("123456")'], approved: true, maxOutputBytes: 3 }), (error) => error.code === 'OUTPUT_LIMIT');
+});
+
+test('spawn 同步 throw 归类为 SPAWN_FAILED、关闭稳定 cwd FD，且 Promise 只结算一次', async () => {
+  const root = await fixture(); let opened;
+  await assert.rejects(() => runControlledCommand({
+    root, argv: [process.execPath, '--version'], approved: true,
+    __testHooks: { onCwdOpened: (stable) => { opened = stable; }, spawn: () => { throw new Error('synthetic synchronous spawn failure'); } },
+  }), (error) => error.code === 'SPAWN_FAILED');
+  await assert.rejects(() => opened.handle.stat(), /closed|EBADF/i);
 });
 
 test('环境变量只保留允许键', async () => {

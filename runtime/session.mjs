@@ -23,6 +23,13 @@ function snapshotSession(session) {
   return { id: session.id, workspaceId: session.workspaceId, mode: session.mode, actor: session.actor, status: session.status, createdAt: session.createdAt, messages: session.messages, running: session.running };
 }
 
+function attachPersistenceError(primary, persistenceError) {
+  if (!primary || typeof primary !== 'object') return;
+  const details = primary.details && typeof primary.details === 'object' ? primary.details : {};
+  primary.details = { ...details, persistenceError: { code: persistenceError?.code, message: persistenceError?.message } };
+  if (!primary.cause) primary.cause = persistenceError;
+}
+
 export function createChatSessionManager({ root, runAgentFn = runAgent, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
   if (!root) throw new SessionError('ROOT_REQUIRED', 'root is required');
   const sessions = new Map();
@@ -76,6 +83,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     const userMessage = Object.freeze({ role: 'user', content: message, createdAt: clock().toISOString() });
     session.messages.push(userMessage);
     try { persist(); } catch (error) { session.messages.pop(); session.running = false; throw error; }
+    let primaryError;
     try {
       const response = await runAgentFn({ message, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal });
       const assistantMessage = Object.freeze({ role: 'assistant', content: response, createdAt: clock().toISOString() });
@@ -83,10 +91,17 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
       persist();
       return Object.freeze({ session: publicSession(session), message: assistantMessage });
     } catch (error) {
+      primaryError = error;
       session.messages.pop();
-      persist();
+      try { persist(); } catch (persistenceError) { attachPersistenceError(error, persistenceError); }
       throw error;
-    } finally { session.running = false; persist(); }
+    } finally {
+      session.running = false;
+      try { persist(); } catch (persistenceError) {
+        if (primaryError) attachPersistenceError(primaryError, persistenceError);
+        else throw persistenceError;
+      }
+    }
   }
 
   async function planReview({ sessionId, question, models, thinking, timeoutSeconds } = {}) {
@@ -96,9 +111,16 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
     session.running = true;
     try { persist(); } catch (error) { session.running = false; throw error; }
+    let primaryError;
     try { return await runPlanReview({ question, models, sessionKey: session.id, thinking, timeoutSeconds }); }
-    catch (error) { if (error instanceof PlanError) throw error; throw error; }
-    finally { session.running = false; persist(); }
+    catch (error) { primaryError = error; throw error; }
+    finally {
+      session.running = false;
+      try { persist(); } catch (persistenceError) {
+        if (primaryError) attachPersistenceError(primaryError, persistenceError);
+        else throw persistenceError;
+      }
+    }
   }
 
   function listMessages(sessionId) {

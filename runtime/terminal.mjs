@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { realpath } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { open, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -32,13 +33,32 @@ function safeEnv(env) {
     .map(([key, value]) => [key, ['PATH', 'HOME', 'TMPDIR'].includes(key) ? process.env[key] : value]));
 }
 
-async function safeCwd(root, cwd) {
+function inside(root, candidate) {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+export async function openStableCwd(root, cwd, { __testHooks } = {}) {
   const rootReal = await realpath(root).catch((error) => { throw new TerminalError('ROOT_UNAVAILABLE', error.message); });
   const candidate = path.resolve(rootReal, cwd ?? '.');
-  if (candidate !== rootReal && !candidate.startsWith(`${rootReal}${path.sep}`)) throw new TerminalError('PATH_ESCAPE', 'command cwd escapes workspace');
-  const cwdReal = await realpath(candidate).catch((error) => { throw new TerminalError('CWD_UNAVAILABLE', error.message); });
-  if (cwdReal !== rootReal && !cwdReal.startsWith(`${rootReal}${path.sep}`)) throw new TerminalError('SYMLINK_ESCAPE', 'command cwd escapes workspace');
-  return cwdReal;
+  if (!inside(rootReal, candidate)) throw new TerminalError('PATH_ESCAPE', 'command cwd escapes workspace');
+  let handle;
+  try {
+    handle = await open(candidate, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    const procPath = `/proc/self/fd/${handle.fd}`;
+    const cwdReal = await realpath(procPath);
+    if (!inside(rootReal, cwdReal)) throw new TerminalError('SYMLINK_ESCAPE', 'command cwd escapes workspace');
+    const info = await handle.stat();
+    if (!info.isDirectory()) throw new TerminalError('CWD_UNAVAILABLE', 'command cwd is not a directory');
+    const stable = Object.freeze({ handle, procPath, cwdReal });
+    __testHooks?.onCwdOpened?.(stable);
+    return stable;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (error instanceof TerminalError) throw error;
+    if (['ELOOP', 'ENOTDIR'].includes(error.code)) throw new TerminalError('SYMLINK_ESCAPE', 'command cwd must not be a symbolic link');
+    if (error.code === 'ENOENT' && String(error.path ?? '').startsWith('/proc/self/fd/')) throw new TerminalError('STABLE_CWD_UNAVAILABLE', 'stable cwd requires Linux procfs');
+    throw new TerminalError('CWD_UNAVAILABLE', error.message);
+  }
 }
 
 async function resolveExecutable(command) {
@@ -56,14 +76,19 @@ async function resolveExecutable(command) {
   throw new TerminalError('EXECUTABLE_UNAVAILABLE', `trusted executable not found: ${command}`);
 }
 
-export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = DEFAULT_TIMEOUT_MS, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, signal, approved = false } = {}) {
+export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = DEFAULT_TIMEOUT_MS, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, signal, approved = false, __testHooks } = {}) {
   if (!approved) throw new TerminalError('APPROVAL_REQUIRED', 'terminal execution requires explicit approval');
   validateCommandLimits({ argv, timeoutMs, maxOutputBytes });
-  const commandCwd = await safeCwd(root, cwd);
+  const stableCwd = await openStableCwd(root, cwd, { __testHooks });
   const executable = await resolveExecutable(argv[0]);
-  if (signal?.aborted) throw new TerminalError('ABORTED', 'command aborted before start');
+  if (signal?.aborted) { await stableCwd.handle.close(); throw new TerminalError('ABORTED', 'command aborted before start'); }
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, argv.slice(1), { cwd: commandCwd, env: safeEnv(env), shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let child;
+    // Test-only seam: production always uses node:child_process spawn.
+    const spawnImpl = __testHooks?.spawn ?? spawn;
+    try { child = spawnImpl(executable, argv.slice(1), { cwd: stableCwd.procPath, env: safeEnv(env), shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (error) { stableCwd.handle.close().catch(() => {}); reject(new TerminalError('SPAWN_FAILED', error.message)); return; }
+    stableCwd.handle.close().catch(() => {});
     let stdout = ''; let stderr = ''; let outputBytes = 0; let settled = false; let timedOut = false; let outputLimited = false;
     const kill = () => { try { process.kill(-child.pid, 'SIGTERM'); } catch {} };
     const finish = (fn, value) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); fn(value); } };
@@ -83,7 +108,7 @@ export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = D
       if (outputLimited) return finish(reject, new TerminalError('OUTPUT_LIMIT', `command output exceeded ${maxOutputBytes} bytes`, { code, signal: signalName }));
       if (timedOut) return finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`));
       if (code !== 0) return finish(reject, new TerminalError('PROCESS_FAILED', `command exited with code ${code}`, { code, signal: signalName, stdout, stderr }));
-      finish(resolve, Object.freeze({ argv: [...argv], cwd: commandCwd, stdout, stderr, code }));
+      finish(resolve, Object.freeze({ argv: [...argv], cwd: stableCwd.cwdReal, stdout, stderr, code }));
     });
   });
 }

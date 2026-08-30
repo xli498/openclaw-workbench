@@ -72,7 +72,7 @@ function errorResponse(error) {
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error instanceof EventBusError) return { status: 400, body: { error: error.code, message: error.message } };
-  if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : 400, body: { error: error.code, message: error.message } };
+  if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: { error: error.code, message: error.message } };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
 }
 
@@ -163,25 +163,23 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
         }
         const input = await bodyOf(request);
-        if (input.actionHash !== proposal.action.actionHash) return json(response, 409, { error: 'ACTION_HASH_MISMATCH', message: 'approval must bind the current action hash' });
-        if (proposal.command) {
-          try {
-            const result = await approveAndRunCommand({ proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision });
-            proposalStore.markTerminal(proposal.action.id, result.action);
-            eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
-            return json(response, 200, result);
-          } catch (error) {
-            if (error instanceof WorkflowError && error.details?.action) proposalStore.markTerminal(proposal.action.id, error.details.action);
-            throw error;
-          }
-        }
+        const claim = proposalStore.claim(proposal.action.id, input.actionHash);
         try {
-          const result = await approveAndApplyPatch({ proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision });
-          proposalStore.markTerminal(proposal.action.id, result.action);
+          const result = proposal.command
+            ? await approveAndRunCommand({ proposal: claim.proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision })
+            : await approveAndApplyPatch({ proposal: claim.proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision });
+          proposalStore.markTerminal(proposal.action.id, result.action, claim.claim.token);
+          proposals.delete(proposal.action.id);
           eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
           return json(response, 200, result);
         } catch (error) {
-          if (error instanceof WorkflowError && error.details?.action) proposalStore.markTerminal(proposal.action.id, error.details.action);
+          if (error instanceof WorkflowError && error.details?.action) proposalStore.markTerminal(proposal.action.id, error.details.action, claim.claim.token);
+          else {
+            // Pre-execution checks (revision, ledger, policy or audit) can fail
+            // after a durable claim. Never leave an unclaimable executing record.
+            proposalStore.markManualReview(proposal.action.id, claim.claim.token, error);
+            proposals.delete(proposal.action.id);
+          }
           throw error;
         }
       }

@@ -24,7 +24,8 @@ test('终态提案重启后仅作为可查看历史保留', async () => {
   try {
     const first = createProposalStore({ root });
     first.put(proposal());
-    first.markTerminal('proposal-1', { id: 'proposal-1', status: 'verified', actionHash: 'hash' });
+    const claim = first.claim('proposal-1', 'hash');
+    first.markTerminal('proposal-1', { id: 'proposal-1', status: 'verified', actionHash: 'hash' }, claim.claim.token);
     const restored = createProposalStore({ root }).get('proposal-1');
     assert.equal(restored.proposal.action.status, 'verified');
     assert.equal(restored.recovery, undefined);
@@ -72,6 +73,47 @@ test('提案快照写入遇到已有锁时保守拒绝，不覆盖现有状态',
     const store = createProposalStore({ root });
     await mkdir(`${store.snapshotPath}.lock`, { recursive: true });
     assert.throws(() => store.put(proposal()), { code: 'PROPOSAL_STORE_BUSY' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('持久化 claim 只允许一个审批者执行且仅其可完成', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-claim-'));
+  try {
+    const store = createProposalStore({ root });
+    store.put(proposal());
+    const claim = store.claim('proposal-1', 'hash');
+    assert.equal(store.get('proposal-1').proposal.action.status, 'executing');
+    assert.throws(() => store.claim('proposal-1', 'hash'), { code: 'PROPOSAL_BUSY' });
+    assert.throws(() => store.markTerminal('proposal-1', { id: 'proposal-1', status: 'verified', actionHash: 'hash' }, '00000000-0000-0000-0000-000000000000'), { code: 'CLAIM_MISMATCH' });
+    store.markTerminal('proposal-1', { id: 'proposal-1', status: 'verified', actionHash: 'hash' }, claim.claim.token);
+    assert.equal(store.get('proposal-1').proposal.action.status, 'verified');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('执行中的提案重启后进入 manual_review 且不重放', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-claim-restart-'));
+  try {
+    const first = createProposalStore({ root });
+    first.put(proposal());
+    first.claim('proposal-1', 'hash');
+    const restored = createProposalStore({ root }).get('proposal-1');
+    assert.equal(restored.recovery.state, 'manual_review');
+    assert.equal(restored.proposal.action.status, 'manual_review');
+    assert.equal(createProposalStore({ root }).recoverySummary().executing, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('revision mismatch 和 ledger/audit 前置失败均持久化为不可执行 manual_review', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-manual-review-'));
+  try {
+    const store = createProposalStore({ root }); store.put(proposal());
+    const claim = store.claim('proposal-1', 'hash');
+    store.markManualReview('proposal-1', claim.claim.token, new ProposalStoreError('LEDGER_PRECONDITION_FAILED', 'ledger/audit rejected revision mismatch'));
+    const record = createProposalStore({ root }).get('proposal-1');
+    assert.equal(record.proposal.action.status, 'manual_review');
+    assert.equal(record.claim.actionHash, 'hash');
+    assert.equal(record.recovery.error.code, 'LEDGER_PRECONDITION_FAILED');
+    assert.throws(() => createProposalStore({ root }).claim('proposal-1', 'hash'), { code: 'PROPOSAL_MANUAL_REVIEW' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
