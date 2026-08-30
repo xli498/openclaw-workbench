@@ -1,4 +1,5 @@
-import { readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { acquireWorkspaceWriteLock } from './change-transaction.mjs';
@@ -27,6 +28,24 @@ async function assertSafeExistingPath(root, candidate, label) {
     if (parent && !inside(root, parent)) throw new RecoveryError('RECOVERY_PATH_ESCAPE', label);
   }
   return real;
+}
+
+async function readSafeFile(root, candidate, label) {
+  const initial = await assertSafeExistingPath(root, candidate, label);
+  if (!initial) return null;
+  let handle;
+  try {
+    handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await handle.stat();
+    if (!info.isFile()) throw new RecoveryError('RECOVERY_PATH_INVALID', label);
+    const content = await handle.readFile();
+    const finalPath = await realpath(candidate).catch(() => null);
+    if (!finalPath || finalPath !== initial) throw new RecoveryError('RECOVERY_PATH_CHANGED', label);
+    return content;
+  } catch (error) {
+    if (error instanceof RecoveryError) throw error;
+    throw new RecoveryError('RECOVERY_PATH_INVALID', label);
+  } finally { await handle?.close().catch(() => {}); }
 }
 
 async function atomicWriteManifest(filePath, manifest) {
@@ -100,9 +119,9 @@ export async function inspectPendingTransaction({ root, manifest }) {
     const target = await assertSafeExistingPath(root, file.target, file.relativePath);
     if (file.snapshot) await assertSafeExistingPath(root, file.snapshot, file.relativePath);
     if (file.temp) await assertSafeExistingPath(root, file.temp, file.relativePath);
-    const snapshot = file.snapshot ? await readFile(file.snapshot).catch(() => null) : null;
-    const current = await readFile(file.target).catch(() => null);
-    const temp = file.temp ? await readFile(file.temp).catch(() => null) : null;
+    const snapshot = file.snapshot ? await readSafeFile(root, file.snapshot, file.relativePath).catch(() => null) : null;
+    const current = await readSafeFile(root, file.target, file.relativePath).catch(() => null);
+    const temp = file.temp ? await readSafeFile(root, file.temp, file.relativePath).catch(() => null) : null;
     files.push(Object.freeze({
       relativePath: file.relativePath,
       targetExists: Boolean(target),
@@ -168,12 +187,12 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
         if (file.snapshot) await assertSafeExistingPath(root, file.snapshot, file.relativePath);
         if (file.temp) await assertSafeExistingPath(root, file.temp, file.relativePath);
         if (mode === 'resume' && file.temp && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesAfter) {
-          const content = await readFile(file.temp).catch((error) => { throw new RecoveryError('TEMP_UNAVAILABLE', file.relativePath, { error: error.message }); });
+          const content = await readSafeFile(root, file.temp, file.relativePath).catch((error) => { throw new RecoveryError('TEMP_UNAVAILABLE', file.relativePath, { error: error.message }); });
           if (hash(content) !== file.afterHash) throw new RecoveryError('TEMP_HASH_MISMATCH', file.relativePath);
           await renameFile(file.temp, file.target);
           applied.push(file);
         } else if (mode === 'rollback' && file.snapshot && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesBefore) {
-          const content = await readFile(file.snapshot).catch((error) => { throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath, { error: error.message }); });
+          const content = await readSafeFile(root, file.snapshot, file.relativePath).catch((error) => { throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath, { error: error.message }); });
           const temp = `${file.target}.ocw-recovery.tmp-${Date.now()}`;
           await writeFile(temp, content, { flag: 'wx' });
           await renameFile(temp, file.target);
@@ -185,7 +204,7 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
       const appliedPaths = applied.map((file) => file.relativePath);
       for (const file of [...applied].reverse()) {
         try {
-          const content = await readFile(file.snapshot);
+          const content = await readSafeFile(root, file.snapshot, file.relativePath);
           const temp = `${file.target}.ocw-recovery-rollback-${Date.now()}`;
           await writeFile(temp, content, { flag: 'wx' });
           await renameFile(temp, file.target);
