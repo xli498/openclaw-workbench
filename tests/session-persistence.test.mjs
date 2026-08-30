@@ -95,3 +95,25 @@ test('会话快照在首次写入和原子覆盖后保持 owner-only 权限', as
     assert.equal((await stat(manager.snapshotPath)).mode & 0o777, 0o600);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('会话快照写入遇到已有锁时保守拒绝，不覆盖现有状态', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-lock-'));
+  try {
+    const manager = createChatSessionManager({ root });
+    await mkdir(`${manager.snapshotPath}.lock`, { recursive: true });
+    assert.throws(() => manager.createSession(), { code: 'SESSION_STORE_BUSY' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('两个会话 manager 基于不同快照版本写入时拒绝后写者覆盖', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-conflict-'));
+  try {
+    const first = createChatSessionManager({ root });
+    const stale = createChatSessionManager({ root });
+    const created = first.createSession();
+    assert.throws(() => stale.createSession(), { code: 'SESSION_STORE_CONFLICT' });
+    assert.throws(() => stale.getSession(created.id), { code: 'SESSION_NOT_FOUND' });
+    const restored = createChatSessionManager({ root });
+    assert.equal(restored.getSession(created.id).id, created.id);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

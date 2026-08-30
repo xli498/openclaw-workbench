@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { assertSafeSnapshotPath, writeSnapshotAtomically } from './snapshot-store.mjs';
+import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 const DEFAULT_LIMIT = 500;
 
@@ -13,15 +12,18 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
   if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) throw new EventBusError('INVALID_LIMIT', 'limit must be an integer between 1 and 10000');
   const events = [];
   let sequence = 0;
+  let persistedDigest = null;
   function persist() {
     if (!storePath) return;
-    writeSnapshotAtomically({ root, storePath, payload: JSON.stringify({ version: 1, sequence, events }), ErrorType: EventBusError, code: 'EVENT_STORE_INVALID', message: 'event snapshot is invalid; refusing recovery', temporaryName: randomUUID() });
+    persistedDigest = writeSnapshotAtomically({ root, storePath, payload: JSON.stringify({ version: 1, sequence, events }), expectedDigest: persistedDigest, ErrorType: EventBusError, code: 'EVENT_STORE_INVALID', message: 'event snapshot is invalid; refusing recovery', busyCode: 'EVENT_STORE_BUSY', busyMessage: 'event snapshot write is already in progress', conflictCode: 'EVENT_STORE_CONFLICT', conflictMessage: 'event snapshot changed outside this manager; refusing overwrite', temporaryName: randomUUID() });
   }
   function restore() {
     if (!storePath) return false;
     try {
-      assertSafeSnapshotPath({ root, storePath, ErrorType: EventBusError, code: 'EVENT_STORE_INVALID', message: 'event snapshot is invalid; refusing recovery' });
-      const snapshot = JSON.parse(readFileSync(storePath, 'utf8'));
+      const stored = readSnapshot({ root, storePath, ErrorType: EventBusError, code: 'EVENT_STORE_INVALID', message: 'event snapshot is invalid; refusing recovery' });
+      if (stored.content === null) return false;
+      persistedDigest = stored.digest;
+      const snapshot = JSON.parse(stored.content);
       if (snapshot?.version !== 1 || !Number.isInteger(snapshot.sequence) || snapshot.sequence < 0 || !Array.isArray(snapshot.events)) throw new Error('unsupported event snapshot');
       const ids = new Set();
       if (snapshot.events.length > limit) throw new Error('invalid event snapshot');
@@ -33,7 +35,6 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
       sequence = snapshot.sequence;
       return events.length > 0;
     } catch (error) {
-      if (error?.code === 'ENOENT') return false;
       throw new EventBusError('EVENT_STORE_INVALID', 'event snapshot is invalid; refusing recovery');
     }
   }
@@ -41,10 +42,12 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
   function publish({ type, sessionId, actionId, requestId, data = {} } = {}) {
     if (typeof type !== 'string' || !type || type.length > 128) throw new EventBusError('INVALID_EVENT_TYPE', 'event type is required and must be at most 128 characters');
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw new EventBusError('INVALID_EVENT_DATA', 'event data must be an object');
+    const previousEvents = [...events];
+    const previousSequence = sequence;
     const event = Object.freeze({ id: randomUUID(), sequence: ++sequence, type, ...(sessionId ? { sessionId } : {}), ...(actionId ? { actionId } : {}), ...(requestId ? { requestId } : {}), data: Object.freeze({ ...data }), createdAt: clock().toISOString() });
     events.push(event);
     if (events.length > limit) events.splice(0, events.length - limit);
-    persist();
+    try { persist(); } catch (error) { events.splice(0, events.length, ...previousEvents); sequence = previousSequence; throw error; }
     return event;
   }
   function list({ after = 0, limit: requestedLimit = 100 } = {}) {

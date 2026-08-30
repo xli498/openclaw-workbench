@@ -1,9 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runAgent } from './openclaw-adapter.mjs';
 import { runPlanReview, PlanError } from './plan.mjs';
-import { assertSafeSnapshotPath, writeSnapshotAtomically } from './snapshot-store.mjs';
+import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 export const CHAT_MODES = Object.freeze(['Ask', 'Plan', 'Code']);
 const MAX_MESSAGE_LENGTH = 32 * 1024;
@@ -27,14 +26,17 @@ function snapshotSession(session) {
 export function createChatSessionManager({ root, runAgentFn = runAgent, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
   if (!root) throw new SessionError('ROOT_REQUIRED', 'root is required');
   const sessions = new Map();
+  let persistedDigest = null;
   function persist() {
     const payload = JSON.stringify({ version: 1, sessions: [...sessions.values()].map(snapshotSession) });
-    writeSnapshotAtomically({ root, storePath, payload, ErrorType: SessionError, code: 'SESSION_STORE_INVALID', message: 'session snapshot is invalid; refusing recovery', temporaryName: randomUUID() });
+    persistedDigest = writeSnapshotAtomically({ root, storePath, payload, expectedDigest: persistedDigest, ErrorType: SessionError, code: 'SESSION_STORE_INVALID', message: 'session snapshot is invalid; refusing recovery', busyCode: 'SESSION_STORE_BUSY', busyMessage: 'session snapshot write is already in progress', conflictCode: 'SESSION_STORE_CONFLICT', conflictMessage: 'session snapshot changed outside this manager; refusing overwrite', temporaryName: randomUUID() });
   }
   function restore() {
     try {
-      assertSafeSnapshotPath({ root, storePath, ErrorType: SessionError, code: 'SESSION_STORE_INVALID', message: 'session snapshot is invalid; refusing recovery' });
-      const payload = JSON.parse(readFileSync(storePath, 'utf8'));
+      const snapshot = readSnapshot({ root, storePath, ErrorType: SessionError, code: 'SESSION_STORE_INVALID', message: 'session snapshot is invalid; refusing recovery' });
+      if (snapshot.content === null) return;
+      persistedDigest = snapshot.digest;
+      const payload = JSON.parse(snapshot.content);
       if (payload?.version !== 1 || !Array.isArray(payload.sessions)) throw new Error('unsupported snapshot');
       const ids = new Set();
       for (const raw of payload.sessions) {
@@ -45,7 +47,6 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
         sessions.set(session.id, session);
       }
     } catch (error) {
-      if (error?.code === 'ENOENT') return;
       throw new SessionError('SESSION_STORE_INVALID', 'session snapshot is invalid; refusing recovery');
     }
   }
@@ -56,7 +57,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (typeof actor !== 'string' || !actor || actor.length > 256) throw new SessionError('INVALID_ACTOR', 'actor is required and must be at most 256 characters');
     const session = { id: randomUUID(), workspaceId, mode, actor, status: 'active', createdAt: clock().toISOString(), messages: [], running: false };
     sessions.set(session.id, session);
-    persist();
+    try { persist(); } catch (error) { sessions.delete(session.id); throw error; }
     return publicSession(session);
   }
 
@@ -74,7 +75,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     session.running = true;
     const userMessage = Object.freeze({ role: 'user', content: message, createdAt: clock().toISOString() });
     session.messages.push(userMessage);
-    persist();
+    try { persist(); } catch (error) { session.messages.pop(); session.running = false; throw error; }
     try {
       const response = await runAgentFn({ message, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal });
       const assistantMessage = Object.freeze({ role: 'assistant', content: response, createdAt: clock().toISOString() });
@@ -94,7 +95,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (session.mode !== 'Plan') throw new SessionError('MODE_INSUFFICIENT', 'plan review requires a Plan session');
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
     session.running = true;
-    persist();
+    try { persist(); } catch (error) { session.running = false; throw error; }
     try { return await runPlanReview({ question, models, sessionKey: session.id, thinking, timeoutSeconds }); }
     catch (error) { if (error instanceof PlanError) throw error; throw error; }
     finally { session.running = false; persist(); }
@@ -108,8 +109,9 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
   function closeSession(sessionId) {
     const session = getSession(sessionId);
     if (session.running) throw new SessionError('SESSION_BUSY', 'cannot close a running session');
+    const previousStatus = session.status;
     session.status = 'closed';
-    persist();
+    try { persist(); } catch (error) { session.status = previousStatus; throw error; }
     return publicSession(session);
   }
 
@@ -118,10 +120,11 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (session.status !== 'manual_review') throw new SessionError('REVIEW_NOT_REQUIRED', 'session is not awaiting manual review');
     if (!['resume', 'close'].includes(decision)) throw new SessionError('INVALID_REVIEW_DECISION', 'decision must be resume or close');
     if (typeof reviewer !== 'string' || !reviewer || reviewer.length > 256) throw new SessionError('INVALID_REVIEWER', 'reviewer is required and must be at most 256 characters');
+    const previous = { status: session.status, recoveryReason: session.recoveryReason, review: session.review };
     session.status = decision === 'resume' ? 'active' : 'closed';
     session.recoveryReason = undefined;
     session.review = Object.freeze({ decision, reviewer, reviewedAt: clock().toISOString(), replayed: false });
-    persist();
+    try { persist(); } catch (error) { Object.assign(session, previous); throw error; }
     return publicSession(session);
   }
 

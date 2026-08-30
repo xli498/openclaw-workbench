@@ -1,4 +1,5 @@
-import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync, writeFileSync, chmodSync, rmdirSync, unlinkSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, relative, resolve, sep } from 'node:path';
 
 function inside(root, target) {
@@ -23,16 +24,38 @@ export function assertSafeSnapshotPath({ root, storePath, ErrorType, code, messa
   }
 }
 
-export function writeSnapshotAtomically({ root, storePath, payload, ErrorType, code, message, temporaryName }) {
+export function snapshotDigest(content) {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+export function readSnapshot({ root, storePath, ErrorType, code, message }) {
+  assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
+  try {
+    const content = readFileSync(storePath, 'utf8');
+    return Object.freeze({ content, digest: snapshotDigest(content) });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return Object.freeze({ content: null, digest: null });
+    throw error;
+  }
+}
+
+export function writeSnapshotAtomically({ root, storePath, payload, expectedDigest, ErrorType, code, message, busyCode, busyMessage, conflictCode, conflictMessage, temporaryName }) {
   assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
   mkdirSync(dirname(storePath), { recursive: true, mode: 0o700 });
   assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
+  const lockPath = `${storePath}.lock`;
+  try { mkdirSync(lockPath, { mode: 0o700 }); }
+  catch (error) { if (error.code === 'EEXIST') throw new ErrorType(busyCode, busyMessage); throw error; }
   const temporary = `${storePath}.${temporaryName}.tmp`;
-  writeFileSync(temporary, payload, { mode: 0o600, flag: 'wx' });
   try {
+    const current = readSnapshot({ root, storePath, ErrorType, code, message });
+    if (current.digest !== expectedDigest) throw new ErrorType(conflictCode, conflictMessage);
+    writeFileSync(temporary, payload, { mode: 0o600, flag: 'wx' });
     renameSync(temporary, storePath);
     chmodSync(storePath, 0o600);
-  } catch (error) {
-    throw error;
+    return snapshotDigest(payload);
+  } finally {
+    try { unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    rmdirSync(lockPath);
   }
 }

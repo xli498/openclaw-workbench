@@ -77,6 +77,10 @@ Content-Type: application/json
 
 会话、提案和事件快照仅接受位于已解析工作区根目录内的普通文件；快照文件或其 `.openclaw-workbench` 上级目录为符号链接时，恢复和写入都会以各自的 `*_STORE_INVALID` 错误拒绝。原子写入后的文件权限固定为 `0600`，目录以 `0700` 创建。该措施用于阻断配置错误或本地替换造成的路径逃逸；它不替代操作系统账户隔离，也不承诺对拥有同等本机文件系统权限的对手提供竞争条件防护。
 
+每个快照文件写入前还会以同目录 `<snapshot>.lock` 目录进行独占保护。检测到该锁时，写入立即以 `SESSION_STORE_BUSY`、`PROPOSAL_STORE_BUSY` 或 `EVENT_STORE_BUSY` 拒绝，不会等待、重试、抢占锁或以旧内存覆盖现有快照。锁只覆盖同步“写临时文件→rename→chmod”的临界区；进程崩溃留下的锁必须由本机操作者检查后处理，系统不会自行接管。
+
+每个 store 在加载时还记录快照摘要；取得锁后会再次读取并比对。若另一个 manager 已提交新版本，后写者以 `SESSION_STORE_CONFLICT`、`PROPOSAL_STORE_CONFLICT` 或 `EVENT_STORE_CONFLICT` 拒绝，磁盘保留先提交版本。系统不会自动重载、合并、重试或覆盖冲突；操作者应停止冲突实例并在确认状态后新建 manager。
+
 ## Plan 多模型复核
 
 ```http

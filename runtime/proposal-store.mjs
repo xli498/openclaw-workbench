@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { assertSafeSnapshotPath, writeSnapshotAtomically } from './snapshot-store.mjs';
+import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 const TERMINAL = new Set(['verified', 'failed', 'timed_out', 'cancelled']);
 
@@ -20,13 +19,16 @@ function publicRecord(record) {
 export function createProposalStore({ root, storePath = join(root ?? '', '.openclaw-workbench', 'proposals.json') } = {}) {
   if (!root) throw new ProposalStoreError('ROOT_REQUIRED', 'root is required');
   const records = new Map();
+  let persistedDigest = null;
   function persist() {
-    writeSnapshotAtomically({ root, storePath, payload: JSON.stringify({ version: 1, proposals: [...records.values()] }), ErrorType: ProposalStoreError, code: 'PROPOSAL_STORE_INVALID', message: 'proposal snapshot is invalid; refusing recovery', temporaryName: randomUUID() });
+    persistedDigest = writeSnapshotAtomically({ root, storePath, payload: JSON.stringify({ version: 1, proposals: [...records.values()] }), expectedDigest: persistedDigest, ErrorType: ProposalStoreError, code: 'PROPOSAL_STORE_INVALID', message: 'proposal snapshot is invalid; refusing recovery', busyCode: 'PROPOSAL_STORE_BUSY', busyMessage: 'proposal snapshot write is already in progress', conflictCode: 'PROPOSAL_STORE_CONFLICT', conflictMessage: 'proposal snapshot changed outside this manager; refusing overwrite', temporaryName: randomUUID() });
   }
   function restore() {
     try {
-      assertSafeSnapshotPath({ root, storePath, ErrorType: ProposalStoreError, code: 'PROPOSAL_STORE_INVALID', message: 'proposal snapshot is invalid; refusing recovery' });
-      const snapshot = JSON.parse(readFileSync(storePath, 'utf8'));
+      const stored = readSnapshot({ root, storePath, ErrorType: ProposalStoreError, code: 'PROPOSAL_STORE_INVALID', message: 'proposal snapshot is invalid; refusing recovery' });
+      if (stored.content === null) return;
+      persistedDigest = stored.digest;
+      const snapshot = JSON.parse(stored.content);
       if (snapshot?.version !== 1 || !Array.isArray(snapshot.proposals)) throw new Error('unsupported proposal snapshot');
       const ids = new Set();
       for (const record of snapshot.proposals) {
@@ -38,15 +40,15 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
         records.set(action.id, Object.freeze({ proposal: record.proposal, ...(recovery ? { recovery } : {}) }));
       }
     } catch (error) {
-      if (error?.code === 'ENOENT') return;
       throw new ProposalStoreError('PROPOSAL_STORE_INVALID', 'proposal snapshot is invalid; refusing recovery');
     }
   }
   restore();
   function put(proposal) {
     if (!validProposal(proposal)) throw new ProposalStoreError('INVALID_PROPOSAL', 'proposal action is required');
+    const previous = records.get(proposal.action.id);
     records.set(proposal.action.id, Object.freeze({ proposal }));
-    persist();
+    try { persist(); } catch (error) { if (previous) records.set(proposal.action.id, previous); else records.delete(proposal.action.id); throw error; }
     return publicRecord(records.get(proposal.action.id));
   }
   function markTerminal(id, action) {
@@ -55,7 +57,7 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
     if (!TERMINAL.has(action?.status)) throw new ProposalStoreError('INVALID_TERMINAL_ACTION', 'action must be terminal');
     const proposal = Object.freeze({ ...record.proposal, action });
     records.set(id, Object.freeze({ proposal }));
-    persist();
+    try { persist(); } catch (error) { records.set(id, record); throw error; }
     return publicRecord(records.get(id));
   }
   function get(id) { return records.has(id) ? publicRecord(records.get(id)) : null; }

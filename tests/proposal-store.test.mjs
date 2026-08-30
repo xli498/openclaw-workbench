@@ -65,3 +65,24 @@ test('拒绝指向工作区外的提案快照符号链接', async () => {
     assert.throws(() => createProposalStore({ root }), { code: 'PROPOSAL_STORE_INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });
+
+test('提案快照写入遇到已有锁时保守拒绝，不覆盖现有状态', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-lock-'));
+  try {
+    const store = createProposalStore({ root });
+    await mkdir(`${store.snapshotPath}.lock`, { recursive: true });
+    assert.throws(() => store.put(proposal()), { code: 'PROPOSAL_STORE_BUSY' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('两个提案 store 基于不同快照版本写入时拒绝后写者覆盖', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-conflict-'));
+  try {
+    const first = createProposalStore({ root });
+    const stale = createProposalStore({ root });
+    first.put(proposal());
+    assert.throws(() => stale.put({ action: { id: 'proposal-2', status: 'awaiting_approval', actionHash: 'hash-2' } }), { code: 'PROPOSAL_STORE_CONFLICT' });
+    assert.equal(stale.get('proposal-2'), null);
+    assert.equal(createProposalStore({ root }).get('proposal-1').proposal.action.id, 'proposal-1');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

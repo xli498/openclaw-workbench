@@ -71,3 +71,24 @@ test('拒绝指向工作区外的事件快照符号链接', async () => {
     assert.throws(() => createEventBus({ root }), { code: 'EVENT_STORE_INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });
+
+test('事件快照写入遇到已有锁时保守拒绝，不覆盖现有状态', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-events-lock-'));
+  try {
+    const bus = createEventBus({ root });
+    await mkdir(`${bus.snapshotPath}.lock`, { recursive: true });
+    assert.throws(() => bus.publish({ type: 'blocked' }), { code: 'EVENT_STORE_BUSY' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('两个事件总线基于不同快照版本写入时拒绝后写者覆盖', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-events-conflict-'));
+  try {
+    const first = createEventBus({ root });
+    const stale = createEventBus({ root });
+    first.publish({ type: 'first' });
+    assert.throws(() => stale.publish({ type: 'stale' }), { code: 'EVENT_STORE_CONFLICT' });
+    assert.equal(stale.list().latestSequence, 0);
+    assert.deepEqual(createEventBus({ root }).list().events.map((event) => event.type), ['first']);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
