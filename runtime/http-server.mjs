@@ -5,6 +5,7 @@ import { createPatchProposal, approveAndApplyPatch, createCommandProposal, appro
 import { createChatSessionManager, SessionError } from './session.mjs';
 import { createCodeToolProposal } from './code-tools.mjs';
 import { createEventBus, EventBusError } from './event-bus.mjs';
+import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -31,6 +32,7 @@ function errorResponse(error) {
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error instanceof EventBusError) return { status: 400, body: { error: error.code, message: error.message } };
+  if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : 400, body: { error: error.code, message: error.message } };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
 }
 
@@ -46,6 +48,7 @@ function publicProposal(proposal) {
 export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0, runAgentFn, eventBus = createEventBus() } = {}) {
   if (!root) throw new Error('root is required');
   const proposals = new Map();
+  const proposalStore = createProposalStore({ root });
   const sessions = createChatSessionManager({ root, runAgentFn });
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
@@ -68,6 +71,7 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
         const input = await bodyOf(request);
         const proposal = await createCodeToolProposal({ mode: session.mode, tool: input.tool, input: { ...input.input, sessionId: session.id }, root, audit });
         proposals.set(proposal.action.id, proposal);
+        proposalStore.put(proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: session.id, actionId: proposal.action.id, requestId, data: { tool: input.tool, actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
@@ -83,6 +87,7 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
         const input = await bodyOf(request);
         const proposal = await createPatchProposal({ ...input, root, audit });
         proposals.set(proposal.action.id, proposal);
+        proposalStore.put(proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
@@ -90,22 +95,45 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
         const input = await bodyOf(request);
         const proposal = createCommandProposal({ ...input, root, audit });
         proposals.set(proposal.action.id, proposal);
+        proposalStore.put(proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
       const approval = url.pathname.match(/^\/v1\/proposals\/([^/]+)\/approve$/);
       if (request.method === 'POST' && approval) {
         const proposal = proposals.get(approval[1]);
-        if (!proposal) return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
+        if (!proposal) {
+          const recovered = proposalStore.get(approval[1]);
+          if (recovered?.recovery?.state === 'manual_review') return json(response, 409, { error: 'PROPOSAL_MANUAL_REVIEW', message: 'proposal was interrupted by restart; create a fresh proposal after review' });
+          return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
+        }
         const input = await bodyOf(request);
         if (proposal.command) {
-          const result = await approveAndRunCommand({ proposal, ...input, root, approved: true, audit });
+          try {
+            const result = await approveAndRunCommand({ proposal, ...input, root, approved: true, audit });
+            proposalStore.markTerminal(proposal.action.id, result.action);
+            eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
+            return json(response, 200, result);
+          } catch (error) {
+            if (error instanceof WorkflowError && error.details?.action) proposalStore.markTerminal(proposal.action.id, error.details.action);
+            throw error;
+          }
+        }
+        try {
+          const result = await approveAndApplyPatch({ proposal, ...input, root, approved: true, audit });
+          proposalStore.markTerminal(proposal.action.id, result.action);
           eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
           return json(response, 200, result);
+        } catch (error) {
+          if (error instanceof WorkflowError && error.details?.action) proposalStore.markTerminal(proposal.action.id, error.details.action);
+          throw error;
         }
-        const result = await approveAndApplyPatch({ proposal, ...input, root, approved: true, audit });
-        eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
-        return json(response, 200, result);
+      }
+      const proposalGet = url.pathname.match(/^\/v1\/proposals\/([^/]+)$/);
+      if (request.method === 'GET' && proposalGet) {
+        const record = proposalStore.get(proposalGet[1]);
+        if (!record) return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
+        return json(response, 200, { proposal: publicProposal(record.proposal), ...(record.recovery ? { recovery: record.recovery } : {}) });
       }
       return json(response, 404, { error: 'NOT_FOUND', message: 'route not found' });
     } catch (error) {

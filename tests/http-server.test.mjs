@@ -90,3 +90,38 @@ test('人工复核 API 仅转换 manual_review 状态并发布只读事件', asy
     await app.close();
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('重启后的未完成提案只能查看，审批接口拒绝自动恢复', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-proposal-recovery-'));
+  const first = createWorkbenchServer({ root, token: 'test-token' });
+  const firstAddress = await first.listen();
+  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: [process.execPath, '-e', 'console.log("no")'] }) });
+  await first.close();
+  const second = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await second.listen();
+  try {
+    const record = await request(address, `/v1/proposals/${created.body.proposal.action.id}`);
+    assert.equal(record.status, 200);
+    assert.equal(record.body.recovery.state, 'manual_review');
+    const approval = await request(address, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', body: '{}' });
+    assert.equal(approval.status, 409);
+    assert.equal(approval.body.error, 'PROPOSAL_MANUAL_REVIEW');
+  } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('执行失败的命令提案保存终态，而不是被重启误判为待复核', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-proposal-terminal-'));
+  const first = createWorkbenchServer({ root, token: 'test-token' });
+  const firstAddress = await first.listen();
+  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: [process.execPath, '-e', 'process.exit(1)'] }) });
+  const failed = await request(firstAddress, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', body: '{}' });
+  assert.equal(failed.status, 400);
+  await first.close();
+  const second = createWorkbenchServer({ root, token: 'test-token' });
+  const address = await second.listen();
+  try {
+    const record = await request(address, `/v1/proposals/${created.body.proposal.action.id}`);
+    assert.equal(record.body.proposal.action.status, 'failed');
+    assert.equal(record.body.recovery, undefined);
+  } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
+});

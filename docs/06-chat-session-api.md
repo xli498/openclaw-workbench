@@ -65,6 +65,10 @@ Content-Type: application/json
 
 只有 `manual_review` 会话可调用该接口。`resume` 仅将会话标为可接收**新的**回合，`close` 则关闭会话；二者都不会重放中断消息、模型调用、Patch 或命令。完成后发布只读的 `session.reviewed` 事件。
 
+## 提案安全恢复
+
+提案快照写入 `.openclaw-workbench/proposals.json`，同样采用原子 rename。进程重启前未进入终态的提案将只恢复为可查看记录，并标记 `recovery.state: manual_review`；它们不重新进入审批或执行内存队列，`POST /v1/proposals/:id/approve` 会返回 `409 PROPOSAL_MANUAL_REVIEW`。已完成的 `verified`、`failed`、`timed_out`、`cancelled` 提案仅作为历史保留。要继续未完成操作，需经人工复核后创建新的提案，重新计算当前 revision、策略和 action hash。
+
 ## Plan 多模型复核
 
 ```http
