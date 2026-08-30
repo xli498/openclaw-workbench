@@ -25,3 +25,36 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
     assert.equal(approved.body.action.status, 'verified');
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('本地控制面提供 Chat 会话并把模式绑定到 Adapter', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-chat-'));
+  const calls = [];
+  const app = createWorkbenchServer({ root, token: 'test-token', runAgentFn: async (input) => { calls.push(input); return { text: '计划完成' }; } });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan', actor: 'tester' }) });
+    assert.equal(created.status, 201);
+    const sessionId = created.body.session.id;
+    const result = await request(address, `/v1/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ message: '分析项目' }) });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.session.mode, 'Plan');
+    assert.equal(calls[0].mode, 'Plan');
+    assert.equal(calls[0].sessionKey, sessionId);
+    const messages = await request(address, `/v1/sessions/${sessionId}/messages`);
+    assert.equal(messages.body.messages.length, 2);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('Chat 会话非法模式和不存在会话返回结构化错误', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-chat-error-'));
+  const app = createWorkbenchServer({ root, token: 'test-token', runAgentFn: async () => ({ text: 'unused' }) });
+  const address = await app.listen();
+  try {
+    const invalid = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Write' }) });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.body.error, 'INVALID_MODE');
+    const missing = await request(address, '/v1/sessions/not-found/messages', { method: 'GET' });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.error, 'SESSION_NOT_FOUND');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});

@@ -43,7 +43,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     const userMessage = Object.freeze({ role: 'user', content: message, createdAt: clock().toISOString() });
     session.messages.push(userMessage);
     try {
-      const response = await runAgentFn({ message, sessionKey: session.id, model, thinking, timeoutSeconds, local });
+      const response = await runAgentFn({ message, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal });
       const assistantMessage = Object.freeze({ role: 'assistant', content: response, createdAt: clock().toISOString() });
       session.messages.push(assistantMessage);
       return Object.freeze({ session: publicSession(session), message: assistantMessage });

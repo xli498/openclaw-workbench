@@ -14,6 +14,7 @@ test('Chat 会话遵守 Ask/Plan/Code 模式并通过 Adapter 记录消息', asy
   assert.equal(result.session.mode, 'Plan');
   assert.equal(result.message.role, 'assistant');
   assert.equal(calls[0].sessionKey, session.id);
+  assert.equal(calls[0].mode, 'Plan');
   assert.equal(calls[0].local, true);
   assert.equal(manager.listMessages(session.id).length, 2);
   assert.throws(() => manager.createSession({ mode: 'Unknown' }), (error) => error instanceof SessionError && error.code === 'INVALID_MODE');
