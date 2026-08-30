@@ -438,3 +438,15 @@ test('hunk 应用支持上下文、删除和新增', () => {
   const result = applyHunks('a\nb\nc\n', [{ oldStart: 2, body: [' b', '-c', '+C', '+d'] }]);
   assert.equal(result, 'a\nb\nC\nd\n');
 });
+
+test('补丁事务拒绝符号链接目标，防止读取工作区外内容', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt');
+  const outside = path.join(tmpdir(), `ocw-outside-${Date.now()}.txt`);
+  await writeFile(outside, 'outside\n');
+  await (await import('node:fs/promises')).unlink(target);
+  await symlink(outside, target);
+  const patch = parseUnifiedPatch('--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-outside\n+two\n');
+  await assert.rejects(() => applyPatchTransaction({ root, parsedPatch: patch, declaredPaths: ['a.txt'] }), (error) => error.code === 'SYMLINK_TARGET' || error.code === 'TARGET_UNAVAILABLE');
+  await (await import('node:fs/promises')).unlink(outside);
+});

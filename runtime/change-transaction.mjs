@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
 import { mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { validatePatchTargets } from './patch-engine.mjs';
@@ -124,7 +125,19 @@ export async function applyPatchTransaction({ root, parsedPatch, declaredPaths, 
       const target = safeRelative(base, file.newPath);
       const targetReal = await realpath(target).catch((e) => { throw new TransactionError('TARGET_UNAVAILABLE', e.message); });
       if (targetReal !== target) throw new TransactionError('SYMLINK_TARGET', file.newPath);
-      const before = await readFile(target);
+      let handle;
+      let before;
+      try {
+        handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const info = await handle.stat();
+        if (!info.isFile()) throw new TransactionError('TARGET_UNAVAILABLE', 'patch target must be a regular file');
+        before = await handle.readFile();
+      } catch (error) {
+        if (error instanceof TransactionError) throw error;
+        throw new TransactionError('TARGET_UNAVAILABLE', error.message);
+      } finally { await handle?.close().catch(() => {}); }
+      const targetAfterRead = await realpath(target).catch((e) => { throw new TransactionError('TARGET_UNAVAILABLE', e.message); });
+      if (targetAfterRead !== target || targetAfterRead !== targetReal) throw new TransactionError('TARGET_CHANGED', file.newPath);
       const beforeHash = digest(before);
       const next = applyHunks(before.toString('utf8'), file.hunks);
       snapshots.push({ target, relativePath: file.newPath, before, beforeHash });

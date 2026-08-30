@@ -76,9 +76,16 @@ function errorResponse(error) {
 }
 
 function requireToken(request, token) {
-  if (!token) return true;
+  if (typeof token !== 'string' || token.length < 16) return false;
   const expected = createHash('sha256').update(`Bearer ${token}`).digest();
   const received = createHash('sha256').update(request.headers.authorization ?? '').digest();
+  return timingSafeEqual(expected, received);
+}
+
+function requireApprovalToken(request, token) {
+  if (typeof token !== 'string' || token.length < 16) return false;
+  const expected = createHash('sha256').update(token).digest();
+  const received = createHash('sha256').update(request.headers['x-approval-token'] ?? '').digest();
   return timingSafeEqual(expected, received);
 }
 
@@ -86,8 +93,10 @@ function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
-export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0, runAgentFn, eventBus = createEventBus({ root }) } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, eventBus = createEventBus({ root }) } = {}) {
   if (!root) throw new Error('root is required');
+  if (typeof token !== 'string' || token.length < 16) throw new Error('token must be at least 16 characters');
+  if (!['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error('host must be loopback');
   const proposals = new Map();
   const proposalStore = createProposalStore({ root });
   const sessions = createChatSessionManager({ root, runAgentFn });
@@ -142,6 +151,7 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
       }
       const approval = url.pathname.match(/^\/v1\/proposals\/([^/]+)\/approve$/);
       if (request.method === 'POST' && approval) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
         const proposal = proposals.get(approval[1]);
         if (!proposal) {
           const recovered = proposalStore.get(approval[1]);
@@ -149,6 +159,7 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
           return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
         }
         const input = await bodyOf(request);
+        if (input.actionHash !== proposal.action.actionHash) return json(response, 409, { error: 'ACTION_HASH_MISMATCH', message: 'approval must bind the current action hash' });
         if (proposal.command) {
           try {
             const result = await approveAndRunCommand({ proposal, ...input, root, approved: true, audit });

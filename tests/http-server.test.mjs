@@ -6,21 +6,21 @@ import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
 
 async function request(address, pathname, options = {}) {
-  const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token', ...(options.headers ?? {}) } });
+  const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token-012345', ...(options.headers ?? {}) } });
   return { status: response.status, headers: response.headers, body: await response.json() };
 }
 
 test('本地控制面提供健康检查、鉴权和命令提案审批执行', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-'));
-  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     assert.equal((await request(address, '/health')).body.ok, true);
     const unauthorized = await fetch(`http://${address.address}:${address.port}/health`);
     assert.equal(unauthorized.status, 401);
-    const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'http-test', argv: [process.execPath, '-e', 'console.log("ok")'] }) });
+    const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'http-test', argv: ['pwd'] }) });
     assert.equal(proposal.status, 201);
-    const approved = await request(address, `/v1/proposals/${proposal.body.proposal.action.id}/approve`, { method: 'POST', body: '{}' });
+    const approved = await request(address, `/v1/proposals/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
     assert.equal(approved.status, 200);
     assert.equal(approved.body.action.status, 'verified');
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
@@ -28,7 +28,7 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
 
 test('本地控制面拒绝部分匹配和错误类型的 Bearer token', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-auth-'));
-  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     for (const authorization of ['Bearer test-toke', 'Bearer test-token-extra', 'Basic test-token', 'Bearer ', 'test-token']) {
@@ -39,9 +39,30 @@ test('本地控制面拒绝部分匹配和错误类型的 Bearer token', async (
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('控制面拒绝无 token、弱 token 或非回环绑定，并要求独立审批凭据和 actionHash', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-auth-boundary-'));
+  try {
+    assert.throws(() => createWorkbenchServer({ root }), /token must be at least 16 characters/);
+    assert.throws(() => createWorkbenchServer({ root, token: 'too-short' }), /token must be at least 16 characters/);
+    assert.throws(() => createWorkbenchServer({ root, token: 'test-token-012345', host: '0.0.0.0' }), /host must be loopback/);
+    const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+    const address = await app.listen();
+    try {
+      const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'auth-boundary', argv: ['pwd'] }) });
+      const url = `/v1/proposals/${proposal.body.proposal.action.id}/approve`;
+      const absent = await request(address, url, { method: 'POST', body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+      assert.equal(absent.status, 403);
+      assert.equal(absent.body.error, 'APPROVAL_AUTH_REQUIRED');
+      const mismatch = await request(address, url, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: 'wrong' }) });
+      assert.equal(mismatch.status, 409);
+      assert.equal(mismatch.body.error, 'ACTION_HASH_MISMATCH');
+    } finally { await app.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面只接受受限格式的请求 ID，非法值会替换为服务端 UUID', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-request-id-'));
-  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     const accepted = await request(address, '/health', { headers: { 'x-request-id': 'client.trace-01:part' } });
@@ -55,7 +76,7 @@ test('本地控制面只接受受限格式的请求 ID，非法值会替换为�
 
 test('事件游标和页面大小只接受安全的十进制整数', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-event-query-'));
-  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     assert.equal((await request(address, '/v1/events?after=0&limit=10')).status, 200);
@@ -69,7 +90,7 @@ test('事件游标和页面大小只接受安全的十进制整数', async () =>
 
 test('事件游标和页面大小拒绝重复查询参数', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-event-duplicates-'));
-  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     for (const query of ['after=0&after=1', 'limit=10&limit=20', 'after=0&limit=10&after=0']) {
@@ -82,7 +103,7 @@ test('事件游标和页面大小拒绝重复查询参数', async () => {
 
 test('写接口只接受 JSON 对象请求体，不把原始 JSON 值传入运行时', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-body-shape-'));
-  const app = createWorkbenchServer({ root, token: 'test-token' });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     for (const body of ['null', '[]', '"text"', '1', 'true']) {
@@ -99,7 +120,7 @@ test('写接口只接受 JSON 对象请求体，不把原始 JSON 值传入运�
 test('本地控制面提供 Chat 会话并把模式绑定到 Adapter', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-chat-'));
   const calls = [];
-  const app = createWorkbenchServer({ root, token: 'test-token', runAgentFn: async (input) => { calls.push(input); return { text: '计划完成' }; } });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn: async (input) => { calls.push(input); return { text: '计划完成' }; } });
   const address = await app.listen();
   try {
     const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan', actor: 'tester' }) });
@@ -117,7 +138,7 @@ test('本地控制面提供 Chat 会话并把模式绑定到 Adapter', async () 
 
 test('Chat 会话非法模式和不存在会话返回结构化错误', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-chat-error-'));
-  const app = createWorkbenchServer({ root, token: 'test-token', runAgentFn: async () => ({ text: 'unused' }) });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn: async () => ({ text: 'unused' }) });
   const address = await app.listen();
   try {
     const invalid = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Write' }) });
@@ -131,7 +152,7 @@ test('Chat 会话非法模式和不存在会话返回结构化错误', async () 
 
 test('本地事件 API 仅暴露已发生事件且遵守鉴权', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-events-'));
-  const app = createWorkbenchServer({ root, token: 'test-token', runAgentFn: async () => ({ text: 'ok' }) });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn: async () => ({ text: 'ok' }) });
   const address = await app.listen();
   try {
     const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
@@ -150,7 +171,7 @@ test('人工复核 API 仅转换 manual_review 状态并发布只读事件', asy
   try {
     await mkdir(path.join(root, '.openclaw-workbench'));
     await writeFile(path.join(root, '.openclaw-workbench', 'sessions.json'), JSON.stringify({ version: 1, sessions: [{ id: 'manual', workspaceId: root, mode: 'Ask', actor: 'user', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', messages: [], running: true }] }));
-    const app = createWorkbenchServer({ root, token: 'test-token' });
+    const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
     const address = await app.listen();
     const reviewed = await request(address, '/v1/sessions/manual/review', { method: 'POST', body: JSON.stringify({ decision: 'resume' }) });
     assert.equal(reviewed.status, 200);
@@ -163,17 +184,17 @@ test('人工复核 API 仅转换 manual_review 状态并发布只读事件', asy
 
 test('重启后的未完成提案只能查看，审批接口拒绝自动恢复', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-proposal-recovery-'));
-  const first = createWorkbenchServer({ root, token: 'test-token' });
+  const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const firstAddress = await first.listen();
-  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: [process.execPath, '-e', 'console.log("no")'] }) });
+  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: ['pwd'] }) });
   await first.close();
-  const second = createWorkbenchServer({ root, token: 'test-token' });
+  const second = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await second.listen();
   try {
     const record = await request(address, `/v1/proposals/${created.body.proposal.action.id}`);
     assert.equal(record.status, 200);
     assert.equal(record.body.recovery.state, 'manual_review');
-    const approval = await request(address, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', body: '{}' });
+    const approval = await request(address, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
     assert.equal(approval.status, 409);
     assert.equal(approval.body.error, 'PROPOSAL_MANUAL_REVIEW');
   } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
@@ -181,13 +202,13 @@ test('重启后的未完成提案只能查看，审批接口拒绝自动恢复',
 
 test('执行失败的命令提案保存终态，而不是被重启误判为待复核', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-proposal-terminal-'));
-  const first = createWorkbenchServer({ root, token: 'test-token' });
+  const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const firstAddress = await first.listen();
-  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: [process.execPath, '-e', 'process.exit(1)'] }) });
-  const failed = await request(firstAddress, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', body: '{}' });
+  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 's', argv: ['git', 'status', '--bad-option'] }) });
+  const failed = await request(firstAddress, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
   assert.equal(failed.status, 400);
   await first.close();
-  const second = createWorkbenchServer({ root, token: 'test-token' });
+  const second = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await second.listen();
   try {
     const record = await request(address, `/v1/proposals/${created.body.proposal.action.id}`);
@@ -198,11 +219,11 @@ test('执行失败的命令提案保存终态，而不是被重启误判为待�
 
 test('重启后事件 API 把历史事件标记为 recovered，且维持全局 sequence', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-events-recovery-'));
-  const first = createWorkbenchServer({ root, token: 'test-token' });
+  const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const firstAddress = await first.listen();
   await request(firstAddress, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
   await first.close();
-  const second = createWorkbenchServer({ root, token: 'test-token' });
+  const second = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await second.listen();
   try {
     const events = await request(address, '/v1/events?after=0&limit=10');
@@ -217,7 +238,7 @@ test('状态 API 汇总重启恢复状态，不暴露会话或提案内容', asy
   try {
     await mkdir(path.join(root, '.openclaw-workbench'));
     await writeFile(path.join(root, '.openclaw-workbench', 'sessions.json'), JSON.stringify({ version: 1, sessions: [{ id: 'manual', workspaceId: root, mode: 'Code', actor: 'user', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', messages: [], running: true }] }));
-    const app = createWorkbenchServer({ root, token: 'test-token' });
+    const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
     const address = await app.listen();
     const status = await request(address, '/v1/status');
     assert.equal(status.status, 200);
