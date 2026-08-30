@@ -43,6 +43,15 @@ Content-Type: application/json
 
 该接口只接受 `Code` 会话和两个结构化工具：`patch`、`command`。模型或客户端只能生成待审批提案，不能通过 Chat 直接写文件或运行命令；提案仍需经过独立的人工审批接口，沿用 action hash、workspace revision、路径边界和命令策略校验。
 
+## 本地事件读取
+
+```http
+GET /v1/events?after=0&limit=100
+Authorization: Bearer <token>
+```
+
+事件读取接口仅轮询内存中的最近事件，支持递增 `sequence` 游标；默认最多保留 500 条。当前事件包括 `session.created`、`chat.completed`、`plan.completed`、`proposal.created` 和 `proposal.verified`。它是只读接口，不提供 SSE/WebSocket，不携带执行凭据，也不能批准或执行提案。
+
 ## Plan 多模型复核
 
 ```http

@@ -8,6 +8,7 @@ export { createWorkbenchServer } from './http-server.mjs';
 export { CHAT_MODES, SessionError, createChatSessionManager } from './session.mjs';
 export { PlanError, runPlanReview } from './plan.mjs';
 export { CODE_TOOLS, createCodeToolProposal } from './code-tools.mjs';
+export { EventBusError, createEventBus } from './event-bus.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {
   if (!root) throw new Error('root is required');

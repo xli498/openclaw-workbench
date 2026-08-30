@@ -58,3 +58,19 @@ test('Chat 会话非法模式和不存在会话返回结构化错误', async () 
     assert.equal(missing.body.error, 'SESSION_NOT_FOUND');
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('本地事件 API 仅暴露已发生事件且遵守鉴权', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-events-'));
+  const app = createWorkbenchServer({ root, token: 'test-token', runAgentFn: async () => ({ text: 'ok' }) });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+    const events = await request(address, '/v1/events?after=0&limit=10');
+    assert.equal(events.status, 200);
+    assert.equal(events.body.events.length, 1);
+    assert.equal(events.body.events[0].type, 'session.created');
+    assert.equal(events.body.events[0].sessionId, created.body.session.id);
+    const unauthorized = await fetch(`http://${address.address}:${address.port}/v1/events`);
+    assert.equal(unauthorized.status, 401);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});

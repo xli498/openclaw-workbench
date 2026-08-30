@@ -4,6 +4,7 @@ import { startWorkbench } from './index.mjs';
 import { createPatchProposal, approveAndApplyPatch, createCommandProposal, approveAndRunCommand, WorkflowError } from './workflow.mjs';
 import { createChatSessionManager, SessionError } from './session.mjs';
 import { createCodeToolProposal } from './code-tools.mjs';
+import { createEventBus, EventBusError } from './event-bus.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -29,6 +30,7 @@ function errorResponse(error) {
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: { error: error.code, message: error.message, details: error.details } };
   if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: { error: error.code, message: error.message, details: error.details } };
+  if (error instanceof EventBusError) return { status: 400, body: { error: error.code, message: error.message } };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
 }
 
@@ -41,7 +43,7 @@ function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
-export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0, runAgentFn } = {}) {
+export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', port = 0, runAgentFn, eventBus = createEventBus() } = {}) {
   if (!root) throw new Error('root is required');
   const proposals = new Map();
   const sessions = createChatSessionManager({ root, runAgentFn });
@@ -51,20 +53,22 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
     response.setHeader('x-request-id', requestId);
     try {
       if (!requireToken(request, token)) return json(response, 401, { error: 'UNAUTHORIZED', message: 'bearer token required' });
+      if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: Number(url.searchParams.get('after') ?? 0), limit: Number(url.searchParams.get('limit') ?? 100) }));
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startWorkbench({ root, audit })), root });
-      if (request.method === 'POST' && url.pathname === '/v1/sessions') return json(response, 201, { session: sessions.createSession(await bodyOf(request)) });
+      if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }
       const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
       if (request.method === 'GET' && sessionMessages) return json(response, 200, { messages: sessions.listMessages(sessionMessages[1]) });
-      if (request.method === 'POST' && sessionMessages) return json(response, 200, await sessions.sendMessage({ sessionId: sessionMessages[1], ...await bodyOf(request) }));
+      if (request.method === 'POST' && sessionMessages) { const result = await sessions.sendMessage({ sessionId: sessionMessages[1], ...await bodyOf(request) }); eventBus.publish({ type: 'chat.completed', sessionId: sessionMessages[1], requestId, data: { messageCount: result.session.messageCount } }); return json(response, 200, result); }
       const sessionPlan = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/plan$/);
-      if (request.method === 'POST' && sessionPlan) return json(response, 200, await sessions.planReview({ sessionId: sessionPlan[1], ...await bodyOf(request) }));
+      if (request.method === 'POST' && sessionPlan) { const result = await sessions.planReview({ sessionId: sessionPlan[1], ...await bodyOf(request) }); eventBus.publish({ type: 'plan.completed', sessionId: sessionPlan[1], requestId, data: { agreement: result.synthesis.agreement, requiresHumanReview: result.synthesis.requiresHumanReview } }); return json(response, 200, result); }
       const sessionTool = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/tools\/proposals$/);
       if (request.method === 'POST' && sessionTool) {
         const session = sessions.getSession(sessionTool[1]);
         const input = await bodyOf(request);
         const proposal = await createCodeToolProposal({ mode: session.mode, tool: input.tool, input: { ...input.input, sessionId: session.id }, root, audit });
         proposals.set(proposal.action.id, proposal);
+        eventBus.publish({ type: 'proposal.created', sessionId: session.id, actionId: proposal.action.id, requestId, data: { tool: input.tool, actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
       const sessionClose = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/close$/);
@@ -73,12 +77,14 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
         const input = await bodyOf(request);
         const proposal = await createPatchProposal({ ...input, root, audit });
         proposals.set(proposal.action.id, proposal);
+        eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
       if (request.method === 'POST' && url.pathname === '/v1/proposals/command') {
         const input = await bodyOf(request);
         const proposal = createCommandProposal({ ...input, root, audit });
         proposals.set(proposal.action.id, proposal);
+        eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
       const approval = url.pathname.match(/^\/v1\/proposals\/([^/]+)\/approve$/);
@@ -88,9 +94,11 @@ export function createWorkbenchServer({ root, audit, token, host = '127.0.0.1', 
         const input = await bodyOf(request);
         if (proposal.command) {
           const result = await approveAndRunCommand({ proposal, ...input, root, approved: true, audit });
+          eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
           return json(response, 200, result);
         }
         const result = await approveAndApplyPatch({ proposal, ...input, root, approved: true, audit });
+        eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
         return json(response, 200, result);
       }
       return json(response, 404, { error: 'NOT_FOUND', message: 'route not found' });
