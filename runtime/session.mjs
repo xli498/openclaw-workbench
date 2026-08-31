@@ -84,6 +84,9 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
     session.running = true;
     const controller = new AbortController();
+    const relayAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener('abort', relayAbort, { once: true });
     controllers.set(session.id, controller);
     const userMessage = Object.freeze({ role: 'user', content: message, createdAt: clock().toISOString() });
     session.messages.push(userMessage);
@@ -101,6 +104,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
       try { persist(); } catch (persistenceError) { attachPersistenceError(error, persistenceError); }
       throw error;
     } finally {
+      signal?.removeEventListener('abort', relayAbort);
       controllers.delete(session.id);
       session.running = false;
       try { persist(); } catch (persistenceError) {
@@ -110,13 +114,16 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     }
   }
 
-  async function planReview({ sessionId, question, models, thinking, timeoutSeconds } = {}) {
+  async function planReview({ sessionId, question, models, thinking, timeoutSeconds, signal } = {}) {
     const session = getSession(sessionId);
     if (session.status !== 'active') throw new SessionError('SESSION_NOT_ACTIVE', 'session is not active');
     if (session.mode !== 'Plan') throw new SessionError('MODE_INSUFFICIENT', 'plan review requires a Plan session');
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
     session.running = true;
     const controller = new AbortController();
+    const relayAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener('abort', relayAbort, { once: true });
     controllers.set(session.id, controller);
     try { persist(); } catch (error) { session.running = false; throw error; }
     let primaryError;
@@ -129,6 +136,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     }
     catch (error) { primaryError = error; throw error; }
     finally {
+      signal?.removeEventListener('abort', relayAbort);
       controllers.delete(session.id);
       session.running = false;
       try { persist(); } catch (persistenceError) {

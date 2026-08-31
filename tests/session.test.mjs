@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createChatSessionManager, SessionError } from '../runtime/session.mjs';
@@ -26,4 +26,21 @@ test('Chat 会话失败时不残留用户半轮消息', async () => {
   const session = manager.createSession({ mode: 'Ask' });
   await assert.rejects(() => manager.sendMessage({ sessionId: session.id, message: '读取' }));
   assert.equal(manager.listMessages(session.id).length, 0);
+});
+
+test('外部 AbortSignal 会取消 Chat 回合并清理半轮消息', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-session-external-abort-'));
+  const external = new AbortController();
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const manager = createChatSessionManager({ root, runAgentFn: async ({ signal }) => await new Promise((resolve, reject) => { markStarted(); signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { code: 'ABORTED' })), { once: true }); }) });
+  try {
+    const session = manager.createSession({ mode: 'Ask' });
+    const turn = manager.sendMessage({ sessionId: session.id, message: 'long', signal: external.signal });
+    await started;
+    external.abort();
+    await assert.rejects(turn, { code: 'ABORTED' });
+    assert.deepEqual(manager.listMessages(session.id), []);
+    assert.throws(() => manager.cancelTurn(session.id), { code: 'NO_RUNNING_TURN' });
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

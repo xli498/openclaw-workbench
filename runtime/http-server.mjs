@@ -94,6 +94,18 @@ function requireApprovalToken(request, token) {
   return timingSafeEqual(expected, received);
 }
 
+function requestAbortSignal(request, response) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const close = () => { if (!response.writableEnded) abort(); };
+  const socketClose = () => abort();
+  request.once('aborted', abort);
+  request.once('close', close);
+  response.once('close', close);
+  request.socket?.once('close', socketClose);
+  return Object.freeze({ signal: controller.signal, cleanup() { request.off('aborted', abort); request.off('close', close); response.off('close', close); request.socket?.off('close', socketClose); } });
+}
+
 function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
@@ -122,9 +134,11 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       await startupState;
       if (request.method === 'GET' && url.pathname === '/v1/events/stream') {
         const after = singleQueryInteger(url.searchParams, 'after', 0);
-        const unsubscribe = eventBus.subscribe((event) => { if (!response.destroyed && !response.writableEnded) response.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`); }, { after });
+        const stream = eventBus.subscribeFrom((event) => { if (!response.destroyed && !response.writableEnded) response.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`); }, { after, limit: Math.min(100, eventBus.retentionLimit ?? 100) });
+        const { page, unsubscribe } = stream;
+        if (page.cursorExpired) { unsubscribe(); return json(response, 409, { error: 'EVENT_CURSOR_EXPIRED', message: 'event cursor is older than retained history', earliestSequence: page.earliestSequence, latestSequence: page.latestSequence }); }
         liveStreams.add(response);
-        const initial = eventBus.list({ after, limit: 100 }).events;
+        const initial = page.events;
         response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-store', connection: 'keep-alive' });
         for (const event of initial) if (!response.destroyed) response.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
         const heartbeat = setInterval(() => { if (!response.destroyed) response.write(': keep-alive\n\n'); }, 15_000);
@@ -140,12 +154,12 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }
       const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
       if (request.method === 'GET' && sessionMessages) return json(response, 200, { messages: sessions.listMessages(sessionMessages[1]) });
-      if (request.method === 'POST' && sessionMessages) { const result = await sessions.sendMessage({ sessionId: sessionMessages[1], ...await bodyOf(request) }); eventBus.publish({ type: 'chat.completed', sessionId: sessionMessages[1], requestId, data: { messageCount: result.session.messageCount } }); return json(response, 200, result); }
+      if (request.method === 'POST' && sessionMessages) { const input = await bodyOf(request); const lifecycle = requestAbortSignal(request, response); try { const result = await sessions.sendMessage({ sessionId: sessionMessages[1], ...input, signal: lifecycle.signal }); eventBus.publish({ type: 'chat.completed', sessionId: sessionMessages[1], requestId, data: { messageCount: result.session.messageCount } }); return json(response, 200, result); } finally { lifecycle.cleanup(); } }
       const sessionCancel = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/cancel$/);
       if (request.method === 'POST' && sessionCancel) { const result = sessions.cancelTurn(sessionCancel[1]); eventBus.publish({ type: 'turn.cancel.requested', sessionId: sessionCancel[1], requestId, data: { cancelled: true } }); return json(response, 202, result); }
       const sessionPlan = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/plan$/);
       if (request.method === 'GET' && sessionPlan) return json(response, 200, { results: sessions.listPlanResults(sessionPlan[1]) });
-      if (request.method === 'POST' && sessionPlan) { const result = await sessions.planReview({ sessionId: sessionPlan[1], ...await bodyOf(request) }); eventBus.publish({ type: 'plan.completed', sessionId: sessionPlan[1], requestId, data: { agreement: result.synthesis.agreement, requiresHumanReview: result.synthesis.requiresHumanReview } }); return json(response, 200, result); }
+      if (request.method === 'POST' && sessionPlan) { const input = await bodyOf(request); const lifecycle = requestAbortSignal(request, response); try { const result = await sessions.planReview({ sessionId: sessionPlan[1], ...input, signal: lifecycle.signal }); eventBus.publish({ type: 'plan.completed', sessionId: sessionPlan[1], requestId, data: { agreement: result.synthesis.agreement, requiresHumanReview: result.synthesis.requiresHumanReview } }); return json(response, 200, result); } finally { lifecycle.cleanup(); } }
       const sessionTool = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/tools\/proposals$/);
       if (request.method === 'POST' && sessionTool) {
         const session = sessions.getSession(sessionTool[1]);

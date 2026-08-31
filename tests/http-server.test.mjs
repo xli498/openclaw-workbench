@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
+import { createEventBus } from '../runtime/event-bus.mjs';
 
 async function request(address, pathname, options = {}) {
   const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token-012345', ...(options.headers ?? {}) } });
@@ -250,6 +251,22 @@ test('事件 SSE 强制鉴权并拒绝非法或重复游标', async () => {
       const body = await response.json();
       assert.ok(['INVALID_QUERY_INTEGER', 'DUPLICATE_QUERY_PARAMETER'].includes(body.error), query);
     }
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('事件 SSE 对超出保留窗口的游标返回明确冲突', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-event-expired-'));
+  const eventBus = createEventBus({ root, limit: 2 });
+  eventBus.publish({ type: 'one' }); eventBus.publish({ type: 'two' }); eventBus.publish({ type: 'three' }); eventBus.publish({ type: 'four' });
+  const app = createWorkbenchServer({ root, eventBus, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const response = await fetch(`http://${address.address}:${address.port}/v1/events/stream?after=1`, { headers: { authorization: 'Bearer test-token-012345' } });
+    assert.equal(response.status, 409);
+    const body = await response.json();
+    assert.equal(body.error, 'EVENT_CURSOR_EXPIRED');
+    assert.equal(body.earliestSequence, 3);
+    assert.equal(body.latestSequence, 4);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

@@ -12,6 +12,31 @@ test('事件总线按序发布并支持游标读取与上限淘汰', () => {
   assert.deepEqual(page.events.map((event) => event.type), ['two', 'three']);
   assert.equal(page.nextAfter, 3);
   assert.equal(page.latestSequence, 3);
+  assert.equal(page.earliestSequence, 2);
+  assert.equal(page.cursorExpired, false);
+  assert.equal(bus.list({ after: 0, limit: 2 }).cursorExpired, false);
+});
+
+test('事件总线明确标记已超出保留窗口的游标', () => {
+  const bus = createEventBus({ limit: 2 });
+  bus.publish({ type: 'one' }); bus.publish({ type: 'two' }); bus.publish({ type: 'three' });
+  const expired = bus.list({ after: 1, limit: 2 });
+  assert.equal(expired.cursorExpired, false);
+  bus.publish({ type: 'four' });
+  assert.equal(bus.list({ after: 1, limit: 2 }).cursorExpired, true);
+});
+
+test('从游标订阅原子衔接历史页与后续实时事件', () => {
+  const bus = createEventBus({ limit: 4 });
+  bus.publish({ type: 'one' });
+  const live = [];
+  const stream = bus.subscribeFrom((event) => live.push(event.type), { after: 0, limit: 4 });
+  bus.publish({ type: 'two' });
+  assert.deepEqual(stream.page.events.map((event) => event.type), ['one']);
+  assert.deepEqual(live, ['two']);
+  stream.unsubscribe();
+  bus.publish({ type: 'three' });
+  assert.deepEqual(live, ['two']);
 });
 
 test('事件总线拒绝非法事件和游标', () => {

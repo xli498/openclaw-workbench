@@ -86,7 +86,14 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
     if (!Number.isInteger(after) || after < 0) throw new EventBusError('INVALID_CURSOR', 'after must be a non-negative integer');
     if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > limit) throw new EventBusError('INVALID_EVENT_LIMIT', `limit must be an integer between 1 and ${limit}`);
     const items = events.filter((event) => event.sequence > after).slice(0, requestedLimit);
-    return Object.freeze({ events: Object.freeze([...items]), nextAfter: items.length ? items.at(-1).sequence : after, latestSequence: sequence, recovered });
+    const earliestSequence = events.length ? events[0].sequence : sequence + 1;
+    const cursorExpired = after > 0 && after < earliestSequence - 1;
+    return Object.freeze({ events: Object.freeze([...items]), nextAfter: items.length ? items.at(-1).sequence : after, latestSequence: sequence, earliestSequence, cursorExpired, recovered });
   }
-  return Object.freeze({ publish, list, subscribe, snapshotPath: storePath, recovered });
+  function subscribeFrom(listener, { after = 0, limit: requestedLimit = Math.min(100, limit) } = {}) {
+    const page = list({ after, limit: requestedLimit });
+    const unsubscribe = subscribe(listener, { after: page.latestSequence });
+    return Object.freeze({ page, unsubscribe });
+  }
+  return Object.freeze({ publish, list, subscribe, subscribeFrom, snapshotPath: storePath, recovered, retentionLimit: limit });
 }
