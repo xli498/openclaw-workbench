@@ -39,6 +39,20 @@ test('本地控制面提供带安全策略响应头的控制台页面', async ()
     assert.match(response.headers.get('content-security-policy'), /default-src 'self'/);
     assert.match(html, /Ask · 只读/);
     assert.match(html, /批准执行/);
+    assert.match(html, /authorization:'Bearer '\+state\.token/);
+    assert.doesNotMatch(html, /EventSource|prompt\(|test-token-012345|approve-token-012345/);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面可显式使用受限 OpenClaw CLI Adapter，并将其失败安全映射为上游错误', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-adapter-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', adapter: { command: process.execPath, local: false, timeoutMs: 5_000, maxOutputBytes: 16_384 } });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+    const response = await request(address, `/v1/sessions/${created.body.session.id}/messages`, { method: 'POST', body: JSON.stringify({ message: 'hello', local: false }) });
+    assert.equal(response.status, 502);
+    assert.equal(response.body.error, 'PROCESS_FAILED');
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

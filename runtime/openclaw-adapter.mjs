@@ -84,3 +84,12 @@ export function runAgent(options, { command = 'openclaw', timeoutMs = DEFAULT_TI
     });
   });
 }
+
+export function createOpenClawAgentRunner({ command = 'openclaw', timeoutMs = DEFAULT_TIMEOUT_MS, maxOutputBytes = 1_048_576 } = {}) {
+  if (typeof command !== 'string' || !command) throw new AdapterError('INVALID_CONFIG', 'command is required');
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new AdapterError('INVALID_CONFIG', 'timeoutMs must be a positive safe integer');
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1) throw new AdapterError('INVALID_CONFIG', 'maxOutputBytes must be a positive safe integer');
+  // The Workbench control plane is deliberately local-only. Do not accept an
+  // adapter-level override: callers may supply only a request-local input.
+  return Object.freeze((input = {}) => runAgent({ ...input, local: true }, { command, timeoutMs, maxOutputBytes, signal: input.signal }));
+}

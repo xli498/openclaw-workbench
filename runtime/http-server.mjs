@@ -9,6 +9,7 @@ import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
 import { createWorkspace } from './workspace.mjs';
 import { CONTROL_PANEL_HTML } from './control-panel.mjs';
 import { transition } from './action.mjs';
+import { AdapterError, createOpenClawAgentRunner } from './openclaw-adapter.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -72,11 +73,12 @@ async function bodyOf(request) {
 function errorResponse(error) {
   const safe = (code, message) => ({ error: code, message: message && message.length <= 256 ? message : 'request failed' });
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
+  if (error instanceof AdapterError) return { status: error.code === 'TIMEOUT' ? 504 : error.code === 'ABORTED' ? 409 : 502, body: safe(error.code, error.message) };
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: safe(error.code, error.message) };
   if (error?.code === 'ABORTED') return { status: 409, body: { error: 'TURN_ABORTED', message: 'agent turn was cancelled' } };
   if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: safe(error.code, error.message) };
-  if (error instanceof EventBusError) return { status: 400, body: { error: error.code, message: error.message } };
-  if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: { error: error.code, message: error.message } };
+  if (error instanceof EventBusError) return { status: 400, body: safe(error.code, 'event request failed') };
+  if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, 'proposal request failed') };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -97,26 +99,31 @@ function requireApprovalToken(request, token) {
 function requestAbortSignal(request, response) {
   const controller = new AbortController();
   const abort = () => controller.abort();
-  const close = () => { if (!response.writableEnded) abort(); };
-  const socketClose = () => abort();
+  // IncomingMessage emits `close` after the request body has been consumed as
+  // well as when the client aborts. Only the explicit aborted signal is a
+  // reliable request-side cancellation source.
+  const requestClose = () => { if (request.aborted) abort(); };
+  const responseClose = () => { if (!response.writableEnded) abort(); };
+  const socketClose = () => { if (!response.writableEnded) abort(); };
   request.once('aborted', abort);
-  request.once('close', close);
-  response.once('close', close);
+  request.once('close', requestClose);
+  response.once('close', responseClose);
   request.socket?.once('close', socketClose);
-  return Object.freeze({ signal: controller.signal, cleanup() { request.off('aborted', abort); request.off('close', close); response.off('close', close); request.socket?.off('close', socketClose); } });
+  return Object.freeze({ signal: controller.signal, cleanup() { request.off('aborted', abort); request.off('close', requestClose); response.off('close', responseClose); request.socket?.off('close', socketClose); } });
 }
 
 function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, eventBus = createEventBus({ root }) } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, eventBus = createEventBus({ root }) } = {}) {
   if (!root) throw new Error('root is required');
   if (typeof token !== 'string' || token.length < 16) throw new Error('token must be at least 16 characters');
   if (!['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error('host must be loopback');
   const proposals = new Map();
   const proposalStore = createProposalStore({ root });
-  const sessions = createChatSessionManager({ root, runAgentFn });
+  const agentRunner = runAgentFn ?? (adapter ? createOpenClawAgentRunner(adapter) : undefined);
+  const sessions = createChatSessionManager({ root, runAgentFn: agentRunner });
   const startupState = startWorkbench({ root, audit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
   const liveStreams = new Set();
