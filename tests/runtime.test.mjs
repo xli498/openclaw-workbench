@@ -7,6 +7,7 @@ import { decide } from '../runtime/policy.mjs';
 import { actionHash, assertWorkspaceRevision, createAction, transition } from '../runtime/action.mjs';
 import { createAuditLog, createFileAuditLog, verifyAuditChain } from '../runtime/audit.mjs';
 import { AdapterError, buildAgentArgv, parseAgentJson, runAgent } from '../runtime/openclaw-adapter.mjs';
+import { createEventBus } from '../runtime/event-bus.mjs';
 
 test('Adapter 使用 argv 参数，不启用 shell，并要求明确会话目标', () => {
   const argv = buildAgentArgv({ message: '只输出状态', sessionKey: 'workbench-test', thinking: 'minimal', local: true });
@@ -36,6 +37,16 @@ test('Adapter 超时会终止执行组，而不是等待其后代自然退出', 
     await assert.rejects(() => runAgent({ message: 'x', agent: 'main' }, { command, timeoutMs: 50 }), (error) => error instanceof AdapterError && error.code === 'TIMEOUT');
     assert.ok(Date.now() - startedAt < 1_000);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('事件总线支持订阅实时事件并可安全取消订阅', () => {
+  const bus = createEventBus();
+  const received = [];
+  const unsubscribe = bus.subscribe((event) => received.push(event.type));
+  bus.publish({ type: 'stream.test' });
+  unsubscribe();
+  bus.publish({ type: 'stream.after' });
+  assert.deepEqual(received, ['stream.test']);
 });
 
 test('Ask 只能读取，Plan 不能修改，Code 修改必须审批', () => {

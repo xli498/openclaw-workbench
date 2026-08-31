@@ -4,7 +4,7 @@ const TERMINAL = new Set(['denied', 'cancelled', 'timed_out', 'failed', 'verifie
 const TRANSITIONS = Object.freeze({
   proposed: new Set(['inspected', 'denied']),
   inspected: new Set(['awaiting_approval', 'denied']),
-  awaiting_approval: new Set(['approved', 'denied']),
+  awaiting_approval: new Set(['approved', 'denied', 'cancelled']),
   approved: new Set(['executing', 'denied']),
   executing: new Set(['verified', 'cancelled', 'timed_out', 'failed']),
   verified: new Set(['rolled_back']),

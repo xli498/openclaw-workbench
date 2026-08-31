@@ -27,6 +27,20 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('本地控制面提供带安全策略响应头的控制台页面', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-ui-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const response = await fetch(`http://${address.address}:${address.port}/ui`, { headers: { authorization: 'Bearer test-token-012345' } });
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-security-policy'), /default-src 'self'/);
+    assert.match(html, /Ask · 只读/);
+    assert.match(html, /批准执行/);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('并发审批先持久化 claim，第二个请求冲突且不会双执行', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-approval-race-'));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
@@ -199,6 +213,157 @@ test('本地事件 API 仅暴露已发生事件且遵守鉴权', async () => {
     assert.equal(events.body.events[0].sessionId, created.body.session.id);
     const unauthorized = await fetch(`http://${address.address}:${address.port}/v1/events`);
     assert.equal(unauthorized.status, 401);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('事件 SSE 先发送历史事件，再推送新事件并支持断开清理', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-event-stream-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+    const streamResponse = await fetch(`http://${address.address}:${address.port}/v1/events/stream?after=0`, { headers: { authorization: 'Bearer test-token-012345' } });
+    assert.equal(streamResponse.status, 200);
+    assert.match(streamResponse.headers.get('content-type'), /text\/event-stream/);
+    const reader = streamResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let text = decoder.decode((await reader.read()).value);
+    assert.match(text, new RegExp(`event: session\\.created[\\s\\S]*${created.body.session.id}`));
+    const next = reader.read();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan' }) });
+    text += decoder.decode((await next).value);
+    assert.match(text, new RegExp(`event: session\\.created[\\s\\S]*${second.body.session.id}`));
+    await reader.cancel();
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('事件 SSE 强制鉴权并拒绝非法或重复游标', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-event-stream-boundary-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    assert.equal((await fetch(`http://${address.address}:${address.port}/v1/events/stream?after=0`)).status, 401);
+    for (const query of ['after=0x10', 'after=1.5', 'after=0&after=1']) {
+      const response = await fetch(`http://${address.address}:${address.port}/v1/events/stream?${query}`, { headers: { authorization: 'Bearer test-token-012345' } });
+      assert.equal(response.status, 400, query);
+      const body = await response.json();
+      assert.ok(['INVALID_QUERY_INTEGER', 'DUPLICATE_QUERY_PARAMETER'].includes(body.error), query);
+    }
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面提供会话和提案列表，且默认只暴露公开字段', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-lists-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Code', actor: 'tester' }) });
+    const sessions = await request(address, '/v1/sessions');
+    assert.equal(sessions.status, 200);
+    assert.equal(sessions.body.sessions[0].id, created.body.session.id);
+    assert.equal('messages' in sessions.body.sessions[0], false);
+    const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: created.body.session.id, argv: ['pwd'] }) });
+    const proposals = await request(address, '/v1/proposals?status=awaiting_approval');
+    assert.equal(proposals.status, 200);
+    assert.equal(proposals.body.proposals[0].action.id, proposal.body.proposal.action.id);
+    assert.equal('claim' in proposals.body.proposals[0], false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('待审批提案可拒绝或取消，执行中提案不能被取消', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-reject-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const denied = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'reject', argv: ['pwd'] }) });
+    const deniedResult = await request(address, `/v1/proposals/${denied.body.proposal.action.id}/deny`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' } });
+    assert.equal(deniedResult.status, 200);
+    assert.equal(deniedResult.body.proposal.action.status, 'denied');
+    const cancelled = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'cancel', argv: ['pwd'] }) });
+    const cancelledResult = await request(address, `/v1/proposals/${cancelled.body.proposal.action.id}/cancel`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' } });
+    assert.equal(cancelledResult.status, 200);
+    assert.equal(cancelledResult.body.proposal.action.status, 'cancelled');
+    const executing = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'busy', argv: ['pwd'] }) });
+    const approveUrl = `/v1/proposals/${executing.body.proposal.action.id}/approve`;
+    const approveOptions = { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: executing.body.proposal.action.actionHash }) };
+    const pending = request(address, approveUrl, approveOptions);
+    const cancelBusy = await request(address, `/v1/proposals/${executing.body.proposal.action.id}/cancel`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' } });
+    assert.equal(cancelBusy.status, 409);
+    await pending;
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('Plan 复核结果可查询并持久化到重启后的会话快照', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-plan-history-'));
+  const runAgentFn = async ({ model }) => ({ text: `analysis from ${model}` });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan', actor: 'tester' }) });
+    const result = await request(address, `/v1/sessions/${created.body.session.id}/plan`, { method: 'POST', body: JSON.stringify({ question: 'compare two designs', models: ['model-a', 'model-b'] }) });
+    assert.equal(result.status, 200);
+    const history = await request(address, `/v1/sessions/${created.body.session.id}/plan`);
+    assert.equal(history.status, 200);
+    assert.equal(history.body.results.length, 1);
+    assert.equal(history.body.results[0].synthesis.analysisCount, 2);
+    assert.equal('runAgentFn' in history.body.results[0], false);
+    await app.close();
+    const restarted = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn });
+    const restartedAddress = await restarted.listen();
+    try {
+      const restored = await request(restartedAddress, `/v1/sessions/${created.body.session.id}/plan`);
+      assert.equal(restored.status, 200);
+      assert.equal(restored.body.results[0].question, 'compare two designs');
+    } finally { await restarted.close(); }
+  } finally { await app.close().catch(() => {}); await rm(root, { recursive: true, force: true }); }
+});
+
+test('运行中的 Chat 回合可通过控制面安全取消', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-cancel-'));
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn: async ({ signal }) => await new Promise((resolve, reject) => { markStarted(); signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { code: 'ABORTED' })), { once: true }); }) });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+    const turn = request(address, `/v1/sessions/${created.body.session.id}/messages`, { method: 'POST', body: JSON.stringify({ message: 'long turn' }) });
+    await started;
+    const cancelled = await request(address, `/v1/sessions/${created.body.session.id}/cancel`, { method: 'POST' });
+    assert.equal(cancelled.status, 202);
+    const result = await turn;
+    assert.equal(result.status, 409);
+    assert.equal(result.body.error, 'TURN_ABORTED');
+    assert.equal((await request(address, `/v1/sessions/${created.body.session.id}/cancel`, { method: 'POST' })).status, 400);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('运行中的 Plan 复核可取消、拒绝并发回合且不保存半成品', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-plan-cancel-'));
+  let startedCount = 0;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const runAgentFn = async ({ signal }) => await new Promise((resolve, reject) => {
+    startedCount += 1;
+    if (startedCount === 2) markStarted();
+    signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { code: 'ABORTED' })), { once: true });
+  });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan' }) });
+    const id = created.body.session.id;
+    const turn = request(address, `/v1/sessions/${id}/plan`, { method: 'POST', body: JSON.stringify({ question: 'long review', models: ['model-a', 'model-b'] }) });
+    await started;
+    const concurrent = await request(address, `/v1/sessions/${id}/messages`, { method: 'POST', body: JSON.stringify({ message: 'must conflict' }) });
+    assert.equal(concurrent.status, 409);
+    assert.equal(concurrent.body.error, 'SESSION_BUSY');
+    assert.equal((await request(address, `/v1/sessions/${id}/cancel`, { method: 'POST' })).status, 202);
+    const result = await turn;
+    assert.equal(result.status, 409);
+    assert.equal(result.body.error, 'TURN_ABORTED');
+    const history = await request(address, `/v1/sessions/${id}/plan`);
+    assert.deepEqual(history.body.results, []);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

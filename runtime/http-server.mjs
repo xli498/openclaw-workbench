@@ -7,6 +7,8 @@ import { createCodeToolProposal } from './code-tools.mjs';
 import { createEventBus, EventBusError } from './event-bus.mjs';
 import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
 import { createWorkspace } from './workspace.mjs';
+import { CONTROL_PANEL_HTML } from './control-panel.mjs';
+import { transition } from './action.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -68,12 +70,14 @@ async function bodyOf(request) {
 }
 
 function errorResponse(error) {
-  if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: { error: error.code, message: error.message, details: error.details } };
-  if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: { error: error.code, message: error.message, details: error.details } };
-  if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: { error: error.code, message: error.message, details: error.details } };
+  const safe = (code, message) => ({ error: code, message: message && message.length <= 256 ? message : 'request failed' });
+  if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
+  if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: safe(error.code, error.message) };
+  if (error?.code === 'ABORTED') return { status: 409, body: { error: 'TURN_ABORTED', message: 'agent turn was cancelled' } };
+  if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof EventBusError) return { status: 400, body: { error: error.code, message: error.message } };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: { error: error.code, message: error.message } };
-  return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: { error: error.code ?? 'INTERNAL_ERROR', message: error.message } };
+  return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
 function requireToken(request, token) {
@@ -103,21 +107,44 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const sessions = createChatSessionManager({ root, runAgentFn });
   const startupState = startWorkbench({ root, audit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
+  const liveStreams = new Set();
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
     const requestId = requestIdOf(request.headers['x-request-id']);
     response.setHeader('x-request-id', requestId);
     try {
       if (!requireToken(request, token)) return json(response, 401, { error: 'UNAUTHORIZED', message: 'bearer token required' });
+      if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/ui')) {
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" });
+        return response.end(CONTROL_PANEL_HTML);
+      }
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       await startupState;
+      if (request.method === 'GET' && url.pathname === '/v1/events/stream') {
+        const after = singleQueryInteger(url.searchParams, 'after', 0);
+        const unsubscribe = eventBus.subscribe((event) => { if (!response.destroyed && !response.writableEnded) response.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`); }, { after });
+        liveStreams.add(response);
+        const initial = eventBus.list({ after, limit: 100 }).events;
+        response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-store', connection: 'keep-alive' });
+        for (const event of initial) if (!response.destroyed) response.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+        const heartbeat = setInterval(() => { if (!response.destroyed) response.write(': keep-alive\n\n'); }, 15_000);
+        let cleaned = false;
+        const cleanup = () => { if (cleaned) return; cleaned = true; clearInterval(heartbeat); unsubscribe(); liveStreams.delete(response); };
+        request.on('close', cleanup);
+        response.on('close', cleanup);
+        return;
+      }
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) }));
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), root, persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
+      if (request.method === 'GET' && url.pathname === '/v1/sessions') return json(response, 200, { sessions: sessions.listSessions({ status: url.searchParams.get('status') ?? undefined }) });
       if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }
       const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
       if (request.method === 'GET' && sessionMessages) return json(response, 200, { messages: sessions.listMessages(sessionMessages[1]) });
       if (request.method === 'POST' && sessionMessages) { const result = await sessions.sendMessage({ sessionId: sessionMessages[1], ...await bodyOf(request) }); eventBus.publish({ type: 'chat.completed', sessionId: sessionMessages[1], requestId, data: { messageCount: result.session.messageCount } }); return json(response, 200, result); }
+      const sessionCancel = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/cancel$/);
+      if (request.method === 'POST' && sessionCancel) { const result = sessions.cancelTurn(sessionCancel[1]); eventBus.publish({ type: 'turn.cancel.requested', sessionId: sessionCancel[1], requestId, data: { cancelled: true } }); return json(response, 202, result); }
       const sessionPlan = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/plan$/);
+      if (request.method === 'GET' && sessionPlan) return json(response, 200, { results: sessions.listPlanResults(sessionPlan[1]) });
       if (request.method === 'POST' && sessionPlan) { const result = await sessions.planReview({ sessionId: sessionPlan[1], ...await bodyOf(request) }); eventBus.publish({ type: 'plan.completed', sessionId: sessionPlan[1], requestId, data: { agreement: result.synthesis.agreement, requiresHumanReview: result.synthesis.requiresHumanReview } }); return json(response, 200, result); }
       const sessionTool = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/tools\/proposals$/);
       if (request.method === 'POST' && sessionTool) {
@@ -147,7 +174,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'POST' && url.pathname === '/v1/proposals/command') {
         const input = await bodyOf(request);
-        const proposal = createCommandProposal({ ...input, root, audit, currentRevision: await currentWorkspaceRevision() });
+        const proposal = await createCommandProposal({ ...input, root, audit, currentRevision: await currentWorkspaceRevision() });
         proposals.set(proposal.action.id, proposal);
         proposalStore.put(proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
@@ -183,7 +210,24 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           throw error;
         }
       }
+      const reject = url.pathname.match(/^\/v1\/proposals\/([^/]+)\/(deny|cancel)$/);
+      if (request.method === 'POST' && reject) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const proposal = proposals.get(reject[1]) ?? proposalStore.get(reject[1])?.proposal;
+        if (!proposal) return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
+        const nextStatus = reject[2] === 'deny' ? 'denied' : 'cancelled';
+        let action;
+        try { action = transition(proposal.action, nextStatus); }
+        catch (error) { const wrapped = new ProposalStoreError(error.message.startsWith('invalid_transition') ? 'PROPOSAL_BUSY' : 'ACTION_HASH_MISMATCH', error.message); throw wrapped; }
+        const record = proposalStore.reject(proposal.action.id, action);
+        proposals.delete(proposal.action.id);
+        const verb = reject[2] === 'deny' ? 'denied' : 'cancelled';
+        eventBus.publish({ type: `proposal.${verb}`, sessionId: action.sessionId, actionId: action.id, requestId, data: { actionType: action.type, status: action.status } });
+        if (audit) await audit.append({ type: `action.${verb}`, actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash });
+        return json(response, 200, { proposal: publicProposal(record.proposal) });
+      }
       const proposalGet = url.pathname.match(/^\/v1\/proposals\/([^/]+)$/);
+      if (request.method === 'GET' && url.pathname === '/v1/proposals') return json(response, 200, { proposals: proposalStore.list({ status: url.searchParams.get('status') ?? undefined }).map((record) => ({ ...publicProposal(record.proposal), ...(record.recovery ? { recovery: record.recovery } : {}) })) });
       if (request.method === 'GET' && proposalGet) {
         const record = proposalStore.get(proposalGet[1]);
         if (!record) return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
@@ -198,6 +242,6 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   return Object.freeze({
     server,
     async listen() { await new Promise((resolve) => server.listen(port, host, resolve)); return server.address(); },
-    async close() { await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); },
+    async close() { for (const stream of liveStreams) stream.end(); await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); },
   });
 }

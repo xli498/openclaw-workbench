@@ -23,8 +23,8 @@ test('命令策略只允许明确列出的只读命令', () => {
 
 test('明确禁止命令在提案阶段即被阻断，不能靠审批绕过', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-command-policy-'));
-  assert.throws(() => createCommandProposal({ root, argv: ['rm', '-rf', '.'], sessionId: 's' }), (error) => error.code === 'COMMAND_POLICY_DENIED');
-  const proposal = createCommandProposal({ root, argv: ['git', 'status'], sessionId: 's', currentRevision: 'r1' });
+  await assert.rejects(() => createCommandProposal({ root, argv: ['rm', '-rf', '.'], sessionId: 's' }), (error) => error.code === 'COMMAND_POLICY_DENIED');
+  const proposal = await createCommandProposal({ root, argv: ['git', 'status'], sessionId: 's', currentRevision: 'r1' });
   const tampered = { ...proposal, command: { ...proposal.command, argv: ['rm', '-rf', '.'] } };
   await assert.rejects(() => approveAndRunCommand({ proposal: tampered, root, approved: true, currentRevision: 'r1' }), (error) => error.code === 'COMMAND_POLICY_DENIED');
 });
@@ -32,7 +32,7 @@ test('明确禁止命令在提案阶段即被阻断，不能靠审批绕过', as
 test('提案和审批审计包含策略判定，策略变化时拒绝执行', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-command-audit-'));
   const audit = { events: [], append(event) { this.events.push(event); } };
-  const proposal = createCommandProposal({ root, argv: ['git', 'status'], sessionId: 's', currentRevision: 'r1', audit });
+  const proposal = await createCommandProposal({ root, argv: ['git', 'status'], sessionId: 's', currentRevision: 'r1', audit });
   assert.equal(audit.events[0].policy.class, 'readonly');
   assert.equal(proposal.action.preview.policy.class, 'readonly');
   const altered = { ...proposal, commandPolicy: { class: 'blocked', command: 'git', reason: 'changed' } };
@@ -41,7 +41,7 @@ test('提案和审批审计包含策略判定，策略变化时拒绝执行', as
 
 test('命令参数被替换时 action hash 校验拒绝执行', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-command-hash-'));
-  const proposal = createCommandProposal({ root, argv: ['git', 'status'], sessionId: 's', currentRevision: 'r1' });
+  const proposal = await createCommandProposal({ root, argv: ['git', 'status'], sessionId: 's', currentRevision: 'r1' });
   const altered = { ...proposal, command: { ...proposal.command, timeoutMs: 1 } };
   await assert.rejects(() => approveAndRunCommand({ proposal: altered, root, approved: true, currentRevision: 'r1' }), (error) => error.code === 'ACTION_HASH_MISMATCH');
 });

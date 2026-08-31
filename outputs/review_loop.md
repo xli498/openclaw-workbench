@@ -259,3 +259,47 @@
 - P2: **0**
 - Exploration: saturated for all requested snapshot digest/open, stale-lock ABA, proposal manual-review, and terminal spawn lifecycle branches.
 - Deliberate residual boundary: stale locks require manual recovery because Node does not expose a safe source-identity compare-and-rename operation; this is a fail-closed availability tradeoff, not an unresolved concurrency-write risk.
+
+## Round 12 — 2026-08-31
+
+**Result:** COMPLETE (scoped P1 repair)
+
+### Fixes
+- Snapshot reads now open every parent component from a verified root directory FD with `O_DIRECTORY | O_NOFOLLOW`; nested ancestor symlink replacement cannot redirect recovery reads.
+- `createCommandProposal()` is async and awaits audit append before returning. Audit failure is propagated, so HTTP cannot return `201` before the proposal audit is durable/accepted.
+- Terminal success, synchronous spawn throw, async error, abort, timeout, and output-limit paths share an awaited single-settlement close path. Close errors are recorded as bounded diagnostics and do not replace the primary process result.
+
+### Verification
+- Focused snapshot/command/terminal suites: **41/41 passed**.
+- Full suite: **169/169 passed** (`npm test`).
+- `git diff --check`: passed.
+- Python sources: none found; `py_compile` not applicable.
+
+### Final review state
+- P0: **0**
+- P1: **0** for the requested scoped findings.
+- P2: **0** for the requested actionable items; residual platform boundary remains Node's lack of portable fd-relative CAS/unlink primitives, handled fail-closed.
+- No commit or push performed. Independent read-only review remains advisable before release.
+
+## Round 13 — 2026-08-31
+
+**Result:** COMPLETE (terminal synchronous-spawn diagnostic repair)
+
+### P1 closure
+- The synchronous `spawn()` throw branch now keeps a single diagnostics object through awaited stable-CWD closure and rejects with the original `SPAWN_FAILED` error.
+- If closing the stable CWD FD also fails, `details.closeError` is retained without replacing the synchronous spawn failure code or message.
+- Regression coverage wraps the existing test-only CWD-open seam, performs the real FD close, then injects an `ECLOSE` failure. It verifies the primary spawn failure, preserved close diagnostic, one close-error callback, and a closed handle.
+
+### Verification
+- `node --test tests/terminal.test.mjs`: **11/11 passed**.
+- Focused snapshot/command/terminal/http suites: **44/44 passed**.
+- `npm test`: **168/168 passed**. This is the observed current-suite count; it differs from the historical Round 12 record of `169/169`.
+- Python sources: none found; `py_compile` not applicable.
+- `git diff --check`: passed.
+
+### Final review state
+- P0: **0** in this scoped review.
+- P1: **0** in this scoped review; synchronous spawn failure retains close diagnostics.
+- P2: **0** for the identified test-gap defect; the injected close failure verifies the real diagnostic path.
+- Residual platform boundary: Node lacks portable fd-relative CAS/unlink primitives; the scoped terminal lifecycle repair does not alter that boundary.
+- No commit or push performed. A fresh independent read-only review is still recommended before release.

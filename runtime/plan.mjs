@@ -22,11 +22,12 @@ function textOf(response) {
   return text;
 }
 
-export async function runPlanReview({ question, models, sessionKey, thinking, timeoutSeconds, runAgentFn = runAgent } = {}) {
+export async function runPlanReview({ question, models, sessionKey, thinking, timeoutSeconds, signal, runAgentFn = runAgent } = {}) {
   validateInput({ question, models });
   if (!sessionKey) throw new PlanError('SESSION_REQUIRED', 'sessionKey is required');
   const prompt = `You are in Plan mode. Analyze the request below without modifying files, running terminal commands, or executing actions. Return a concise plan with assumptions, risks, and verification steps.\n\nRequest:\n${question}`;
-  const settled = await Promise.allSettled(models.map((model) => runAgentFn({ message: prompt, sessionKey: `${sessionKey}:plan:${digest(model)}`, mode: 'Plan', model, thinking, timeoutSeconds, local: true })));
+  const settled = await Promise.allSettled(models.map((model) => runAgentFn({ message: prompt, sessionKey: `${sessionKey}:plan:${digest(model)}`, mode: 'Plan', model, thinking, timeoutSeconds, local: true, signal })));
+  if (signal?.aborted) throw new PlanError('ABORTED', 'Plan review aborted');
   const analyses = [];
   const failures = [];
   settled.forEach((item, index) => {

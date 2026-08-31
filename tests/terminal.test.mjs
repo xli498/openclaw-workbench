@@ -70,12 +70,29 @@ test('命令超时、取消和输出超限都会终止执行', async () => {
   await assert.rejects(() => runControlledCommand({ root, argv: [process.execPath, '-e', 'process.stdout.write("123456")'], approved: true, maxOutputBytes: 3 }), (error) => error.code === 'OUTPUT_LIMIT');
 });
 
-test('spawn 同步 throw 归类为 SPAWN_FAILED、关闭稳定 cwd FD，且 Promise 只结算一次', async () => {
-  const root = await fixture(); let opened;
+test('spawn 同步 throw 保留关闭诊断、关闭稳定 cwd FD，且 Promise 只结算一次', async () => {
+  const root = await fixture(); let opened; let closeErrors = 0;
   await assert.rejects(() => runControlledCommand({
     root, argv: [process.execPath, '--version'], approved: true,
-    __testHooks: { onCwdOpened: (stable) => { opened = stable; }, spawn: () => { throw new Error('synthetic synchronous spawn failure'); } },
-  }), (error) => error.code === 'SPAWN_FAILED');
+    __testHooks: {
+      onCwdOpened: (stable) => {
+        opened = stable;
+        const close = stable.handle.close.bind(stable.handle);
+        stable.handle.close = async () => {
+          await close();
+          const error = new Error('synthetic close failure');
+          error.code = 'ECLOSE';
+          throw error;
+        };
+      },
+      onCloseError: () => { closeErrors += 1; },
+      spawn: () => { throw new Error('synthetic synchronous spawn failure'); },
+    },
+  }), (error) => error.code === 'SPAWN_FAILED'
+    && error.message === 'synthetic synchronous spawn failure'
+    && error.details.closeError?.code === 'ECLOSE'
+    && error.details.closeError?.message === 'synthetic close failure');
+  assert.equal(closeErrors, 1);
   await assert.rejects(() => opened.handle.stat(), /closed|EBADF/i);
 });
 

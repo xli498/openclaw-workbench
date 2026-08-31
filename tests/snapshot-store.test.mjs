@@ -54,6 +54,16 @@ test('恢复读取锚定父目录并拒绝末级符号链接', async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('读取逐级拒绝嵌套祖先符号链接', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-snapshot-nested-link-'));
+  const outside = await mkdtemp(join(tmpdir(), 'ocw-snapshot-nested-outside-'));
+  try {
+    mkdirSync(join(outside, 'inner')); writeFileSync(join(outside, 'inner', 'snapshot.json'), 'outside');
+    mkdirSync(join(root, 'state')); symlinkSync(join(outside, 'inner'), join(root, 'state', 'nested'));
+    assert.throws(() => readSnapshot({ root, storePath: join(root, 'state', 'nested', 'snapshot.json'), ErrorType: SnapshotError, code: 'INVALID', message: 'invalid' }), { code: 'INVALID' });
+  } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
+});
+
 test('stale 锁 inode 确认后出现 successor 时，successor 保持在活 lockName 且写者不得取得锁', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-snapshot-aba-'));
   try {

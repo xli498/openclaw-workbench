@@ -16,11 +16,11 @@ function assertMode(mode) {
 }
 
 function publicSession(session) {
-  return Object.freeze({ id: session.id, workspaceId: session.workspaceId, mode: session.mode, actor: session.actor, status: session.status, createdAt: session.createdAt, messageCount: session.messages.length, ...(session.recoveryReason ? { recoveryReason: session.recoveryReason } : {}) });
+  return Object.freeze({ id: session.id, workspaceId: session.workspaceId, mode: session.mode, actor: session.actor, status: session.status, createdAt: session.createdAt, messageCount: session.messages.length, planCount: session.planResults.length, ...(session.recoveryReason ? { recoveryReason: session.recoveryReason } : {}) });
 }
 
 function snapshotSession(session) {
-  return { id: session.id, workspaceId: session.workspaceId, mode: session.mode, actor: session.actor, status: session.status, createdAt: session.createdAt, messages: session.messages, running: session.running };
+  return { id: session.id, workspaceId: session.workspaceId, mode: session.mode, actor: session.actor, status: session.status, createdAt: session.createdAt, messages: session.messages, planResults: session.planResults, running: session.running };
 }
 
 function attachPersistenceError(primary, persistenceError) {
@@ -33,6 +33,7 @@ function attachPersistenceError(primary, persistenceError) {
 export function createChatSessionManager({ root, runAgentFn = runAgent, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
   if (!root) throw new SessionError('ROOT_REQUIRED', 'root is required');
   const sessions = new Map();
+  const controllers = new Map();
   let persistedDigest = null;
   function persist() {
     const payload = JSON.stringify({ version: 1, sessions: [...sessions.values()].map(snapshotSession) });
@@ -48,9 +49,11 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
       const ids = new Set();
       for (const raw of payload.sessions) {
         if (!raw || typeof raw.id !== 'string' || !raw.id || ids.has(raw.id) || !CHAT_MODES.includes(raw.mode) || (raw.status !== undefined && !['active', 'closed', 'manual_review'].includes(raw.status)) || !Array.isArray(raw.messages) || raw.messages.some((message) => !message || !['user', 'assistant'].includes(message.role) || (typeof message.content !== 'string' && (!message.content || typeof message.content !== 'object' || Array.isArray(message.content))))) throw new Error('invalid session snapshot');
+        const planResults = raw.planResults ?? [];
+        if (!Array.isArray(planResults) || planResults.some((result) => !result || typeof result.id !== 'string' || typeof result.question !== 'string' || !Array.isArray(result.analyses) || !Array.isArray(result.failures) || !result.synthesis || typeof result.createdAt !== 'string')) throw new Error('invalid plan result snapshot');
         ids.add(raw.id);
         const interrupted = raw.running === true;
-        const session = { id: raw.id, workspaceId: raw.workspaceId || root, mode: raw.mode, actor: raw.actor || 'user', status: interrupted ? 'manual_review' : raw.status === 'closed' ? 'closed' : 'active', createdAt: raw.createdAt || clock().toISOString(), messages: raw.messages.map((message) => Object.freeze({ ...message })), running: false, ...(interrupted ? { recoveryReason: 'interrupted_turn' } : {}) };
+        const session = { id: raw.id, workspaceId: raw.workspaceId || root, mode: raw.mode, actor: raw.actor || 'user', status: interrupted ? 'manual_review' : raw.status === 'closed' ? 'closed' : 'active', createdAt: raw.createdAt || clock().toISOString(), messages: raw.messages.map((message) => Object.freeze({ ...message })), planResults: planResults.map((result) => Object.freeze({ ...result, analyses: Object.freeze(result.analyses.map((item) => Object.freeze({ ...item }))), failures: Object.freeze(result.failures.map((item) => Object.freeze({ ...item }))), synthesis: Object.freeze({ ...result.synthesis }) })), running: false, ...(interrupted ? { recoveryReason: 'interrupted_turn' } : {}) };
         sessions.set(session.id, session);
       }
     } catch (error) {
@@ -62,7 +65,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
   function createSession({ mode = 'Ask', actor = 'user', workspaceId = root } = {}) {
     assertMode(mode);
     if (typeof actor !== 'string' || !actor || actor.length > 256) throw new SessionError('INVALID_ACTOR', 'actor is required and must be at most 256 characters');
-    const session = { id: randomUUID(), workspaceId, mode, actor, status: 'active', createdAt: clock().toISOString(), messages: [], running: false };
+    const session = { id: randomUUID(), workspaceId, mode, actor, status: 'active', createdAt: clock().toISOString(), messages: [], planResults: [], running: false };
     sessions.set(session.id, session);
     try { persist(); } catch (error) { sessions.delete(session.id); throw error; }
     return publicSession(session);
@@ -80,12 +83,14 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (typeof message !== 'string' || !message.trim() || message.length > MAX_MESSAGE_LENGTH) throw new SessionError('INVALID_MESSAGE', `message must be non-empty and at most ${MAX_MESSAGE_LENGTH} characters`);
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
     session.running = true;
+    const controller = new AbortController();
+    controllers.set(session.id, controller);
     const userMessage = Object.freeze({ role: 'user', content: message, createdAt: clock().toISOString() });
     session.messages.push(userMessage);
     try { persist(); } catch (error) { session.messages.pop(); session.running = false; throw error; }
     let primaryError;
     try {
-      const response = await runAgentFn({ message, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal });
+      const response = await runAgentFn({ message, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal: controller.signal });
       const assistantMessage = Object.freeze({ role: 'assistant', content: response, createdAt: clock().toISOString() });
       session.messages.push(assistantMessage);
       persist();
@@ -96,6 +101,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
       try { persist(); } catch (persistenceError) { attachPersistenceError(error, persistenceError); }
       throw error;
     } finally {
+      controllers.delete(session.id);
       session.running = false;
       try { persist(); } catch (persistenceError) {
         if (primaryError) attachPersistenceError(primaryError, persistenceError);
@@ -110,11 +116,20 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (session.mode !== 'Plan') throw new SessionError('MODE_INSUFFICIENT', 'plan review requires a Plan session');
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
     session.running = true;
+    const controller = new AbortController();
+    controllers.set(session.id, controller);
     try { persist(); } catch (error) { session.running = false; throw error; }
     let primaryError;
-    try { return await runPlanReview({ question, models, sessionKey: session.id, thinking, timeoutSeconds }); }
+    try {
+      const result = await runPlanReview({ question, models, sessionKey: session.id, thinking, timeoutSeconds, signal: controller.signal, runAgentFn: (input) => runAgentFn({ ...input, signal: controller.signal }) });
+      const stored = Object.freeze({ id: randomUUID(), ...result, createdAt: clock().toISOString() });
+      session.planResults.push(stored);
+      persist();
+      return stored;
+    }
     catch (error) { primaryError = error; throw error; }
     finally {
+      controllers.delete(session.id);
       session.running = false;
       try { persist(); } catch (persistenceError) {
         if (primaryError) attachPersistenceError(primaryError, persistenceError);
@@ -126,6 +141,25 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
   function listMessages(sessionId) {
     const session = getSession(sessionId);
     return Object.freeze(session.messages.map((message) => Object.freeze({ ...message })));
+  }
+
+  function cancelTurn(sessionId) {
+    const session = getSession(sessionId);
+    if (!session.running || !controllers.has(sessionId)) throw new SessionError('NO_RUNNING_TURN', 'session has no running turn');
+    controllers.get(sessionId).abort();
+    return Object.freeze({ session: publicSession(session), cancelled: true });
+  }
+
+  function listPlanResults(sessionId) {
+    const session = getSession(sessionId);
+    return Object.freeze(session.planResults.map((result) => Object.freeze({ ...result, analyses: Object.freeze(result.analyses.map((item) => Object.freeze({ ...item }))), failures: Object.freeze(result.failures.map((item) => Object.freeze({ ...item }))), synthesis: Object.freeze({ ...result.synthesis }) })));
+  }
+
+  function listSessions({ status } = {}) {
+    if (status !== undefined && !['active', 'closed', 'manual_review'].includes(status)) throw new SessionError('INVALID_STATUS', 'status must be active, closed or manual_review');
+    return Object.freeze([...sessions.values()]
+      .filter((session) => status === undefined || session.status === status)
+      .map(publicSession));
   }
 
   function closeSession(sessionId) {
@@ -155,5 +189,5 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     return Object.freeze({ total: values.length, active: values.filter((session) => session.status === 'active').length, closed: values.filter((session) => session.status === 'closed').length, manualReview: values.filter((session) => session.status === 'manual_review').length, interruptedTurns: values.filter((session) => session.recoveryReason === 'interrupted_turn').length });
   }
 
-  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), sendMessage, planReview, listMessages, closeSession, reviewSession, recoverySummary, snapshotPath: storePath });
+  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), listSessions, sendMessage, planReview, cancelTurn, listMessages, listPlanResults, closeSession, reviewSession, recoverySummary, snapshotPath: storePath });
 }

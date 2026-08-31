@@ -80,19 +80,35 @@ export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = D
   if (!approved) throw new TerminalError('APPROVAL_REQUIRED', 'terminal execution requires explicit approval');
   validateCommandLimits({ argv, timeoutMs, maxOutputBytes });
   const stableCwd = await openStableCwd(root, cwd, { __testHooks });
-  const executable = await resolveExecutable(argv[0]);
-  if (signal?.aborted) { await stableCwd.handle.close(); throw new TerminalError('ABORTED', 'command aborted before start'); }
+  const closeCwd = async (details) => {
+    try { await stableCwd.handle.close(); }
+    catch (error) { details.closeError = { code: error.code, message: error.message }; __testHooks?.onCloseError?.(error); }
+  };
+  let executable;
+  try { executable = await resolveExecutable(argv[0]); }
+  catch (error) { const details = {}; await closeCwd(details); if (Object.keys(details).length) error.details = { ...(error.details ?? {}), ...details }; throw error; }
+  if (signal?.aborted) { const details = {}; await closeCwd(details); throw new TerminalError('ABORTED', 'command aborted before start', details); }
   return new Promise((resolve, reject) => {
     let child;
     // Test-only seam: production always uses node:child_process spawn.
     const spawnImpl = __testHooks?.spawn ?? spawn;
     try { child = spawnImpl(executable, argv.slice(1), { cwd: stableCwd.procPath, env: safeEnv(env), shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
-    catch (error) { stableCwd.handle.close().catch(() => {}); reject(new TerminalError('SPAWN_FAILED', error.message)); return; }
-    stableCwd.handle.close().catch(() => {});
+    catch (error) {
+      const details = {};
+      void closeCwd(details).then(() => reject(new TerminalError('SPAWN_FAILED', error.message, details)));
+      return;
+    }
     let stdout = ''; let stderr = ''; let outputBytes = 0; let settled = false; let timedOut = false; let outputLimited = false;
     const kill = () => { try { process.kill(-child.pid, 'SIGTERM'); } catch {} };
-    const finish = (fn, value) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); fn(value); } };
-    const abort = () => { kill(); finish(reject, new TerminalError('ABORTED', 'command aborted')); };
+    const finish = async (fn, value) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort);
+      const details = value?.details ?? {};
+      await closeCwd(details);
+      if (details.closeError && value && !value.details) value = Object.freeze({ ...value, closeError: details.closeError });
+      fn(value);
+    };
+    const abort = () => { kill(); void finish(reject, new TerminalError('ABORTED', 'command aborted')); };
     const timer = setTimeout(() => { timedOut = true; kill(); finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`)); }, timeoutMs);
     const collect = (target, chunk) => {
       outputBytes += chunk.byteLength;
@@ -105,10 +121,10 @@ export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = D
     child.on('error', (error) => finish(reject, new TerminalError('SPAWN_FAILED', error.message)));
     child.on('close', (code, signalName) => {
       if (settled) return;
-      if (outputLimited) return finish(reject, new TerminalError('OUTPUT_LIMIT', `command output exceeded ${maxOutputBytes} bytes`, { code, signal: signalName }));
-      if (timedOut) return finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`));
-      if (code !== 0) return finish(reject, new TerminalError('PROCESS_FAILED', `command exited with code ${code}`, { code, signal: signalName, stdout, stderr }));
-      finish(resolve, Object.freeze({ argv: [...argv], cwd: stableCwd.cwdReal, stdout, stderr, code }));
+      if (outputLimited) return void finish(reject, new TerminalError('OUTPUT_LIMIT', `command output exceeded ${maxOutputBytes} bytes`, { code, signal: signalName }));
+      if (timedOut) return void finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`));
+      if (code !== 0) return void finish(reject, new TerminalError('PROCESS_FAILED', `command exited with code ${code}`, { code, signal: signalName, stdout, stderr }));
+      void finish(resolve, Object.freeze({ argv: [...argv], cwd: stableCwd.cwdReal, stdout, stderr, code }));
     });
   });
 }

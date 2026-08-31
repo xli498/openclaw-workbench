@@ -62,7 +62,7 @@ export async function approveAndApplyPatch({ proposal, root, declaredPaths, appr
   return Object.freeze({ action: verified, transaction: result });
 }
 
-export function createCommandProposal({ root, argv, sessionId, mode = 'Terminal', cwd = '.', timeoutMs, maxOutputBytes, currentRevision, audit } = {}) {
+export async function createCommandProposal({ root, argv, sessionId, mode = 'Terminal', cwd = '.', timeoutMs, maxOutputBytes, currentRevision, audit } = {}) {
   if (!sessionId) throw new WorkflowError('SESSION_REQUIRED', 'sessionId is required');
   const policy = decide({ mode, actionType: 'command' });
   if (policy.reason === 'mode_insufficient') throw new WorkflowError('MODE_INSUFFICIENT', 'current mode cannot create a command proposal');
@@ -73,7 +73,7 @@ export function createCommandProposal({ root, argv, sessionId, mode = 'Terminal'
   const preview = Object.freeze({ argv: [...argv], cwd, ...(timeoutMs === undefined ? {} : { timeoutMs }), ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }) });
   const actionPreview = Object.freeze({ ...preview, policy: commandPolicy });
   const action = transition(transition(createAction({ type: 'command', sessionId, workspaceRevision: revisionForAction(currentRevision), target: cwd, preview: actionPreview, risk: 'high' }), 'inspected'), 'awaiting_approval');
-  if (audit) audit.append({ type: 'command.proposed', actor: 'user', actionId: action.id, sessionId, actionHash: action.actionHash, preview, policy: commandPolicy });
+  if (audit) await audit.append({ type: 'command.proposed', actor: 'user', actionId: action.id, sessionId, actionHash: action.actionHash, preview, policy: commandPolicy });
   return Object.freeze({ action, command: preview, workspaceRevision: revisionForAction(currentRevision), policy, commandPolicy, root });
 }
 

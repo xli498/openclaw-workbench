@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
 
-const TERMINAL = new Set(['verified', 'failed', 'timed_out', 'cancelled']);
+const TERMINAL = new Set(['verified', 'failed', 'timed_out', 'cancelled', 'denied']);
 const MANUAL_REVIEW = 'manual_review';
 
 export class ProposalStoreError extends Error {
@@ -84,6 +84,14 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
     replace(id, { proposal });
     return publicRecord(records.get(id));
   }
+  function reject(id, action) {
+    const record = records.get(id);
+    if (!record) throw new ProposalStoreError('PROPOSAL_NOT_FOUND', 'proposal not found');
+    if (record.proposal.action.status !== 'awaiting_approval' || record.claim) throw new ProposalStoreError('PROPOSAL_BUSY', 'only an awaiting approval proposal can be rejected');
+    if (!TERMINAL.has(action?.status) || !['denied', 'cancelled'].includes(action.status)) throw new ProposalStoreError('INVALID_TERMINAL_ACTION', 'rejection must end in denied or cancelled');
+    if (action.actionHash !== record.proposal.action.actionHash || action.id !== record.proposal.action.id) throw new ProposalStoreError('ACTION_HASH_MISMATCH', 'rejection must preserve the current action identity');
+    return publicRecord(replace(id, { proposal: Object.freeze({ ...record.proposal, action: Object.freeze(action) }) }));
+  }
   function markManualReview(id, claimToken, error) {
     const record = records.get(id);
     if (!record) throw new ProposalStoreError('PROPOSAL_NOT_FOUND', 'proposal not found');
@@ -94,9 +102,15 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
     return publicRecord(records.get(id));
   }
   function get(id) { return records.has(id) ? publicRecord(records.get(id)) : null; }
+  function list({ status } = {}) {
+    if (status !== undefined && typeof status !== 'string') throw new ProposalStoreError('INVALID_STATUS', 'status must be a string');
+    return Object.freeze([...records.values()]
+      .filter((record) => status === undefined || record.proposal.action.status === status)
+      .map(publicRecord));
+  }
   function recoverySummary() {
     const values = [...records.values()];
     return Object.freeze({ total: values.length, manualReview: values.filter((record) => record.proposal.action.status === MANUAL_REVIEW).length, executing: values.filter((record) => record.proposal.action.status === 'executing').length, terminal: values.filter((record) => TERMINAL.has(record.proposal.action.status)).length });
   }
-  return Object.freeze({ put, claim, markTerminal, markManualReview, get, recoverySummary, snapshotPath: storePath });
+  return Object.freeze({ put, claim, markTerminal, reject, markManualReview, get, list, recoverySummary, snapshotPath: storePath });
 }

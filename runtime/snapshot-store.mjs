@@ -51,6 +51,25 @@ function readAnchoredRegularFile(parent, name) {
   return readRegularFileNoFollow(entry(parent, name));
 }
 
+function openExistingAnchoredParent(root, pathname, ErrorType, code, message) {
+  const realRoot = realpathSync(resolve(root));
+  const targetParent = resolve(dirname(pathname));
+  if (!inside(realRoot, targetParent)) throw new ErrorType(code, message);
+  let current = openAnchoredDirectory(realRoot, ErrorType, code, message);
+  try {
+    for (const segment of relative(realRoot, targetParent).split(sep).filter(Boolean)) {
+      let next;
+      try { next = openAnchoredDirectory(entry(current, segment), ErrorType, code, message); }
+      catch (error) {
+        if (error?.code === 'ENOENT' || !lstatSync(entry(current, segment), { throwIfNoEntry: false })) return null;
+        throw error;
+      }
+      closeDirectory(current); current = next;
+    }
+    return current;
+  } catch (error) { closeDirectory(current); throw error; }
+}
+
 function readLockOwner(lock) {
   const file = readRegularFileNoFollow(entry(lock, 'owner.json'));
   if (!file) return null;
@@ -110,14 +129,8 @@ export function snapshotDigest(content) { return createHash('sha256').update(con
 
 export function readSnapshot({ root, storePath, ErrorType, code, message, __testHooks } = {}) {
   assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
-  let parent;
-  try { parent = openAnchoredDirectory(dirname(resolve(storePath)), ErrorType, code, message); }
-  catch (error) {
-    // A missing parent is observationally equivalent to a missing snapshot;
-    // symlink, non-directory and procfs failures remain fail-closed.
-    if (lstatSync(dirname(resolve(storePath)), { throwIfNoEntry: false }) === undefined) return Object.freeze({ content: null, digest: null });
-    throw error;
-  }
+  const parent = openExistingAnchoredParent(root, storePath, ErrorType, code, message);
+  if (!parent) return Object.freeze({ content: null, digest: null });
   try {
     __testHooks?.onParentOpened?.({ parentPath: parent.path, storePath });
     const file = readAnchoredRegularFile(parent, basename(storePath));

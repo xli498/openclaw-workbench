@@ -31,6 +31,7 @@ function normalizeEventData(data) {
 export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date(), root, storePath = root ? join(root, '.openclaw-workbench', 'events.json') : undefined } = {}) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) throw new EventBusError('INVALID_LIMIT', 'limit must be an integer between 1 and 10000');
   const events = [];
+  const subscribers = new Set();
   let sequence = 0;
   let persistedDigest = null;
   function persist() {
@@ -69,7 +70,17 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
     events.push(event);
     if (events.length > limit) events.splice(0, events.length - limit);
     try { persist(); } catch (error) { events.splice(0, events.length, ...previousEvents); sequence = previousSequence; throw error; }
+    for (const subscriber of subscribers) {
+      try { subscriber(event); } catch { /* 订阅者故障不得影响事件发布 */ }
+    }
     return event;
+  }
+  function subscribe(listener, { after = 0 } = {}) {
+    if (typeof listener !== 'function') throw new EventBusError('INVALID_SUBSCRIBER', 'subscriber must be a function');
+    if (!Number.isSafeInteger(after) || after < 0) throw new EventBusError('INVALID_CURSOR', 'after must be a non-negative integer');
+    const filtered = (event) => { if (event.sequence > after) listener(event); };
+    subscribers.add(filtered);
+    return () => subscribers.delete(filtered);
   }
   function list({ after = 0, limit: requestedLimit = 100 } = {}) {
     if (!Number.isInteger(after) || after < 0) throw new EventBusError('INVALID_CURSOR', 'after must be a non-negative integer');
@@ -77,5 +88,5 @@ export function createEventBus({ limit = DEFAULT_LIMIT, clock = () => new Date()
     const items = events.filter((event) => event.sequence > after).slice(0, requestedLimit);
     return Object.freeze({ events: Object.freeze([...items]), nextAfter: items.length ? items.at(-1).sequence : after, latestSequence: sequence, recovered });
   }
-  return Object.freeze({ publish, list, snapshotPath: storePath, recovered });
+  return Object.freeze({ publish, list, subscribe, snapshotPath: storePath, recovered });
 }
