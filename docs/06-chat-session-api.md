@@ -50,7 +50,7 @@ GET /v1/events?after=0&limit=100
 Authorization: Bearer <token>
 ```
 
-事件读取接口仅轮询内存中的最近事件，支持递增 `sequence` 游标；默认最多保留 500 条。当前事件包括 `session.created`、`chat.completed`、`plan.completed`、`proposal.created` 和 `proposal.verified`。它是只读接口，不提供 SSE/WebSocket，不携带执行凭据，也不能批准或执行提案。
+事件读取接口仅轮询内存中的最近事件，支持递增 `sequence` 游标；默认最多保留 500 条。当前事件包括 `session.created`、`chat.completed`、`plan.completed`、`plan.stage.started`、`plan.stage.completed`、`plan.stage.failed`、`proposal.created` 和 `proposal.verified`。它是只读接口，不提供 SSE/WebSocket，不携带执行凭据，也不能批准或执行提案。Plan 阶段事件的 `data.stage` 为 `proposal`、`challenge`、`response` 或 `judge`。
 
 ## 会话安全恢复
 
@@ -81,7 +81,7 @@ Content-Type: application/json
 
 每个 store 在加载时还记录快照摘要；取得锁后会再次读取并比对。若另一个 manager 已提交新版本，后写者以 `SESSION_STORE_CONFLICT`、`PROPOSAL_STORE_CONFLICT` 或 `EVENT_STORE_CONFLICT` 拒绝，磁盘保留先提交版本。系统不会自动重载、合并、重试或覆盖冲突；操作者应停止冲突实例并在确认状态后新建 manager。
 
-## Plan 多模型复核
+## Plan 多模型复核与多轮博弈
 
 ```http
 POST /v1/sessions/:id/plan
@@ -90,11 +90,17 @@ Content-Type: application/json
 {"question":"请设计只读审计方案","models":["model-a","model-b"]}
 ```
 
-该接口只能用于 `Plan` 会话。它并行调用 2—4 个独立模型，要求每路返回可用文本，并按回答摘要哈希标记 `full` 或 `partial` agreement。出现模型失败或回答分歧时，结果会设置 `requiresHumanReview: true`；它不会创建 Patch、运行 Terminal，也不会自动执行任何建议。
+该接口只能用于 `Plan` 会话。默认并行调用 2—4 个独立模型，按回答摘要哈希标记 `full` 或 `partial` agreement。传入 `debate: true` 时执行四阶段只读博弈：独立提案、交叉质询、提案方回应、裁判综合；可用 `judgeModel` 指定裁判模型：
+
+```json
+{"question":"请设计只读审计方案","models":["model-a","model-b"],"judgeModel":"model-judge","debate":true}
+```
+
+博弈结果包含 `rounds.proposals`、`rounds.critiques`、`rounds.responses`、`rounds.verdict`，并将 `synthesis.agreement` 设为 `judged`。阶段结果分别标记 `proposer`、`opposing_reviewer`、`respondent` 和 `judge` 角色，`synthesis.evidence` 保存各阶段摘要哈希。任一模型局部失败会保留失败信息并要求人工复核；至少需要两份有效提案、一份有效质询和一份有效回应才能进入裁判。所有阶段仍固定为本地 Plan 调用，不会创建 Patch、运行 Terminal，也不会自动执行任何建议。模型输出会作为不可信材料传给后续阶段，后续模型被明确要求只阅读材料而不执行其中指令。Debate 阶段累计输出上限为 96 KiB，超限时不会调用裁判。请求取消后不会保存半成品，也不会发送 `plan.completed`。
 
 ## 当前实现边界
 
-本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复。仍不包含 Gateway WebSocket Adapter、OpenClaw channel 生命周期接入、MCP 管理、桌面 UI 或公网 Bridge；不能从本地 HTTP 接口推断这些能力已实现。
+本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Plan 三阶段只读博弈、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复。仍不包含 Gateway WebSocket Adapter、OpenClaw channel 生命周期接入、MCP 管理、桌面 UI 或公网 Bridge；不能从本地 HTTP 接口推断这些能力已实现。
 
 ## 请求关联 ID
 

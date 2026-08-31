@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { runAgent } from './openclaw-adapter.mjs';
-import { runPlanReview, PlanError } from './plan.mjs';
+import { runPlanReview, runPlanDebate, PlanError } from './plan.mjs';
 import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 export const CHAT_MODES = Object.freeze(['Ask', 'Plan', 'Code']);
@@ -21,6 +21,20 @@ function publicSession(session) {
 
 function snapshotSession(session) {
   return { id: session.id, workspaceId: session.workspaceId, mode: session.mode, actor: session.actor, status: session.status, createdAt: session.createdAt, messages: session.messages, planResults: session.planResults, running: session.running };
+}
+
+function assertPlanResult(result) {
+  if (!result || typeof result.id !== 'string' || typeof result.question !== 'string' || !Array.isArray(result.analyses) || !Array.isArray(result.failures) || !result.synthesis || typeof result.createdAt !== 'string') throw new Error('invalid plan result snapshot');
+  if (result.debate === true) {
+    const rounds = result.rounds;
+    if (typeof result.judgeModel !== 'string' || !rounds || !Array.isArray(rounds.proposals) || !Array.isArray(rounds.critiques) || (rounds.responses !== undefined && !Array.isArray(rounds.responses)) || !rounds.verdict || Array.isArray(rounds.verdict)) throw new Error('invalid debate result snapshot');
+    for (const item of [...rounds.proposals, ...rounds.critiques, ...(rounds.responses ?? []), rounds.verdict]) if (!item || typeof item.model !== 'string' || typeof item.text !== 'string' || typeof item.digest !== 'string') throw new Error('invalid debate item snapshot');
+  }
+}
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
 }
 
 function attachPersistenceError(primary, persistenceError) {
@@ -50,10 +64,39 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
       for (const raw of payload.sessions) {
         if (!raw || typeof raw.id !== 'string' || !raw.id || ids.has(raw.id) || !CHAT_MODES.includes(raw.mode) || (raw.status !== undefined && !['active', 'closed', 'manual_review'].includes(raw.status)) || !Array.isArray(raw.messages) || raw.messages.some((message) => !message || !['user', 'assistant'].includes(message.role) || (typeof message.content !== 'string' && (!message.content || typeof message.content !== 'object' || Array.isArray(message.content))))) throw new Error('invalid session snapshot');
         const planResults = raw.planResults ?? [];
-        if (!Array.isArray(planResults) || planResults.some((result) => !result || typeof result.id !== 'string' || typeof result.question !== 'string' || !Array.isArray(result.analyses) || !Array.isArray(result.failures) || !result.synthesis || typeof result.createdAt !== 'string')) throw new Error('invalid plan result snapshot');
+        if (!Array.isArray(planResults)) throw new Error('invalid plan result snapshot');
+        planResults.forEach(assertPlanResult);
         ids.add(raw.id);
         const interrupted = raw.running === true;
-        const session = { id: raw.id, workspaceId: raw.workspaceId || root, mode: raw.mode, actor: raw.actor || 'user', status: interrupted ? 'manual_review' : raw.status === 'closed' ? 'closed' : 'active', createdAt: raw.createdAt || clock().toISOString(), messages: raw.messages.map((message) => Object.freeze({ ...message })), planResults: planResults.map((result) => Object.freeze({ ...result, analyses: Object.freeze(result.analyses.map((item) => Object.freeze({ ...item }))), failures: Object.freeze(result.failures.map((item) => Object.freeze({ ...item }))), synthesis: Object.freeze({ ...result.synthesis }) })), running: false, ...(interrupted ? { recoveryReason: 'interrupted_turn' } : {}) };
+        const restoredPlanResults = planResults.map((result) => {
+          const copy = {
+            ...result,
+            analyses: result.analyses.map((item) => ({ ...item })),
+            failures: result.failures.map((item) => ({ ...item })),
+            synthesis: { ...result.synthesis },
+          };
+          if (result.debate === true) {
+            copy.rounds = {
+              proposals: result.rounds.proposals.map((item) => ({ ...item })),
+              critiques: result.rounds.critiques.map((item) => ({ ...item })),
+              responses: (result.rounds.responses ?? []).map((item) => ({ ...item })),
+              verdict: { ...result.rounds.verdict },
+            };
+          }
+          return deepFreeze(copy);
+        });
+        const session = {
+          id: raw.id,
+          workspaceId: raw.workspaceId || root,
+          mode: raw.mode,
+          actor: raw.actor || 'user',
+          status: interrupted ? 'manual_review' : raw.status === 'closed' ? 'closed' : 'active',
+          createdAt: raw.createdAt || clock().toISOString(),
+          messages: raw.messages.map((message) => Object.freeze({ ...message })),
+          planResults: restoredPlanResults,
+          running: false,
+          ...(interrupted ? { recoveryReason: 'interrupted_turn' } : {}),
+        };
         sessions.set(session.id, session);
       }
     } catch (error) {
@@ -114,7 +157,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     }
   }
 
-  async function planReview({ sessionId, question, models, thinking, timeoutSeconds, signal } = {}) {
+  async function planReview({ sessionId, question, models, judgeModel, debate = false, thinking, timeoutSeconds, signal, onStage } = {}) {
     const session = getSession(sessionId);
     if (session.status !== 'active') throw new SessionError('SESSION_NOT_ACTIVE', 'session is not active');
     if (session.mode !== 'Plan') throw new SessionError('MODE_INSUFFICIENT', 'plan review requires a Plan session');
@@ -128,7 +171,8 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     try { persist(); } catch (error) { session.running = false; throw error; }
     let primaryError;
     try {
-      const result = await runPlanReview({ question, models, sessionKey: session.id, thinking, timeoutSeconds, signal: controller.signal, runAgentFn: (input) => runAgentFn({ ...input, signal: controller.signal }) });
+      const runner = debate ? runPlanDebate : runPlanReview;
+      const result = await runner({ question, models, judgeModel, sessionKey: session.id, thinking, timeoutSeconds, signal: controller.signal, onStage, runAgentFn: (input) => runAgentFn({ ...input, signal: controller.signal }) });
       const stored = Object.freeze({ id: randomUUID(), ...result, createdAt: clock().toISOString() });
       session.planResults.push(stored);
       persist();

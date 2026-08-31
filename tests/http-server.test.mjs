@@ -350,6 +350,27 @@ test('Plan 复核结果可查询并持久化到重启后的会话快照', async 
   } finally { await app.close().catch(() => {}); await rm(root, { recursive: true, force: true }); }
 });
 
+test('控制面 Plan 接口可执行多轮大模型博弈并持久化结果', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-debate-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn: async ({ model, message }) => ({ text: `${model}:${message.includes('final impartial judge') ? 'verdict' : message.includes('opposing reviewer') ? 'critique' : 'proposal'}` }) });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan' }) });
+    const result = await request(address, `/v1/sessions/${created.body.session.id}/plan`, { method: 'POST', body: JSON.stringify({ question: 'compare designs', models: ['model-a', 'model-b'], judgeModel: 'judge', debate: true }) });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.debate, true);
+    assert.equal(result.body.rounds.proposals.length, 2);
+    assert.equal(result.body.rounds.critiques.length, 2);
+    assert.equal(result.body.rounds.responses.length, 2);
+    assert.equal(result.body.rounds.verdict.model, 'judge');
+    const events = await request(address, '/v1/events');
+    const stages = events.body.events.filter((event) => event.sessionId === created.body.session.id && event.type.startsWith('plan.stage.'));
+    assert.deepEqual(stages.map((event) => `${event.data.stage}:${event.data.status}`), ['proposal:started', 'proposal:completed', 'challenge:started', 'challenge:completed', 'response:started', 'response:completed', 'judge:started', 'judge:completed']);
+    const history = await request(address, `/v1/sessions/${created.body.session.id}/plan`);
+    assert.equal(history.body.results[0].debate, true);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('运行中的 Chat 回合可通过控制面安全取消', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-cancel-'));
   let markStarted;
@@ -395,6 +416,56 @@ test('运行中的 Plan 复核可取消、拒绝并发回合且不保存半成�
     assert.equal(result.body.error, 'TURN_ABORTED');
     const history = await request(address, `/v1/sessions/${id}/plan`);
     assert.deepEqual(history.body.results, []);
+    const events = await request(address, '/v1/events?after=0&limit=100');
+    const planEvents = events.body.events.filter((event) => event.sessionId === id);
+    assert.equal(planEvents.some((event) => event.type === 'plan.completed'), false);
+    assert.equal(planEvents.some((event) => event.type === 'plan.stage.completed'), false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('Plan Debate 阶段全失败时发布失败终态且不发布完成事件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-plan-failed-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn: async () => { throw Object.assign(new Error('model down'), { code: 'MODEL_FAILED' }); } });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan' }) });
+    const id = created.body.session.id;
+    const result = await request(address, `/v1/sessions/${id}/plan`, { method: 'POST', body: JSON.stringify({ question: 'failed debate', models: ['a', 'b'], debate: true }) });
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error, 'DEBATE_FAILED');
+    const events = await request(address, '/v1/events?after=0&limit=100');
+    const planEvents = events.body.events.filter((event) => event.sessionId === id);
+    const stageEvents = planEvents.filter((event) => event.type.startsWith('plan.stage.'));
+    assert.deepEqual(stageEvents.map((event) => `${event.data.stage}:${event.data.status}`), ['proposal:started', 'proposal:failed']);
+    assert.equal(planEvents.some((event) => event.type === 'plan.completed'), false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('Plan Debate 裁判失败时发布 judge 失败终态且不发布完成事件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-judge-failed-'));
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    runAgentFn: async ({ message }) => {
+      if (message.includes('final impartial judge')) throw Object.assign(new Error('judge down'), { code: 'MODEL_FAILED' });
+      if (message.includes('opposing reviewer')) return { text: 'critique' };
+      if (message.includes('responding to peer criticism')) return { text: 'response' };
+      return { text: 'proposal' };
+    },
+  });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Plan' }) });
+    const id = created.body.session.id;
+    const result = await request(address, `/v1/sessions/${id}/plan`, { method: 'POST', body: JSON.stringify({ question: 'judge failure', models: ['a', 'b'], judgeModel: 'judge', debate: true }) });
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error, 'JUDGE_FAILED');
+    const events = await request(address, '/v1/events?after=0&limit=100');
+    const planEvents = events.body.events.filter((event) => event.sessionId === id);
+    assert.equal(planEvents.at(-1).type, 'plan.stage.failed');
+    assert.equal(planEvents.at(-1).data.stage, 'judge');
+    assert.equal(planEvents.some((event) => event.type === 'plan.completed'), false);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

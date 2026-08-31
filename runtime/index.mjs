@@ -6,7 +6,7 @@ export { runControlledCommand, TerminalError } from './terminal.mjs';
 export { claimCommandAction, scanCommandLedger, updateCommandAction } from './command-ledger.mjs';
 export { createWorkbenchServer } from './http-server.mjs';
 export { CHAT_MODES, SessionError, createChatSessionManager } from './session.mjs';
-export { PlanError, runPlanReview } from './plan.mjs';
+export { PlanError, runPlanReview, runPlanDebate } from './plan.mjs';
 export { CODE_TOOLS, createCodeToolProposal } from './code-tools.mjs';
 export { EventBusError, createEventBus } from './event-bus.mjs';
 export { ProposalStoreError, createProposalStore } from './proposal-store.mjs';
