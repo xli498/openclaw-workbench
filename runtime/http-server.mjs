@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { startWorkbench } from './index.mjs';
 import { createPatchProposal, approveAndApplyPatch, createCommandProposal, approveAndRunCommand, WorkflowError } from './workflow.mjs';
 import { createChatSessionManager, SessionError } from './session.mjs';
@@ -8,7 +8,7 @@ import { createEventBus, EventBusError } from './event-bus.mjs';
 import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
 import { scanCommandLedger } from './command-ledger.mjs';
 import { createWorkspace, WorkspaceError } from './workspace.mjs';
-import { CONTROL_PANEL_HTML } from './control-panel.mjs';
+import { controlPanelHtml } from './control-panel.mjs';
 import { transition } from './action.mjs';
 import { AdapterError, createOpenClawAgentRunner } from './openclaw-adapter.mjs';
 import { PlanError } from './plan.mjs';
@@ -160,8 +160,9 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
     try {
       if (!requireToken(request, token)) return json(response, 401, { error: 'UNAUTHORIZED', message: 'bearer token required' });
       if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/ui')) {
-        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" });
-        return response.end(CONTROL_PANEL_HTML);
+        const nonce = randomBytes(18).toString('base64');
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': `default-src 'self'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'` });
+        return response.end(controlPanelHtml(nonce));
       }
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       await startupState;

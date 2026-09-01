@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
+import { controlPanelHtml } from '../runtime/control-panel.mjs';
 import { createEventBus } from '../runtime/event-bus.mjs';
 
 async function request(address, pathname, options = {}) {
@@ -89,15 +90,34 @@ test('关闭本地服务会终止 SSE 与进行中的 Agent 回合', async () =>
   } finally { await app.close().catch(() => {}); await rm(root, { recursive: true, force: true }); }
 });
 
+test('控制面严格校验 CSP nonce 格式', () => {
+  assert.doesNotThrow(() => controlPanelHtml('ABCDEFGHIJKLMNOPQRSTUVWX'));
+  for (const nonce of ['short', 'ABCDEFGHIJKLMNOPQRSTUV==', 'ABCDEFGHIJKLMNOPQRSTUV!X', 'ABCDEFGHIJKLMNOPQRSTUVW=']) {
+    assert.throws(() => controlPanelHtml(nonce), /nonce must be base64/);
+  }
+});
+
 test('本地控制面提供带安全策略响应头的控制台页面', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-ui-'));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     const response = await fetch(`http://${address.address}:${address.port}/ui`, { headers: { authorization: 'Bearer test-token-012345' } });
+    const secondResponse = await fetch(`http://${address.address}:${address.port}/ui`, { headers: { authorization: 'Bearer test-token-012345' } });
     const html = await response.text();
+    const secondHtml = await secondResponse.text();
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-security-policy'), /default-src 'self'/);
+    assert.match(response.headers.get('content-security-policy'), /script-src 'nonce-[^']+'/);
+    assert.doesNotMatch(response.headers.get('content-security-policy'), /script-src 'unsafe-inline'/);
+    const nonce = html.match(/<script nonce="([^"]+)">/)?.[1];
+    const secondNonce = secondHtml.match(/<script nonce="([^"]+)">/)?.[1];
+    assert.ok(nonce);
+    assert.ok(secondNonce);
+    assert.notEqual(nonce, secondNonce);
+    assert.match(response.headers.get('content-security-policy'), new RegExp(`nonce-${nonce.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(secondResponse.headers.get('content-security-policy'), new RegExp(`nonce-${secondNonce.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.equal((html.match(/<script\b[^>]*\bnonce="[^"]+"[^>]*>/g) || []).length, 1);
     assert.match(html, /Ask · 只读/);
     assert.match(html, /批准执行/);
     assert.match(html, /Workspace Inspector/);
