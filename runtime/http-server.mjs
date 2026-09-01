@@ -103,7 +103,7 @@ function errorResponse(error) {
   }
   if (error instanceof EventBusError) return { status: 400, body: safe(error.code, 'event request failed') };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, 'proposal request failed') };
-  if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
+  if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -188,6 +188,12 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         const workspace = await createWorkspace(root);
         const [content, metadata] = await Promise.all([workspace.read(relativePath), workspace.inspect(relativePath)]);
         return json(response, 200, { file: { ...metadata, content } });
+      }
+      if (request.method === 'GET' && url.pathname === '/v1/workspace/tree') {
+        const workspace = await createWorkspace(root);
+        const maxEntries = singleQueryInteger(url.searchParams, 'maxEntries', 2_000);
+        const maxDepth = singleQueryInteger(url.searchParams, 'maxDepth', 8);
+        return json(response, 200, { root: { path: '', type: 'directory', children: await workspace.tree({ maxEntries, maxDepth }) } });
       }
       if (request.method === 'GET' && url.pathname === '/v1/sessions') return json(response, 200, { sessions: sessions.listSessions({ status: url.searchParams.get('status') ?? undefined }) });
       if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }

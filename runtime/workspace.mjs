@@ -83,6 +83,33 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
       const info = await stat(resolved.targetReal);
       return Object.freeze({ path: resolved.normalized, size: info.size, isFile: info.isFile(), isDirectory: info.isDirectory() });
     },
+    async tree({ maxEntries = 2_000, maxDepth = 8 } = {}) {
+      if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 10_000) throw new WorkspaceError('TREE_LIMIT', 'maxEntries must be between 1 and 10000');
+      if (!Number.isSafeInteger(maxDepth) || maxDepth < 0 || maxDepth > 32) throw new WorkspaceError('TREE_LIMIT', 'maxDepth must be between 0 and 32');
+      let count = 0;
+      const walk = async (directory, prefix, depth) => {
+        const entries = await readdir(directory, { withFileTypes: true });
+        const nodes = [];
+        for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+          const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
+          if (relativePath === INTERNAL_STATE_DIRECTORY || relativePath.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(relativePath)) continue;
+          count += 1;
+          if (count > maxEntries) throw new WorkspaceError('TREE_LIMIT', 'workspace tree exceeds entry limit', { maxEntries });
+          const absolutePath = path.join(directory, entry.name);
+          const info = await lstat(absolutePath);
+          if (info.isSymbolicLink()) continue;
+          if (info.isDirectory()) {
+            const node = { path: relativePath, type: 'directory' };
+            if (depth < maxDepth) node.children = await walk(absolutePath, relativePath, depth + 1);
+            nodes.push(node);
+          } else if (info.isFile()) {
+            nodes.push({ path: relativePath, type: 'file', size: info.size });
+          }
+        }
+        return nodes;
+      };
+      return walk(rootReal, '', 0);
+    },
     async gitRevision() {
       try {
         const { stdout } = await execFileAsync('git', ['-C', rootReal, 'rev-parse', 'HEAD'], { timeout: 5_000, maxBuffer: 64 * 1024 });

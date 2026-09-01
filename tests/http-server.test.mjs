@@ -19,6 +19,9 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
+    const tree = await request(address, '/v1/workspace/tree');
+    assert.equal(tree.status, 200);
+    assert.deepEqual(tree.body.root.children, [{ path: 'README.md', type: 'file', size: 8 }]);
     const file = await request(address, '/v1/workspace/read?path=README.md');
     assert.equal(file.status, 200);
     assert.deepEqual(file.body.file, { path: 'README.md', size: 8, isFile: true, isDirectory: false, content: '# local\n' });
@@ -27,6 +30,9 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.equal(sensitive.body.error, 'SENSITIVE_PATH');
     const missing = await request(address, '/v1/workspace/read?path=missing.md');
     assert.equal(missing.status, 404);
+    const limited = await request(address, '/v1/workspace/tree?maxEntries=0');
+    assert.equal(limited.status, 400);
+    assert.equal(limited.body.error, 'TREE_LIMIT');
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
