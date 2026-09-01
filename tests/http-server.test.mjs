@@ -47,6 +47,9 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /workspacePreviewLabel/);
     assert.match(controlHtml, /aria-labelledby="workspacePreviewLabel"/);
     assert.match(controlHtml, /只读预览：'+path+'/);
+    assert.match(controlHtml, /function treeHasFile\(nodes,path\)/);
+    assert.match(controlHtml, /已选文件不再存在/);
+    assert.match(controlHtml, /treeHasFile\(state\.workspaceTree,state\.selectedWorkspaceFile\)/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
