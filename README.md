@@ -14,6 +14,55 @@ node bin/workbench.mjs --help
 node bin/workbench.mjs --root /path/to/workspace --json
 ```
 
+## Quickstart（当前实现）
+
+要求 **Node.js >= 22.19.0**（见 `package.json` 的 `engines`）。`root` 是要扫描和约束读写的工作区绝对路径；快照、提案和审计材料必须留在该目录内。
+
+```bash
+cd openclaw-workbench
+npm install
+npm test
+
+# 无 token：只执行启动恢复扫描后退出
+node bin/workbench.mjs --root "$PWD" --json
+
+# 有 token：启动长期、本地回环 HTTP 控制面
+node bin/workbench.mjs \
+  --root "$PWD" \
+  --host 127.0.0.1 \
+  --port 4312 \
+  --token "$WORKBENCH_TOKEN" \
+  --approval-token "$WORKBENCH_APPROVAL_TOKEN"
+```
+
+`--token` 与 `--approval-token` 必须分别提供至少 16 个字符的随机值，且不得提交到仓库。服务默认监听 `127.0.0.1`；`--host` 仅允许 `127.0.0.1`、`::1` 或 `localhost`，`--port` 默认为 `0`（由操作系统分配空闲端口）。服务在启动恢复扫描完成后才开始监听；收到 `SIGINT`/`SIGTERM` 时会关闭 HTTP 服务、结束 SSE 连接，并取消进行中的 Agent 回合。
+
+也可从 Node API 启动：
+
+```js
+import { createWorkbenchServer } from 'openclaw-workbench';
+
+const app = createWorkbenchServer({
+  root: '/absolute/path/to/workspace',
+  host: '127.0.0.1',
+  port: 4312,
+  token: process.env.WORKBENCH_TOKEN,
+  approvalToken: process.env.WORKBENCH_APPROVAL_TOKEN,
+});
+console.log(await app.listen());
+// 进程退出时调用 await app.close()
+```
+
+每个请求都要带 `Authorization: Bearer <token>`；`/approve` 另外必须带独立的 `X-Approval-Token: <审批 token>`，并在 JSON body 中提交提案当前的 `actionHash`。这两个 token 不会由 Workbench 生成或回显，也不要提交到仓库。控制面是 **loopback-only**：它不提供公网监听、Gateway 接管、WebSocket Bridge 或生产部署能力；`/v1/events` 和 SSE 只是只读事件读取，不是执行入口。
+
+主路径按 Ask → Plan → Code 理解：
+
+1. **Ask**：`POST /v1/sessions`（`{"mode":"Ask"}`）后调用 `/messages`；用于只读问答，不能创建修改提案。
+2. **Plan**：创建 `{"mode":"Plan"}` 会话后调用 `/plan`，传入 `question` 和 2—4 个 `models`；只读复核/博弈，不创建 Patch、不运行 Terminal。
+3. **Code**：创建 `{"mode":"Code"}` 会话后调用 `/tools/proposals`，`tool` 只能是 `patch` 或 `command`；这里只生成 `awaiting_approval` 提案。用户人工核对预览、路径、策略和 `actionHash` 后，才可用独立审批 token 调 `/v1/proposals/:id/approve`。Code Chat 不会直接写文件。
+
+无真实模型、无外部网络的 fresh-workspace smoke 覆盖位于 `tests/fresh-workspace-smoke.test.mjs`，通过注入 `runAgentFn` 验证上述主路径；它不会启动 `openclaw` 子进程，也不会批准或执行 Patch。若需要真实 OpenClaw Adapter，必须由调用方显式配置并承担其本地 CLI/登录态依赖。
+
 ## 本地控制面 API
 
 `createWorkbenchServer` 提供默认仅监听 `127.0.0.1` 的本地 HTTP 控制面：`GET /health`、`GET /v1/status`、创建 Patch/Command 提案以及明确批准执行提案。请求体限制为 256 KiB；配置 `token` 后所有请求必须携带 `Authorization: Bearer <token>`。该 API 不绑定公网地址、不接管 Gateway，也不把状态持久化到网络数据库；会话、提案和本地事件分别写入工作区的原子 JSON 快照。服务重启后未完成会话/提案只进入 `manual_review`，不会自动调用模型或执行命令。

@@ -226,6 +226,11 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     return Object.freeze({ session: publicSession(session), cancelled: true });
   }
 
+  function cancelAllTurns() {
+    for (const controller of controllers.values()) controller.abort();
+    return controllers.size;
+  }
+
   function listPlanResults(sessionId) {
     const session = getSession(sessionId);
     return Object.freeze(session.planResults.map((result) => Object.freeze({ ...result, analyses: Object.freeze(result.analyses.map((item) => Object.freeze({ ...item }))), failures: Object.freeze(result.failures.map((item) => Object.freeze({ ...item }))), synthesis: Object.freeze({ ...result.synthesis }) })));
@@ -265,5 +270,5 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     return Object.freeze({ total: values.length, active: values.filter((session) => session.status === 'active').length, closed: values.filter((session) => session.status === 'closed').length, manualReview: values.filter((session) => session.status === 'manual_review').length, interruptedTurns: values.filter((session) => session.recoveryReason === 'interrupted_turn').length });
   }
 
-  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), listSessions, sendMessage, planReview, cancelTurn, listMessages, listPlanResults, closeSession, reviewSession, recoverySummary, snapshotPath: storePath });
+  return Object.freeze({ createSession, getSession: (id) => publicSession(getSession(id)), listSessions, sendMessage, planReview, cancelTurn, cancelAllTurns, listMessages, listPlanResults, closeSession, reviewSession, recoverySummary, snapshotPath: storePath });
 }

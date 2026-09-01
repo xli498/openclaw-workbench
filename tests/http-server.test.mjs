@@ -28,6 +28,23 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('关闭本地服务会终止 SSE 与进行中的 Agent 回合', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-close-'));
+  let started;
+  const running = new Promise((resolve) => { started = resolve; });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', runAgentFn: ({ signal }) => new Promise((resolve, reject) => { started(); signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { code: 'ABORTED' })), { once: true }); }) });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+    const turn = request(address, `/v1/sessions/${created.body.session.id}/messages`, { method: 'POST', body: JSON.stringify({ message: 'long turn' }) });
+    await running;
+    await app.close();
+    const response = await turn;
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error, 'TURN_ABORTED');
+  } finally { await app.close().catch(() => {}); await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面提供带安全策略响应头的控制台页面', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-ui-'));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });

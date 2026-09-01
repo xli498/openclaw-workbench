@@ -289,9 +289,19 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       return json(response, mapped.status, mapped.body);
     }
   });
+  let closing = false;
   return Object.freeze({
     server,
+    startup: startupState,
     async listen() { await new Promise((resolve) => server.listen(port, host, resolve)); return server.address(); },
-    async close() { for (const stream of liveStreams) stream.end(); await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); },
+    async close() {
+      if (closing) return;
+      closing = true;
+      sessions.cancelAllTurns();
+      for (const stream of liveStreams) stream.end();
+      liveStreams.clear();
+      if (!server.listening) return;
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    },
   });
 }
