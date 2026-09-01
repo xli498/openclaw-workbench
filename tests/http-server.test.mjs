@@ -34,6 +34,10 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     const limited = await request(address, '/v1/workspace/tree?maxEntries=0');
     assert.equal(limited.status, 400);
     assert.equal(limited.body.error, 'TREE_LIMIT');
+    const controlHtml = controlPanelHtml('ABCDEFGHIJKLMNOPQRSTUVWX');
+    assert.match(controlHtml, /expandedDirectories:new Set\(\)/);
+    assert.match(controlHtml, /state\.expandedDirectories\.has\(node\.path\)/);
+    assert.match(controlHtml, /item\.dataset\.type==='directory'/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
