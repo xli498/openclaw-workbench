@@ -605,6 +605,29 @@ test('执行失败的命令提案保存终态，而不是被重启误判为待�
   } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('Terminal 结果摘要在重启后可按会话读取，且不暴露 ledger 路径', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-command-result-recovery-'));
+  const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const firstAddress = await first.listen();
+  const created = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'terminal-session', argv: ['pwd'] }) });
+  const approved = await request(firstAddress, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+  assert.equal(approved.status, 200);
+  await first.close();
+  const second = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await second.listen();
+  try {
+    const commands = await request(address, '/v1/commands?sessionId=terminal-session');
+    assert.equal(commands.status, 200);
+    assert.equal(commands.body.commands.length, 1);
+    assert.equal(commands.body.commands[0].status, 'verified');
+    assert.equal(commands.body.commands[0].result.code, 0);
+    assert.equal(typeof commands.body.commands[0].result.stdout, 'string');
+    assert.equal('ledgerPath' in commands.body.commands[0], false);
+    const otherSession = await request(address, '/v1/commands?sessionId=other-session');
+    assert.deepEqual(otherSession.body.commands, []);
+  } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('重启后事件 API 把历史事件标记为 recovered，且维持全局 sequence', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-events-recovery-'));
   const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });

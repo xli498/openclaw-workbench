@@ -189,6 +189,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         const records = await scanCommandLedger({ root });
         return json(response, 200, { commands: records
           .filter((record) => (sessionId === null || record.sessionId === sessionId) && (actionHash === null || record.actionHash === actionHash))
+          .sort((left, right) => String(right.updatedAt ?? right.claimedAt ?? '').localeCompare(String(left.updatedAt ?? left.claimedAt ?? '')))
           .map(({ ledgerPath, ...record }) => record) });
       }
       if (request.method === 'GET' && url.pathname === '/v1/workspace/read') {
