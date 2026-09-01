@@ -107,6 +107,10 @@ test('本地控制面提供带安全策略响应头的控制台页面', async ()
     assert.match(html, /查看 Patch Diff/);
     assert.match(html, /查看最近 Terminal 结果/);
     assert.match(html, /\/v1\/commands/);
+    assert.match(html, /command-list/);
+    assert.match(html, /renderCommands/);
+    assert.match(html, /标准输出/);
+    assert.match(html, /错误输出/);
     assert.match(html, /转入 Code 审阅/);
     assert.match(html, /handoffHint/);
     assert.match(html, /复核结果不会自动执行/);
