@@ -10,6 +10,7 @@ import { createWorkspace } from './workspace.mjs';
 import { CONTROL_PANEL_HTML } from './control-panel.mjs';
 import { transition } from './action.mjs';
 import { AdapterError, createOpenClawAgentRunner } from './openclaw-adapter.mjs';
+import { PlanError } from './plan.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -70,13 +71,36 @@ async function bodyOf(request) {
   return body;
 }
 
+function safePlanFailures(failures) {
+  if (!Array.isArray(failures)) return [];
+  return failures.slice(0, 32).map((failure) => {
+    const safe = {};
+    for (const field of ['model', 'stage', 'code']) {
+      if (typeof failure?.[field] === 'string' && failure[field].length <= 256) safe[field] = failure[field];
+    }
+    if (typeof failure?.message === 'string') {
+      // Failure text is model/provider controlled. Keep it useful for the UI,
+      // but never return paths, credentials, or an unbounded provider error.
+      const message = failure.message.replace(/(?:bearer|token|password|secret|api[_ -]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]')
+        .replace(/(?:[A-Za-z]:)?(?:\\|\/)[^\s,;]*/g, '[path redacted]');
+      safe.message = message.length <= 256 ? message : `${message.slice(0, 253)}...`;
+    }
+    return safe;
+  });
+}
+
 function errorResponse(error) {
   const safe = (code, message) => ({ error: code, message: message && message.length <= 256 ? message : 'request failed' });
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
   if (error instanceof AdapterError) return { status: error.code === 'TIMEOUT' ? 504 : error.code === 'ABORTED' ? 409 : 502, body: safe(error.code, error.message) };
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: safe(error.code, error.message) };
   if (error?.code === 'ABORTED') return { status: 409, body: { error: 'TURN_ABORTED', message: 'agent turn was cancelled' } };
-  if (error?.name === 'PlanError') return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body: safe(error.code, error.message) };
+  if (error instanceof PlanError || error?.name === 'PlanError') {
+    const body = safe(error.code, error.message);
+    const failures = safePlanFailures(error.details?.failures);
+    if (failures.length) body.failures = failures;
+    return { status: error.code === 'PLAN_FAILED' ? 502 : 400, body };
+  }
   if (error instanceof EventBusError) return { status: 400, body: safe(error.code, 'event request failed') };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, 'proposal request failed') };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
@@ -248,7 +272,12 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         return json(response, 200, { proposal: publicProposal(record.proposal) });
       }
       const proposalGet = url.pathname.match(/^\/v1\/proposals\/([^/]+)$/);
-      if (request.method === 'GET' && url.pathname === '/v1/proposals') return json(response, 200, { proposals: proposalStore.list({ status: url.searchParams.get('status') ?? undefined }).map((record) => ({ ...publicProposal(record.proposal), ...(record.recovery ? { recovery: record.recovery } : {}) })) });
+      if (request.method === 'GET' && url.pathname === '/v1/proposals') {
+        const sessionId = url.searchParams.get('sessionId') ?? undefined;
+        return json(response, 200, { proposals: proposalStore.list({ status: url.searchParams.get('status') ?? undefined })
+          .filter((record) => sessionId === undefined || record.proposal.action.sessionId === sessionId)
+          .map((record) => ({ ...publicProposal(record.proposal), ...(record.recovery ? { recovery: record.recovery } : {}) })) });
+      }
       if (request.method === 'GET' && proposalGet) {
         const record = proposalStore.get(proposalGet[1]);
         if (!record) return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
