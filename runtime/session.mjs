@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { runAgent } from './openclaw-adapter.mjs';
 import { runPlanReview, runPlanDebate, PlanError } from './plan.mjs';
@@ -27,8 +27,19 @@ function assertPlanResult(result) {
   if (!result || typeof result.id !== 'string' || typeof result.question !== 'string' || !Array.isArray(result.analyses) || !Array.isArray(result.failures) || !result.synthesis || typeof result.createdAt !== 'string') throw new Error('invalid plan result snapshot');
   if (result.debate === true) {
     const rounds = result.rounds;
-    if (typeof result.judgeModel !== 'string' || !rounds || !Array.isArray(rounds.proposals) || !Array.isArray(rounds.critiques) || (rounds.responses !== undefined && !Array.isArray(rounds.responses)) || !rounds.verdict || Array.isArray(rounds.verdict)) throw new Error('invalid debate result snapshot');
-    for (const item of [...rounds.proposals, ...rounds.critiques, ...(rounds.responses ?? []), rounds.verdict]) if (!item || typeof item.model !== 'string' || typeof item.text !== 'string' || typeof item.digest !== 'string') throw new Error('invalid debate item snapshot');
+    if (typeof result.judgeModel !== 'string' || !rounds || !Array.isArray(rounds.proposals) || !Array.isArray(rounds.critiques) || !Array.isArray(rounds.responses) || !rounds.verdict || Array.isArray(rounds.verdict)) throw new Error('invalid debate result snapshot');
+    const expectedDigest = (text) => createHash('sha256').update(text).digest('hex').slice(0, 16);
+    const assertItem = (item, role, { target = false } = {}) => {
+      if (!item || typeof item.model !== 'string' || typeof item.modelId !== 'string' || item.model !== item.modelId || item.role !== role || typeof item.text !== 'string' || typeof item.digest !== 'string' || item.digest !== expectedDigest(item.text)) throw new Error('invalid debate item snapshot');
+      if (target && (typeof item.targetModel !== 'string' || typeof item.targetProposal !== 'string')) throw new Error('invalid debate target snapshot');
+    };
+    rounds.proposals.forEach((item) => assertItem(item, 'proposer'));
+    rounds.critiques.forEach((item) => assertItem(item, 'opposing_reviewer', { target: true }));
+    rounds.responses.forEach((item) => assertItem(item, 'respondent', { target: true }));
+    assertItem(rounds.verdict, 'judge');
+    if (rounds.verdict.model !== result.judgeModel || rounds.verdict.modelId !== result.judgeModel || result.synthesis?.judgeModel !== result.judgeModel) throw new Error('invalid debate judge snapshot');
+    const proposalDigests = new Set(rounds.proposals.map((item) => item.digest));
+    if (rounds.critiques.some((item) => !proposalDigests.has(item.targetProposal)) || rounds.responses.some((item) => item.targetModel !== item.model || !proposalDigests.has(item.targetProposal))) throw new Error('invalid debate association snapshot');
   }
 }
 function deepFreeze(value) {
@@ -95,6 +106,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
           messages: raw.messages.map((message) => Object.freeze({ ...message })),
           planResults: restoredPlanResults,
           running: false,
+          pendingRunners: new Set(),
           ...(interrupted ? { recoveryReason: 'interrupted_turn' } : {}),
         };
         sessions.set(session.id, session);
@@ -108,7 +120,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
   function createSession({ mode = 'Ask', actor = 'user', workspaceId = root } = {}) {
     assertMode(mode);
     if (typeof actor !== 'string' || !actor || actor.length > 256) throw new SessionError('INVALID_ACTOR', 'actor is required and must be at most 256 characters');
-    const session = { id: randomUUID(), workspaceId, mode, actor, status: 'active', createdAt: clock().toISOString(), messages: [], planResults: [], running: false };
+    const session = { id: randomUUID(), workspaceId, mode, actor, status: 'active', createdAt: clock().toISOString(), messages: [], planResults: [], running: false, pendingRunners: new Set() };
     sessions.set(session.id, session);
     try { persist(); } catch (error) { sessions.delete(session.id); throw error; }
     return publicSession(session);
@@ -164,6 +176,10 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
     session.running = true;
     const controller = new AbortController();
+    const registerRunner = (runner) => {
+      session.pendingRunners.add(runner);
+      runner.then(() => session.pendingRunners.delete(runner), () => session.pendingRunners.delete(runner));
+    };
     const relayAbort = () => controller.abort();
     if (signal?.aborted) controller.abort();
     else signal?.addEventListener('abort', relayAbort, { once: true });
@@ -172,7 +188,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     let primaryError;
     try {
       const runner = debate ? runPlanDebate : runPlanReview;
-      const result = await runner({ question, models, judgeModel, sessionKey: session.id, thinking, timeoutSeconds, signal: controller.signal, onStage, runAgentFn: (input) => runAgentFn({ ...input, signal: controller.signal }) });
+      const result = await runner({ question, models, judgeModel, sessionKey: session.id, thinking, timeoutSeconds, signal: controller.signal, onStage, onRunnerStart: registerRunner, runAgentFn: (input) => runAgentFn({ ...input, signal: controller.signal }) });
       const stored = Object.freeze({ id: randomUUID(), ...result, createdAt: clock().toISOString() });
       session.planResults.push(stored);
       persist();
@@ -182,10 +198,18 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     finally {
       signal?.removeEventListener('abort', relayAbort);
       controllers.delete(session.id);
-      session.running = false;
+      if (session.pendingRunners.size === 0) session.running = false;
       try { persist(); } catch (persistenceError) {
         if (primaryError) attachPersistenceError(primaryError, persistenceError);
         else throw persistenceError;
+      }
+      if (session.pendingRunners.size > 0) {
+        void Promise.allSettled([...session.pendingRunners]).then(() => {
+          if (session.pendingRunners.size === 0 && session.running) {
+            session.running = false;
+            try { persist(); } catch { /* best effort; the original turn already returned */ }
+          }
+        });
       }
     }
   }

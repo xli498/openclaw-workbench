@@ -46,6 +46,17 @@ test('拒绝损坏会话快照，避免猜测性恢复', async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('恢复 Debate 快照时校验角色、摘要、目标关联和裁判模型绑定', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-session-debate-invalid-'));
+  try {
+    const storePath = join(root, '.openclaw-workbench', 'sessions.json');
+    await mkdir(join(root, '.openclaw-workbench'));
+    const item = (model, role, text, extra = {}) => ({ model, modelId: model, role, text, digest: 'forged-digest', ...extra });
+    await writeFile(storePath, JSON.stringify({ version: 1, sessions: [{ id: 'debate', mode: 'Plan', status: 'active', messages: [], planResults: [{ id: 'p', question: 'q', analyses: [], failures: [], createdAt: '2026-01-01T00:00:00.000Z', debate: true, judgeModel: 'judge', synthesis: { judgeModel: 'judge' }, rounds: { proposals: [item('a', 'proposer', 'proposal')], critiques: [item('b', 'opposing_reviewer', 'critique', { targetModel: 'a', targetProposal: 'forged-digest' })], responses: [item('a', 'respondent', 'response', { targetModel: 'a', targetProposal: 'forged-digest' })], verdict: item('judge', 'judge', 'verdict') } }] }] }));
+    assert.throws(() => createChatSessionManager({ root }), { code: 'SESSION_STORE_INVALID' });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('人工复核只恢复会话状态，不重放中断回合', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-session-review-'));
   try {

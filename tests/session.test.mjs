@@ -44,3 +44,33 @@ test('外部 AbortSignal 会取消 Chat 回合并清理半轮消息', async () =
     assert.throws(() => manager.cancelTurn(session.id), { code: 'NO_RUNNING_TURN' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('Plan 超时后等待忽略 abort 的底层 runner 排水，排水完成后才允许下一回合', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-session-plan-drain-'));
+  try {
+    let release;
+    const blocked = new Promise((resolve) => { release = resolve; });
+    let firstTurn = true;
+    let started = 0;
+    const manager = createChatSessionManager({
+      root,
+      runAgentFn: async ({ signal }) => {
+        if (!firstTurn) return { text: 'ok' };
+        started += 1;
+        await blocked;
+        return { text: 'late result despite abort' };
+      },
+    });
+    const session = manager.createSession({ mode: 'Plan' });
+    const turn = manager.planReview({ sessionId: session.id, question: 'long review', models: ['a', 'b'], debate: true, timeoutSeconds: 0.01 });
+    while (started < 2) await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(turn, { code: 'DEBATE_FAILED' });
+    await assert.rejects(() => manager.sendMessage({ sessionId: session.id, message: 'must wait' }), { code: 'SESSION_BUSY' });
+
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    firstTurn = false;
+    const result = await manager.sendMessage({ sessionId: session.id, message: 'after drain' });
+    assert.equal(result.message.content.text, 'ok');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
