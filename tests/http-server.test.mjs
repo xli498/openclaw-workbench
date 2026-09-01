@@ -110,6 +110,10 @@ test('本地控制面提供带安全策略响应头的控制台页面', async ()
     assert.match(html, /复核结果不会自动执行/);
     assert.match(html, /if\(state.mode==='Plan'\)await loadPlanHistory\(\)/);
     assert.match(html, /人工复核/);
+    assert.match(html, /恢复会话/);
+    assert.match(html, /关闭会话/);
+    assert.match(html, /reviewSession\('resume'\)/);
+    assert.match(html, /reviewSession\('close'\)/);
     assert.match(html, /authorization:'Bearer '\+state\.token/);
     assert.doesNotMatch(html, /EventSource|prompt\(|test-token-012345|approve-token-012345/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
