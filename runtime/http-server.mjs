@@ -6,6 +6,7 @@ import { createChatSessionManager, SessionError } from './session.mjs';
 import { createCodeToolProposal } from './code-tools.mjs';
 import { createEventBus, EventBusError } from './event-bus.mjs';
 import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
+import { scanCommandLedger } from './command-ledger.mjs';
 import { createWorkspace, WorkspaceError } from './workspace.mjs';
 import { CONTROL_PANEL_HTML } from './control-panel.mjs';
 import { transition } from './action.mjs';
@@ -182,6 +183,14 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) }));
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), root, persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
+      if (request.method === 'GET' && url.pathname === '/v1/commands') {
+        const sessionId = url.searchParams.get('sessionId');
+        const actionHash = url.searchParams.get('actionHash');
+        const records = await scanCommandLedger({ root });
+        return json(response, 200, { commands: records
+          .filter((record) => (sessionId === null || record.sessionId === sessionId) && (actionHash === null || record.actionHash === actionHash))
+          .map(({ ledgerPath, ...record }) => record) });
+      }
       if (request.method === 'GET' && url.pathname === '/v1/workspace/read') {
         const relativePath = url.searchParams.get('path');
         if (!relativePath) return json(response, 400, { error: 'INVALID_PATH', message: 'path query parameter is required' });

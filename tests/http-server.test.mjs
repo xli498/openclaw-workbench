@@ -105,6 +105,8 @@ test('本地控制面提供带安全策略响应头的控制台页面', async ()
     assert.match(html, /workspacePreview/);
     assert.match(html, /proposalStatus/);
     assert.match(html, /查看 Patch Diff/);
+    assert.match(html, /查看最近 Terminal 结果/);
+    assert.match(html, /\/v1\/commands/);
     assert.match(html, /转入 Code 审阅/);
     assert.match(html, /handoffHint/);
     assert.match(html, /复核结果不会自动执行/);
@@ -571,6 +573,10 @@ test('重启后的未完成提案只能查看，审批接口拒绝自动恢复',
   try {
     const record = await request(address, `/v1/proposals/${created.body.proposal.action.id}`);
     assert.equal(record.status, 200);
+    const commands = await request(address, `/v1/commands?actionHash=${created.body.proposal.action.actionHash}`);
+    assert.equal(commands.status, 200);
+    assert.equal(commands.body.commands.length, 1);
+    assert.equal(commands.body.commands[0].actionHash, created.body.proposal.action.actionHash);
     assert.equal(record.body.recovery.state, 'manual_review');
     const approval = await request(address, `/v1/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
     assert.equal(approval.status, 409);

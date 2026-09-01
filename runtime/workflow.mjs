@@ -77,6 +77,11 @@ export async function createCommandProposal({ root, argv, sessionId, mode = 'Ter
   return Object.freeze({ action, command: preview, workspaceRevision: revisionForAction(currentRevision), policy, commandPolicy, root });
 }
 
+function outputSummary(result = {}) {
+  const clip = (value) => typeof value === 'string' ? value.slice(0, 32 * 1024) : '';
+  return Object.freeze({ code: result.code, cwd: result.cwd, stdout: clip(result.stdout), stderr: clip(result.stderr) });
+}
+
 export async function approveAndRunCommand({ proposal, root = proposal?.root, approved = false, audit, currentRevision, getCurrentRevision, signal } = {}) {
   if (!proposal?.action || !proposal?.command) throw new WorkflowError('PROPOSAL_INVALID', 'command proposal is required');
   if (!approved) throw new WorkflowError('APPROVAL_REQUIRED', 'terminal execution requires explicit approval');
@@ -105,13 +110,13 @@ export async function approveAndRunCommand({ proposal, root = proposal?.root, ap
   try {
     const result = await runControlledCommand({ root, ...proposal.command, approved: true, signal });
     const verified = transition(executing, 'verified');
-    await updateCommandAction({ root, actionHash: action.actionHash, status: 'verified', result: { code: result.code, cwd: result.cwd } });
+    await updateCommandAction({ root, actionHash: action.actionHash, status: 'verified', result: outputSummary(result) });
     if (audit) await audit.append({ type: 'command.verified', actor: 'system', actionId: verified.id });
     return Object.freeze({ action: verified, result });
   } catch (error) {
     const terminalStatus = error.code === 'TIMEOUT' ? 'timed_out' : error.code === 'ABORTED' ? 'cancelled' : 'failed';
     const failed = transition(executing, terminalStatus);
-    await updateCommandAction({ root, actionHash: action.actionHash, status: terminalStatus, error: { code: error.code, message: error.message } });
+    await updateCommandAction({ root, actionHash: action.actionHash, status: terminalStatus, result: outputSummary(error.details), error: { code: error.code, message: error.message } });
     if (audit) await audit.append({ type: 'command.failed', actor: 'system', actionId: failed.id, code: error.code });
     throw new WorkflowError(error.code ?? 'COMMAND_FAILED', error.message, { cause: error, action: failed });
   }
