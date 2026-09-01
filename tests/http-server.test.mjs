@@ -41,6 +41,9 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /<button type="button" class="tree-item/);
     assert.match(controlHtml, /aria-expanded=/);
     assert.match(controlHtml, /\.tree-item:focus-visible/);
+    assert.match(controlHtml, /selectedWorkspaceFile:null/);
+    assert.match(controlHtml, /aria-current="true"/);
+    assert.match(controlHtml, /\.tree-item\.selected/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
