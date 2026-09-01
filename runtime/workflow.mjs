@@ -5,6 +5,7 @@ import { actionHash, createAction, transition } from './action.mjs';
 import { applyPatchTransaction, TransactionError } from './change-transaction.mjs';
 import { runControlledCommand, validateCommandLimits } from './terminal.mjs';
 import { claimCommandAction, updateCommandAction } from './command-ledger.mjs';
+import path from 'node:path';
 
 export class WorkflowError extends Error {
   constructor(code, message, details = {}) { super(message); this.name = 'WorkflowError'; this.code = code; this.details = details; }
@@ -77,9 +78,18 @@ export async function createCommandProposal({ root, argv, sessionId, mode = 'Ter
   return Object.freeze({ action, command: preview, workspaceRevision: revisionForAction(currentRevision), policy, commandPolicy, root });
 }
 
+function redactOutput(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/(bearer\s+|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|cookie)\s*[=:]\s*)[^\s,;]+/gi, '$1[redacted]')
+    .replace(/\b(?:sk|pk|xox[baprs]|gh[pousr])-[A-Za-z0-9_-]+\b/g, '[redacted]')
+    .replace(/(?:^|\s)(\/(?:home|tmp|var|etc|opt|root)\/[^\s"'<>]+)/g, '$1[path]')
+    .slice(0, 16 * 1024);
+}
+
 function outputSummary(result = {}) {
-  const clip = (value) => typeof value === 'string' ? value.slice(0, 32 * 1024) : '';
-  return Object.freeze({ code: result.code, cwd: result.cwd, stdout: clip(result.stdout), stderr: clip(result.stderr) });
+  const cwd = typeof result.cwd === 'string' && path.isAbsolute(result.cwd) ? '[workspace]' : result.cwd;
+  return Object.freeze({ code: result.code, cwd, stdout: redactOutput(result.stdout), stderr: redactOutput(result.stderr) });
 }
 
 export async function approveAndRunCommand({ proposal, root = proposal?.root, approved = false, audit, currentRevision, getCurrentRevision, signal } = {}) {

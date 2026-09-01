@@ -653,6 +653,7 @@ test('状态 API 汇总重启恢复状态，不暴露会话或提案内容', asy
     const address = await app.listen();
     const status = await request(address, '/v1/status');
     assert.equal(status.status, 200);
+    assert.equal('root' in status.body, false);
     assert.deepEqual(status.body.persistedState.sessions, { total: 1, active: 0, closed: 0, manualReview: 1, interruptedTurns: 1 });
     assert.deepEqual(status.body.persistedState.proposals, { total: 0, manualReview: 0, executing: 0, terminal: 0 });
     assert.equal(status.body.persistedState.events.recovered, false);

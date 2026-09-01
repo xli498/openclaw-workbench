@@ -182,7 +182,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         return;
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) }));
-      if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), root, persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
+      if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
       if (request.method === 'GET' && url.pathname === '/v1/commands') {
         const sessionId = url.searchParams.get('sessionId');
         const actionHash = url.searchParams.get('actionHash');

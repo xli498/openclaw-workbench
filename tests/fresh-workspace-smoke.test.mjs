@@ -38,7 +38,7 @@ test('fresh workspace smoke: Ask/Plan/Code main path uses injected runner withou
   try {
     assert.equal(address.address, '127.0.0.1');
     assert.equal((await request(address, '/health')).body.ok, true);
-    assert.equal((await request(address, '/v1/status')).body.root, root);
+    assert.equal('root' in (await request(address, '/v1/status')).body, false);
 
     const ask = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
     assert.equal(ask.status, 201);
