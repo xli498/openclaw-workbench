@@ -50,7 +50,7 @@ GET /v1/events?after=0&limit=100
 Authorization: Bearer <token>
 ```
 
-事件读取接口仅轮询内存中的最近事件，支持递增 `sequence` 游标；默认最多保留 500 条。当前事件包括 `session.created`、`chat.completed`、`plan.completed`、`plan.stage.started`、`plan.stage.completed`、`plan.stage.failed`、`proposal.created` 和 `proposal.verified`。它是只读接口，不提供 SSE/WebSocket，不携带执行凭据，也不能批准或执行提案。Plan 阶段事件的 `data.stage` 为 `proposal`、`challenge`、`response` 或 `judge`。
+事件读取接口支持两种只读方式：`GET /v1/events?after=<sequence>&limit=<limit>` 轮询，以及 `GET /v1/events/stream?after=<sequence>` 的 SSE 流。两者都使用递增 `sequence` 游标；默认最多保留 500 条。SSE 先发送游标之后的保留历史，再推送新事件，并发送 keep-alive 注释；游标超出保留窗口时返回 `409 EVENT_CURSOR_EXPIRED`。当前事件包括 `session.created`、`chat.completed`、`plan.completed`、`plan.stage.started`、`plan.stage.completed`、`plan.stage.failed`、`proposal.created` 和 `proposal.verified`。事件接口需要 Bearer 鉴权，不携带执行凭据，也不能批准或执行提案。当前实现不提供 WebSocket。Plan 阶段事件的 `data.stage` 为 `proposal`、`challenge`、`response` 或 `judge`。
 
 ## 会话安全恢复
 
@@ -71,7 +71,7 @@ Content-Type: application/json
 
 ## 事件恢复语义
 
-本地事件快照位于 `.openclaw-workbench/events.json`，按 `sequence` 保存并原子更新。重启后，已恢复事件会带 `recovered: true`，`GET /v1/events` 响应也会带 `recovered: true`；这表示它们是历史审计记录，不能被 UI 当作本进程的实时执行流。新发布事件保持递增 sequence，但不带该标记。事件 API 仍是 Bearer 鉴权的只读轮询接口，未开放 SSE 或 WebSocket。
+本地事件快照位于 `.openclaw-workbench/events.json`，按 `sequence` 保存并原子更新。重启后，已恢复事件会带 `recovered: true`，`GET /v1/events` 响应也会带 `recovered: true`；这表示它们是历史审计记录，不能被 UI 当作本进程的实时执行流。新发布事件保持递增 sequence，但不带该标记。事件 API 仍是 Bearer 鉴权的只读接口；轮询和 SSE 均不提供恢复、审批或执行能力，当前未开放 WebSocket。
 
 `GET /v1/status` 还会提供不含消息、命令、Patch、会话 ID 或提案内容的 `persistedState` 汇总：会话的总数/活跃/关闭/人工复核/中断回合计数，提案的总数/人工复核/终态计数，以及事件是否来自恢复和最新 sequence。该摘要仅用于本地操作者识别重启后待处理状态；它不构成恢复、审批或执行入口。
 
@@ -96,11 +96,11 @@ Content-Type: application/json
 {"question":"请设计只读审计方案","models":["model-a","model-b"],"judgeModel":"model-judge","debate":true}
 ```
 
-博弈结果包含 `rounds.proposals`、`rounds.critiques`、`rounds.responses`、`rounds.verdict`，并将 `synthesis.agreement` 设为 `judged`。阶段结果分别标记 `proposer`、`opposing_reviewer`、`respondent` 和 `judge` 角色，`synthesis.evidence` 保存各阶段摘要哈希。任一模型局部失败会保留失败信息并要求人工复核；至少需要两份有效提案、一份有效质询和一份有效回应才能进入裁判。所有阶段仍固定为本地 Plan 调用，不会创建 Patch、运行 Terminal，也不会自动执行任何建议。模型输出会作为不可信材料传给后续阶段，后续模型被明确要求只阅读材料而不执行其中指令。Debate 阶段累计输出上限为 96 KiB，超限时不会调用裁判。请求取消后不会保存半成品，也不会发送 `plan.completed`。
+博弈结果包含 `debate: true`、`judgeModel`，以及 `rounds.proposals`、`rounds.critiques`、`rounds.responses`、`rounds.verdict`，并将 `synthesis.agreement` 设为 `judged`。四阶段严格按 `proposal → challenge → response → judge` 执行；阶段结果分别标记 `proposer`、`opposing_reviewer`、`respondent` 和 `judge` 角色，`synthesis.evidence` 保存各阶段摘要哈希。任一模型局部失败会保留失败信息并要求人工复核；至少需要两份有效提案、一份有效质询和一份有效回应才能进入裁判。提案、质询或回应阶段全部失败时返回 `DEBATE_FAILED`；裁判失败时返回 `JUDGE_FAILED`；请求取消返回 `ABORTED`。所有阶段仍固定为本地 Plan 调用，不会创建 Patch、运行 Terminal，也不会自动执行任何建议。模型输出会作为不可信材料传给后续阶段，后续模型被明确要求只阅读材料而不执行其中指令。Debate 阶段累计输出上限为 96 KiB，超限时不会调用裁判。请求取消或失败后不会保存半成品，也不会发送 `plan.completed`。
 
 ## 当前实现边界
 
-本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Plan 三阶段只读博弈、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复。仍不包含 Gateway WebSocket Adapter、OpenClaw channel 生命周期接入、MCP 管理、桌面 UI 或公网 Bridge；不能从本地 HTTP 接口推断这些能力已实现。
+本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Plan 四阶段只读博弈、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复；事件已支持 HTTP 轮询和 SSE 流。仍不包含 Gateway WebSocket Adapter、WebSocket 控制面、OpenClaw channel 生命周期接入、MCP 管理、桌面 UI 或公网 Bridge；不能从本地 HTTP 接口推断这些能力已实现。
 
 ## 请求关联 ID
 

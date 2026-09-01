@@ -22,6 +22,10 @@ node bin/workbench.mjs --root /path/to/workspace --json
 
 Chat 会话接口遵循 ShunCode 的 Ask / Plan / Code 三模式：`POST /v1/sessions` 创建会话，`POST /v1/sessions/:id/messages` 调用独立的 OpenClaw Adapter，`GET /v1/sessions/:id/messages` 读取消息，`POST /v1/sessions/:id/close` 关闭会话。当前三种模式已完成会话级边界；真正的 Code 文件修改仍必须通过 Patch 提案和明确审批，不允许 Chat 直接写文件。
 
+Plan 会话支持 `POST /v1/sessions/:id/plan` 的多模型只读复核；传入 `debate: true` 时执行四阶段 `proposal → challenge → response → judge`，可用 `judgeModel` 指定裁判模型。结果通过 `rounds.proposals`、`rounds.critiques`、`rounds.responses`、`rounds.verdict` 返回，并保留失败信息和人工复核语义；Plan 不会创建 Patch、运行 Terminal 或自动执行建议。
+
+事件可通过只读 `GET /v1/events` 轮询，或通过 Bearer 鉴权的 `GET /v1/events/stream?after=<sequence>` 使用 SSE 接收历史事件和后续事件（含 keep-alive）；事件流不是审批或执行入口。当前未实现 Gateway WebSocket Adapter 或 WebSocket 控制面。
+
 Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前仍不包含桌面 UI、MCP 管理、OpenClaw channel/Gateway 生命周期接入和公网 Bridge。
 
 ## 能力状态

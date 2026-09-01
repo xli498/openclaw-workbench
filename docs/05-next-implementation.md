@@ -7,7 +7,14 @@
 5. 失败时按快照清单恢复；恢复失败必须保留现场并返回 `ROLLBACK_PARTIAL`。
 6. 用故障注入覆盖：第二个文件 hash 冲突、写入失败、进程中断、符号链接替换和并发变更。
 
-在上述门禁通过前，不接入 Agent 自动 Code 模式。
+在上述门禁通过前，不接入 Agent 自动 Code 模式。当前实现仍坚持这一边界：Code 只能生成待审批提案，文件修改和命令执行都需要独立人工批准。
+
+## 当前已实现的 Chat/Plan 边界
+
+- Chat 会话支持 Ask / Plan / Code 三模式；消息调用由独立 Adapter 执行，服务重启或请求取消不会重放中断回合。
+- Plan 支持多模型只读复核；`debate: true` 时按 `proposal → challenge → response → judge` 四阶段执行，结果字段为 `debate`、`judgeModel` 和 `rounds.proposals` / `rounds.critiques` / `rounds.responses` / `rounds.verdict`。
+- Plan 各阶段只处理不可信模型材料，不创建 Patch、不运行 Terminal、不自动执行建议。局部失败保留失败信息并要求人工复核；阶段前置条件不满足返回 `DEBATE_FAILED`，裁判失败返回 `JUDGE_FAILED`，取消返回 `ABORTED`；失败或取消不保存半成品。
+- 本地事件支持 Bearer 鉴权的轮询 `GET /v1/events` 和 SSE `GET /v1/events/stream`，SSE 支持历史回放、递增游标和 keep-alive；当前不支持 WebSocket。
 
 ## 启动扫描阶段（已完成）
 
