@@ -50,6 +50,8 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /function treeHasFile\(nodes,path\)/);
     assert.match(controlHtml, /已选文件不再存在/);
     assert.match(controlHtml, /treeHasFile\(state\.workspaceTree,state\.selectedWorkspaceFile\)/);
+    assert.match(controlHtml, /if\(selected&&state\.selectedWorkspaceFile===selected\)await loadWorkspaceFile\(selected\)/);
+    assert.match(controlHtml, /e\.status===404&&state\.selectedWorkspaceFile===path/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
