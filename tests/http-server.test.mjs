@@ -36,6 +36,26 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('控制面提供 Patch Diff 只读预览并拒绝非 Patch 提案', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-diff-'));
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const patch = '--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,1 @@\n-old\n+new\n';
+    const created = await request(address, '/v1/proposals/patch', { method: 'POST', body: JSON.stringify({ sessionId: 'diff-test', patch, declaredPaths: ['README.md'] }) });
+    assert.equal(created.status, 201);
+    const diff = await request(address, `/v1/proposals/${created.body.proposal.action.id}/diff`);
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.diff.patch, patch);
+    assert.deepEqual(diff.body.diff.paths, ['README.md']);
+    assert.equal(diff.body.diff.actionHash, created.body.proposal.action.actionHash);
+    const command = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'diff-command', argv: ['pwd'] }) });
+    const rejected = await request(address, `/v1/proposals/${command.body.proposal.action.id}/diff`);
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body.error, 'NOT_PATCH_PROPOSAL');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面提供健康检查、鉴权和命令提案审批执行', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-'));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });

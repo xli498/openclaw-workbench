@@ -285,6 +285,26 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         if (audit) await audit.append({ type: `action.${verb}`, actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash });
         return json(response, 200, { proposal: publicProposal(record.proposal) });
       }
+      const proposalDiff = url.pathname.match(/^\/v1\/proposals\/([^/]+)\/diff$/);
+      if (request.method === 'GET' && proposalDiff) {
+        const record = proposalStore.get(proposalDiff[1]);
+        if (!record) return json(response, 404, { error: 'PROPOSAL_NOT_FOUND', message: 'proposal not found' });
+        const proposal = record.proposal;
+        if (proposal.action.type !== 'patch' || typeof proposal.action.preview !== 'string') {
+          return json(response, 400, { error: 'NOT_PATCH_PROPOSAL', message: 'proposal does not contain a patch diff' });
+        }
+        return json(response, 200, {
+          diff: {
+            actionId: proposal.action.id,
+            actionHash: proposal.action.actionHash,
+            status: proposal.action.status,
+            workspaceRevision: proposal.workspaceRevision,
+            paths: Array.isArray(proposal.parsedPatch?.paths) ? proposal.parsedPatch.paths : [],
+            patch: proposal.action.preview,
+            parsedPatch: proposal.parsedPatch,
+          },
+        });
+      }
       const proposalGet = url.pathname.match(/^\/v1\/proposals\/([^/]+)$/);
       if (request.method === 'GET' && url.pathname === '/v1/proposals') {
         const sessionId = url.searchParams.get('sessionId') ?? undefined;
