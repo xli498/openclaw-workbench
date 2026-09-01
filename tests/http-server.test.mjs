@@ -12,6 +12,24 @@ async function request(address, pathname, options = {}) {
   return { status: response.status, headers: response.headers, body: await response.json() };
 }
 
+test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感路径', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-workspace-'));
+  await writeFile(path.join(root, 'README.md'), '# local\n');
+  await writeFile(path.join(root, '.env'), 'secret\n');
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const file = await request(address, '/v1/workspace/read?path=README.md');
+    assert.equal(file.status, 200);
+    assert.deepEqual(file.body.file, { path: 'README.md', size: 8, isFile: true, isDirectory: false, content: '# local\n' });
+    const sensitive = await request(address, '/v1/workspace/read?path=.env');
+    assert.equal(sensitive.status, 400);
+    assert.equal(sensitive.body.error, 'SENSITIVE_PATH');
+    const missing = await request(address, '/v1/workspace/read?path=missing.md');
+    assert.equal(missing.status, 404);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('本地控制面提供健康检查、鉴权和命令提案审批执行', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-'));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });

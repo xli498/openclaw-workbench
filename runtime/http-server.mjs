@@ -6,7 +6,7 @@ import { createChatSessionManager, SessionError } from './session.mjs';
 import { createCodeToolProposal } from './code-tools.mjs';
 import { createEventBus, EventBusError } from './event-bus.mjs';
 import { createProposalStore, ProposalStoreError } from './proposal-store.mjs';
-import { createWorkspace } from './workspace.mjs';
+import { createWorkspace, WorkspaceError } from './workspace.mjs';
 import { CONTROL_PANEL_HTML } from './control-panel.mjs';
 import { transition } from './action.mjs';
 import { AdapterError, createOpenClawAgentRunner } from './openclaw-adapter.mjs';
@@ -103,6 +103,7 @@ function errorResponse(error) {
   }
   if (error instanceof EventBusError) return { status: 400, body: safe(error.code, 'event request failed') };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, 'proposal request failed') };
+  if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -181,6 +182,13 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) }));
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), root, persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
+      if (request.method === 'GET' && url.pathname === '/v1/workspace/read') {
+        const relativePath = url.searchParams.get('path');
+        if (!relativePath) return json(response, 400, { error: 'INVALID_PATH', message: 'path query parameter is required' });
+        const workspace = await createWorkspace(root);
+        const [content, metadata] = await Promise.all([workspace.read(relativePath), workspace.inspect(relativePath)]);
+        return json(response, 200, { file: { ...metadata, content } });
+      }
       if (request.method === 'GET' && url.pathname === '/v1/sessions') return json(response, 200, { sessions: sessions.listSessions({ status: url.searchParams.get('status') ?? undefined }) });
       if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }
       const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
