@@ -100,6 +100,12 @@ test('本地控制面提供带安全策略响应头的控制台页面', async ()
     assert.match(response.headers.get('content-security-policy'), /default-src 'self'/);
     assert.match(html, /Ask · 只读/);
     assert.match(html, /批准执行/);
+    assert.match(html, /Workspace Inspector/);
+    assert.match(html, /workspaceTree/);
+    assert.match(html, /workspacePreview/);
+    assert.match(html, /proposalStatus/);
+    assert.match(html, /查看 Patch Diff/);
+    assert.match(html, /人工复核/);
     assert.match(html, /authorization:'Bearer '\+state\.token/);
     assert.doesNotMatch(html, /EventSource|prompt\(|test-token-012345|approve-token-012345/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
