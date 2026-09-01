@@ -106,6 +106,7 @@ test('本地控制面提供带安全策略响应头的控制台页面', async ()
     assert.match(html, /proposalStatus/);
     assert.match(html, /查看 Patch Diff/);
     assert.match(html, /转入 Code 审阅/);
+    assert.match(html, /handoffHint/);
     assert.match(html, /复核结果不会自动执行/);
     assert.match(html, /人工复核/);
     assert.match(html, /authorization:'Bearer '\+state\.token/);
