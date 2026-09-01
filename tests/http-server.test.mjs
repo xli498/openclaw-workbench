@@ -52,6 +52,14 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /treeHasFile\(state\.workspaceTree,state\.selectedWorkspaceFile\)/);
     assert.match(controlHtml, /if\(selected&&state\.selectedWorkspaceFile===selected\)await loadWorkspaceFile\(selected\)/);
     assert.match(controlHtml, /e\.status===404&&state\.selectedWorkspaceFile===path/);
+    assert.match(controlHtml, /role="tree" aria-label="只读工作区文件树" aria-busy="false"/);
+    assert.match(controlHtml, /role="treeitem"/);
+    assert.match(controlHtml, /aria-level=/);
+    assert.match(controlHtml, /e\.key==='ArrowDown'/);
+    assert.match(controlHtml, /e\.key==='ArrowRight'/);
+    assert.match(controlHtml, /tree\.setAttribute\('aria-busy','true'\)/);
+    assert.match(controlHtml, /button\.disabled=true/);
+    assert.match(controlHtml, /finally\{tree\.setAttribute\('aria-busy','false'\);button\.disabled=false\}/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
