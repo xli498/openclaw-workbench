@@ -38,6 +38,9 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /expandedDirectories:new Set\(\)/);
     assert.match(controlHtml, /state\.expandedDirectories\.has\(node\.path\)/);
     assert.match(controlHtml, /item\.dataset\.type==='directory'/);
+    assert.match(controlHtml, /<button type="button" class="tree-item/);
+    assert.match(controlHtml, /aria-expanded=/);
+    assert.match(controlHtml, /\.tree-item:focus-visible/);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
