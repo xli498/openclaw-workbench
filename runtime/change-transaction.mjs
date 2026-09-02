@@ -62,7 +62,7 @@ async function assertWorkspaceDirectory(root, directory, label) {
   return real;
 }
 
-async function writeStableFile(root, filePath, content, label) {
+export async function writeStableFile(root, filePath, content, label) {
   let stable;
   try {
     stable = await openStableParent(root, filePath);
@@ -73,7 +73,7 @@ async function writeStableFile(root, filePath, content, label) {
   } finally { await stable?.directory.close().catch(() => {}); }
 }
 
-async function unlinkStableFile(root, filePath) {
+export async function unlinkStableFile(root, filePath) {
   let stable;
   try {
     stable = await openStableParent(root, filePath);

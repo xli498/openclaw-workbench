@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { acquireWorkspaceWriteLock, openStableParent, replaceWithinStableParent } from './change-transaction.mjs';
+import { acquireWorkspaceWriteLock, openStableParent, replaceWithinStableParent, unlinkStableFile, writeStableFile } from './change-transaction.mjs';
 
 export class RecoveryError extends Error {
   constructor(code, message, details = {}) { super(message); this.name = 'RecoveryError'; this.code = code; this.details = details; }
@@ -208,8 +208,13 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
         } else if (mode === 'rollback' && file.snapshot && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesBefore) {
           const content = await readSafeFile(root, file.snapshot, file.relativePath).catch((error) => { throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath, { error: error.message }); });
           const temp = `${file.target}.ocw-recovery.tmp-${Date.now()}`;
-          await writeFile(temp, content, { flag: 'wx' });
-          await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: hash(content), expectedTargetHash: file.afterHash, expectedAfterHash: hash(content) });
+          await writeStableFile(root, temp, content, 'recovery staging write');
+          try {
+            await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: hash(content), expectedTargetHash: file.afterHash, expectedAfterHash: hash(content) });
+          } catch (error) {
+            await unlinkStableFile(root, temp).catch(() => {});
+            throw error;
+          }
           applied.push(file);
         }
       }
@@ -220,8 +225,13 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
         try {
           const content = await readSafeFile(root, file.snapshot, file.relativePath);
           const temp = `${file.target}.ocw-recovery-rollback-${Date.now()}`;
-          await writeFile(temp, content, { flag: 'wx' });
-          await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: hash(content), expectedTargetHash: mode === 'resume' ? file.afterHash : file.beforeHash, expectedAfterHash: hash(content) });
+          await writeStableFile(root, temp, content, 'recovery rollback staging write');
+          try {
+            await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: hash(content), expectedTargetHash: mode === 'resume' ? file.afterHash : file.beforeHash, expectedAfterHash: hash(content) });
+          } catch (error) {
+            await unlinkStableFile(root, temp).catch(() => {});
+            throw error;
+          }
         } catch (rollbackError) { rollbackErrors.push({ path: file.relativePath, error: rollbackError.message }); }
       }
       const failureCode = rollbackErrors.length ? 'ROLLBACK_PARTIAL' : 'RECOVERY_APPLY_FAILED';
