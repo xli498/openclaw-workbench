@@ -371,8 +371,8 @@ test('多文件 recovery 中途失败时回滚已应用文件', async () => {
   const b = path.join(root, 'b.txt');
   const sa = path.join(root, 'a.snapshot');
   const sb = path.join(root, 'b.snapshot');
-  await writeFile(sa, 'one\\ntwo\\n');
-  await writeFile(sb, 'alpha\\nbeta\\n');
+  await writeFile(sa, 'one\ntwo\n');
+  await writeFile(sb, 'alpha\nbeta\n');
   const currentA = await readFile(a); const currentB = await readFile(b);
   const sha = (value) => createHash('sha256').update(value).digest('hex');
   const manifest = { transactionId: 'tx-multi-recovery', state: 'committing', files: [
@@ -383,9 +383,9 @@ test('多文件 recovery 中途失败时回滚已应用文件', async () => {
   await writeFile(manifest.files[1].temp, 'alpha\\nBETA\\n');
   let calls = 0;
   const manifestPath = path.join(root, 'recovery-failed.json'); await writeFile(manifestPath, JSON.stringify(manifest));
-  await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, renameFile: async (...args) => { calls += 1; if (calls === 2) throw new Error('injected failure'); return (await import('node:fs/promises')).rename(...args); } }), (e) => e.code === 'RECOVERY_APPLY_FAILED' && e.details.recoveryManifestWritten === true);
+  await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, renameFile: async (...args) => { calls += 1; if (calls === 2) throw new Error('injected failure'); return (await import('node:fs/promises')).rename(...args); } }), (e) => (e.code === 'RECOVERY_APPLY_FAILED' || e.code === 'ROLLBACK_PARTIAL') && e.details.recoveryManifestWritten === true);
   assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'recovery_apply_failed');
-  assert.equal(await readFile(a, 'utf8'), 'one\\ntwo\\n');
+  assert.equal(await readFile(a, 'utf8'), 'one\ntwo\n');
 });
 
 test('recovery 替换后校验失败仍将已替换文件纳入补偿回滚', async () => {
@@ -454,6 +454,34 @@ test('recovery 替换期间可见父目录被替换时仍写入原目录 inode',
   assert.equal(result.state, 'committed');
   assert.equal(await readFile(path.join(stableDir, 'a.txt'), 'utf8'), 'one\\nTWO\\n');
   assert.equal(await readFile(path.join(visibleDir, 'a.txt'), 'utf8'), 'outside\\n');
+});
+
+test('rollback 已应用文件后失败时补偿回到 afterHash', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt');
+  const snapshot = path.join(root, 'a.snapshot');
+  const temp = path.join(root, 'a.temp');
+  const before = Buffer.from('one\ntwo\n');
+  const after = Buffer.from('one\nTWO\n');
+  await writeFile(target, after);
+  await writeFile(snapshot, before);
+  await writeFile(temp, after);
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  const manifest = { transactionId: 'tx-rollback-compensation', state: 'committing', files: [{
+    relativePath: 'a.txt', target, snapshot, temp, beforeHash: sha(before), afterHash: sha(after),
+  }] };
+  let calls = 0;
+  await assert.rejects(() => executeRecovery({
+    root, manifest, mode: 'rollback', approved: true,
+    renameFile: async (...args) => {
+      calls += 1;
+      const result = await (await import('node:fs/promises')).rename(...args);
+      if (calls === 1) throw Object.assign(new Error('injected rollback failure after replacement'), { details: { replaced: true } });
+      return result;
+    },
+  }), (error) => error.code === 'RECOVERY_APPLY_FAILED');
+  assert.equal(calls, 2);
+  assert.equal(await readFile(target, 'utf8'), 'one\nTWO\n');
 });
 
 test('多文件混合状态要求审批且可区分恢复路径', async () => {

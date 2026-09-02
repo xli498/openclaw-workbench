@@ -216,11 +216,12 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
           await writeStableFile(root, temp, content, 'recovery staging write');
           try {
             await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: hash(content), expectedTargetHash: file.afterHash, expectedAfterHash: hash(content) });
+            applied.push(file);
           } catch (error) {
+            if (error.details?.replaced) applied.push(file);
             await unlinkStableFile(root, temp).catch(() => {});
             throw error;
           }
-          applied.push(file);
         }
       }
     } catch (error) {
@@ -228,11 +229,16 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
       const appliedPaths = applied.map((file) => file.relativePath);
       for (const file of [...applied].reverse()) {
         try {
-          const content = await readSafeFile(root, file.snapshot, file.relativePath);
-          const temp = `${file.target}.ocw-recovery-rollback-${Date.now()}`;
+          // resume 的补偿回到 before；rollback 的补偿必须回到原来的 after，不能再次写入快照。
+          const compensationSource = mode === 'resume' ? file.snapshot : file.temp;
+          const expectedCompensationHash = mode === 'resume' ? file.beforeHash : file.afterHash;
+          if (!compensationSource) throw new RecoveryError('COMPENSATION_MATERIAL_MISSING', file.relativePath);
+          const content = await readSafeFile(root, compensationSource, file.relativePath);
+          if (hash(content) !== expectedCompensationHash) throw new RecoveryError('COMPENSATION_HASH_MISMATCH', file.relativePath);
+          const temp = `${file.target}.ocw-recovery-rollback-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           await writeStableFile(root, temp, content, 'recovery rollback staging write');
           try {
-            await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: hash(content), expectedTargetHash: mode === 'resume' ? file.afterHash : file.beforeHash, expectedAfterHash: hash(content) });
+            await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: expectedCompensationHash, expectedTargetHash: mode === 'resume' ? file.afterHash : file.beforeHash, expectedAfterHash: expectedCompensationHash });
           } catch (error) {
             await unlinkStableFile(root, temp).catch(() => {});
             throw error;
