@@ -388,6 +388,37 @@ test('多文件 recovery 中途失败时回滚已应用文件', async () => {
   assert.equal(await readFile(a, 'utf8'), 'one\\ntwo\\n');
 });
 
+test('recovery 替换后校验失败仍将已替换文件纳入补偿回滚', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt');
+  const temp = path.join(root, 'a.temp');
+  const snapshot = path.join(root, 'a.snapshot');
+  await writeFile(temp, 'one\nTWO\n');
+  await writeFile(snapshot, 'one\ntwo\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  const manifest = { transactionId: 'tx-recovery-post-verify', state: 'committing', files: [{
+    relativePath: 'a.txt', target, temp, snapshot,
+    beforeHash: sha(Buffer.from('one\ntwo\n')),
+    afterHash: sha(Buffer.from('one\nTWO\n')),
+  }] };
+  const originalRename = (await import('node:fs/promises')).rename;
+  let renameCalls = 0;
+  await assert.rejects(() => executeRecovery({
+    root, manifest, mode: 'resume', approved: true,
+    renameFile: async (...args) => {
+      renameCalls += 1;
+      if (renameCalls === 1) {
+        await originalRename(...args);
+        await writeFile(args[1], 'corrupted\\n');
+      } else {
+        await writeFile(args[1], 'one\\nTWO\\n');
+        await originalRename(...args);
+      }
+    },
+  }), (error) => error.code === 'ROLLBACK_PARTIAL' && renameCalls === 1);
+  assert.equal(await readFile(target, 'utf8'), 'corrupted\\n');
+});
+
 test('多文件混合状态要求审批且可区分恢复路径', async () => {
   const root = await fixture();
   const a = path.join(root, 'a.txt'); const b = path.join(root, 'b.txt');

@@ -203,8 +203,13 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
         if (mode === 'resume' && file.temp && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesAfter) {
           const content = await readSafeFile(root, file.temp, file.relativePath).catch((error) => { throw new RecoveryError('TEMP_UNAVAILABLE', file.relativePath, { error: error.message }); });
           if (hash(content) !== file.afterHash) throw new RecoveryError('TEMP_HASH_MISMATCH', file.relativePath);
-          await replaceWithinStableParent({ root, source: file.temp, target: file.target, renameFile, expectedSourceHash: file.afterHash, expectedTargetHash: file.beforeHash, expectedAfterHash: file.afterHash });
-          applied.push(file);
+          try {
+            await replaceWithinStableParent({ root, source: file.temp, target: file.target, renameFile, expectedSourceHash: file.afterHash, expectedTargetHash: file.beforeHash, expectedAfterHash: file.afterHash });
+            applied.push(file);
+          } catch (error) {
+            if (error.details?.replaced) applied.push(file);
+            throw error;
+          }
         } else if (mode === 'rollback' && file.snapshot && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesBefore) {
           const content = await readSafeFile(root, file.snapshot, file.relativePath).catch((error) => { throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath, { error: error.message }); });
           const temp = `${file.target}.ocw-recovery.tmp-${Date.now()}`;
