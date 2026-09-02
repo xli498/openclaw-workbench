@@ -276,8 +276,17 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
         throw new RecoveryError('FINALIZE_FAILED', error.message, { state: finalState, recoveryManifestWritten });
       }
     }
-    if (audit) await audit.append({ type: `transaction.${mode}`, actor: 'user-approved', transactionId: manifest.transactionId, files: manifest.files.map((file) => file.relativePath), state: finalState });
-    return Object.freeze({ transactionId: manifest.transactionId, mode, state: finalState });
+    let auditWritten = false;
+    if (audit) {
+      try {
+        await audit.append({ type: `transaction.${mode}`, actor: 'user-approved', transactionId: manifest.transactionId, files: manifest.files.map((file) => file.relativePath), state: finalState });
+        auditWritten = true;
+      } catch (error) {
+        // 文件与清单已完成时，审计不可用不能让调用方误以为恢复失败并触发重复操作。
+        return Object.freeze({ transactionId: manifest.transactionId, mode, state: finalState, auditWritten, auditError: error.message });
+      }
+    }
+    return Object.freeze({ transactionId: manifest.transactionId, mode, state: finalState, auditWritten });
   });
 }
 
