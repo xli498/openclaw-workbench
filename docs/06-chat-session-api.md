@@ -75,6 +75,8 @@ Content-Type: application/json
 
 `GET /v1/status` 还会提供不含消息、命令、Patch、会话 ID 或提案内容的 `persistedState` 汇总：会话的总数/活跃/关闭/人工复核/中断回合计数，提案的总数/人工复核/终态计数，以及事件是否来自恢复和最新 sequence。该摘要仅用于本地操作者识别重启后待处理状态；它不构成恢复、审批或执行入口。
 
+事务恢复状态可通过只读 `GET /v1/recovery` 查看。接口返回未完成事务的检查报告和 `requires_approval`、`mark_committed` 或 `blocked` 判定；损坏清单会被隔离，其他事务继续返回。该接口不会执行 `resume`、`rollback` 或审批。工作区浏览使用 `GET /v1/workspace/tree`，单文件只读预览使用 `GET /v1/workspace/read?path=<relativePath>`；越界、敏感路径和符号链接逃逸均被拒绝。
+
 会话、提案和事件快照仅接受位于已解析工作区根目录内的普通文件；快照文件或其 `.openclaw-workbench` 上级目录为符号链接时，恢复和写入都会以各自的 `*_STORE_INVALID` 错误拒绝。原子写入后的文件权限固定为 `0600`，目录以 `0700` 创建。该措施用于阻断配置错误或本地替换造成的路径逃逸；它不替代操作系统账户隔离，也不承诺对拥有同等本机文件系统权限的对手提供竞争条件防护。
 
 每个快照文件写入前还会以同目录 `<snapshot>.lock` 目录进行独占保护。检测到该锁时，写入立即以 `SESSION_STORE_BUSY`、`PROPOSAL_STORE_BUSY` 或 `EVENT_STORE_BUSY` 拒绝，不会等待、重试、抢占锁或以旧内存覆盖现有快照。锁只覆盖同步“写临时文件→rename→chmod”的临界区；进程崩溃留下的锁必须由本机操作者检查后处理，系统不会自行接管。
