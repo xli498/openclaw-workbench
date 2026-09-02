@@ -148,6 +148,30 @@ test('恢复清单拒绝工作区外路径', async () => {
   assert.throws(() => validateTransactionManifest({ root, manifest: { transactionId: 'x', state: 'committing', files: [{ relativePath: 'a.txt', target: '/tmp/escape', snapshot: path.join(root, 'snap') }] } }), (e) => e.code === 'MANIFEST_PATH_INVALID');
 });
 
+test('事务存储目录是符号链接时拒绝写入', async () => {
+  const root = await fixture();
+  const parsed = parseUnifiedPatch(`--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n`);
+  const workbench = path.join(root, '.openclaw-workbench');
+  const outside = await mkdtemp(path.join(tmpdir(), 'ocw-storage-outside-'));
+  await mkdir(workbench, { recursive: true });
+  await symlink(outside, path.join(workbench, 'transactions'));
+  await assert.rejects(() => applyPatchTransaction({ root, parsedPatch: parsed, declaredPaths: ['a.txt'] }), (e) => e.code === 'STORAGE_PATH_CHANGED');
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n');
+  assert.equal((await (await import('node:fs/promises')).readdir(outside)).length, 0);
+});
+
+test('快照存储目录是符号链接时拒绝写入', async () => {
+  const root = await fixture();
+  const parsed = parseUnifiedPatch(`--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n`);
+  const workbench = path.join(root, '.openclaw-workbench');
+  const outside = await mkdtemp(path.join(tmpdir(), 'ocw-snapshot-outside-'));
+  await mkdir(workbench, { recursive: true });
+  await symlink(outside, path.join(workbench, 'snapshots'));
+  await assert.rejects(() => applyPatchTransaction({ root, parsedPatch: parsed, declaredPaths: ['a.txt'] }), (e) => e.code === 'STORAGE_PATH_CHANGED');
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n');
+  assert.equal((await (await import('node:fs/promises')).readdir(outside)).length, 0);
+});
+
 test('恢复清单拒绝 relativePath 与实际 target 不一致', async () => {
   const root = await fixture();
   assert.throws(() => validateTransactionManifest({ root, manifest: { transactionId: 'x', state: 'committing', files: [{ relativePath: 'a.txt', target: path.join(root, 'b.txt') }] } }), (e) => e.code === 'MANIFEST_PATH_INVALID');
