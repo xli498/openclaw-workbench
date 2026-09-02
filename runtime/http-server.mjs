@@ -194,9 +194,13 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
             transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: 'blocked', reason: manifest.invalid.code, invalid: manifest.invalid });
             continue;
           }
-          const report = await inspectPendingTransaction({ root, manifest });
-          const decision = decideRecovery(report);
-          transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: decision.decision, reason: decision.reason ?? null, states: decision.states, report });
+          try {
+            const report = await inspectPendingTransaction({ root, manifest });
+            const decision = decideRecovery(report);
+            transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: decision.decision, reason: decision.reason ?? null, states: decision.states, report });
+          } catch (error) {
+            transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: 'blocked', reason: error.code ?? 'RECOVERY_INSPECTION_FAILED', invalid: { code: error.code ?? 'RECOVERY_INSPECTION_FAILED', message: String(error.message ?? 'recovery inspection failed').slice(0, 512) } });
+          }
         }
         return json(response, 200, { transactions });
       }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -72,11 +72,14 @@ test('控制面 recovery 接口只读暴露恢复判定，并隔离无效清单'
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-'));
   const transactionDir = path.join(root, '.openclaw-workbench', 'transactions');
   const snapshotDir = path.join(root, '.openclaw-workbench', 'snapshots');
+  const externalRoot = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-external-'));
+  const externalSnapshot = path.join(externalRoot, 'snapshot');
   await mkdir(transactionDir, { recursive: true });
   await mkdir(snapshotDir, { recursive: true });
   const target = path.join(root, 'README.md');
   const before = Buffer.from('before\n');
   const after = Buffer.from('after\n');
+  await writeFile(externalSnapshot, before);
   await writeFile(target, before);
   const digest = (value) => createHash('sha256').update(value).digest('hex');
   await writeFile(path.join(snapshotDir, 'tx-resume-README.md'), before);
@@ -85,18 +88,27 @@ test('控制面 recovery 接口只读暴露恢复判定，并隔离无效清单'
     transactionId: 'tx-resume', state: 'committing', files: [{ relativePath: 'README.md', target, temp: path.join(root, '.openclaw-workbench', 'temp-after'), snapshot: path.join(snapshotDir, 'tx-resume-README.md'), beforeHash: digest(before), afterHash: digest(after) }]
   }));
   await writeFile(path.join(transactionDir, 'broken.json'), '{not-json');
+  const escapedSnapshot = path.join(snapshotDir, 'escaped-snapshot');
+  await symlink(externalSnapshot, escapedSnapshot);
+  await writeFile(path.join(transactionDir, 'inspection-failure.json'), JSON.stringify({
+    transactionId: 'inspection-failure', state: 'committing', files: [{ relativePath: 'README.md', target, temp: path.join(root, '.openclaw-workbench', 'temp-after'), snapshot: escapedSnapshot, beforeHash: digest(before), afterHash: digest(after) }]
+  }));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {
     const recovery = await request(address, '/v1/recovery');
     assert.equal(recovery.status, 200);
-    assert.equal(recovery.body.transactions.length, 2);
+    assert.equal(recovery.body.transactions.length, 3);
     const resume = recovery.body.transactions.find((item) => item.transactionId === 'tx-resume');
     assert.equal(resume.decision, 'requires_approval');
     assert.deepEqual(resume.report.files[0].relativePath, 'README.md');
     const invalid = recovery.body.transactions.find((item) => item.transactionId === 'broken.json');
     assert.equal(invalid.decision, 'blocked');
-  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+    const inspectionFailure = recovery.body.transactions.find((item) => item.transactionId === 'inspection-failure');
+    assert.equal(inspectionFailure.decision, 'blocked');
+    assert.equal(inspectionFailure.reason, 'RECOVERY_PATH_ESCAPE');
+    assert.equal(inspectionFailure.report, undefined);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); await rm(externalRoot, { recursive: true, force: true }); }
 });
 
 test('控制面提供 Patch Diff 只读预览并拒绝非 Patch 提案', async () => {
