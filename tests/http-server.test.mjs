@@ -46,6 +46,10 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /aria-current="true"/);
     assert.match(controlHtml, /\.tree-item\.selected/);
     assert.match(controlHtml, /workspacePreviewLabel/);
+    assert.match(controlHtml, /id="recoveryStatus"/);
+    assert.match(controlHtml, /function renderRecovery\(transactions=\[\]\)/);
+    assert.match(controlHtml, /async function loadRecovery\(\)/);
+    assert.match(controlHtml, /loadRecovery\(\)/);
     assert.match(controlHtml, /aria-labelledby="workspacePreviewLabel"/);
     assert.match(controlHtml, /只读预览：['"]\+path\+['"]/);
     assert.match(controlHtml, /function treeHasFile\(nodes,path\)/);
