@@ -18,6 +18,9 @@ async function fixture() {
   return root;
 }
 
+const transactionManifestPath = (root, transactionId) => path.join(root, '.openclaw-workbench', 'transactions', `${transactionId}.json`);
+const testManifestWriter = async () => {};
+
 test('stale write lock 仅在进程已退出且超过阈值时接管', async () => {
   const root = await fixture();
   const lockDir = path.join(root, '.openclaw-workbench'); await mkdir(lockDir, { recursive: true });
@@ -245,7 +248,7 @@ test('启动扫描隔离单项失败并继续处理其他事务', async () => {
   const snapshot = path.join(root, 'a.snapshot'); await writeFile(snapshot, content);
   const valid = { transactionId: 'tx-valid', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, beforeHash: digest, afterHash: digest }] };
   const invalid = { transactionId: 'tx-invalid', state: 'committing', files: [{ relativePath: 'a.txt', target: path.join(root, '..', 'escape'), snapshot }] };
-  await writeFile(path.join(dir, 'a-valid.json'), JSON.stringify(valid)); await writeFile(path.join(dir, 'b-invalid.json'), JSON.stringify(invalid));
+  await writeFile(transactionManifestPath(root, valid.transactionId), JSON.stringify(valid)); await writeFile(path.join(dir, 'b-invalid.json'), JSON.stringify(invalid));
   const failures = []; const result = await scanStartupRecovery({ root, onError: (failure) => failures.push(failure) });
   assert.equal(result.length, 2); assert.equal(result.find((item) => item.transactionId === 'tx-valid').finalized, true); assert.equal(result.find((item) => item.transactionId === 'tx-invalid').decision, 'error'); assert.equal(failures.length, 1);
 });
@@ -275,10 +278,10 @@ test('启动扫描仅自动收敛已完成事务，不自动恢复冲突事务',
   const target = path.join(root, 'a.txt'); const content = await readFile(target); const digest = createHash('sha256').update(content).digest('hex');
   const snapshot = path.join(root, 'a.snapshot'); await writeFile(snapshot, content);
   const manifest = { transactionId: 'tx-startup', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, beforeHash: digest, afterHash: digest }] };
-  await writeFile(path.join(dir, 'startup.json'), JSON.stringify(manifest));
+  await writeFile(transactionManifestPath(root, manifest.transactionId), JSON.stringify(manifest));
   const result = await scanStartupRecovery({ root });
   assert.equal(result[0].finalized, true); assert.equal(result[0].decision, 'mark_committed');
-  assert.equal(JSON.parse(await readFile(path.join(dir, 'startup.json'), 'utf8')).state, 'committed');
+  assert.equal(JSON.parse(await readFile(transactionManifestPath(root, manifest.transactionId), 'utf8')).state, 'committed');
 });
 
 test('启动恢复可再次收敛 finalize_failed 且文件已全部达到 afterHash 的事务', async () => {
@@ -287,9 +290,9 @@ test('启动恢复可再次收敛 finalize_failed 且文件已全部达到 after
   const digest = (value) => createHash('sha256').update(value).digest('hex');
   const manifest = { transactionId: 'tx-finalize-retry', state: 'finalize_failed', files: [{ relativePath: 'a.txt', target, snapshot, beforeHash: digest(Buffer.from('old\\n')), afterHash: digest(Buffer.from('one\\n')) }] };
   const dir = path.join(root, '.openclaw-workbench', 'transactions'); await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'tx.json'), JSON.stringify(manifest));
+  await writeFile(transactionManifestPath(root, manifest.transactionId), JSON.stringify(manifest));
   const results = await scanStartupRecovery({ root });
-  assert.equal(results[0].finalized, true); assert.equal(results[0].decision, 'mark_committed'); assert.equal(JSON.parse(await readFile(path.join(dir, 'tx.json'), 'utf8')).state, 'committed');
+  assert.equal(results[0].finalized, true); assert.equal(results[0].decision, 'mark_committed'); assert.equal(JSON.parse(await readFile(transactionManifestPath(root, manifest.transactionId), 'utf8')).state, 'committed');
 });
 
 test('finalize_failed 文件未完全达到 afterHash 时不会跳过决策强行标记 committed', async () => {
@@ -305,7 +308,7 @@ test('finalize_failed 文件未完全达到 afterHash 时不会跳过决策强�
 });
 
 test('已全部写入 afterHash 时可原子标记 committed', async () => {
-  const root = await fixture(); const manifestPath = path.join(root, '.openclaw-workbench', 'transactions', 'done.json');
+  const root = await fixture(); const manifestPath = transactionManifestPath(root, 'tx-already-done');
   await mkdir(path.dirname(manifestPath), { recursive: true });
   const target = path.join(root, 'a.txt'); const content = await readFile(target); const digest = createHash('sha256').update(content).digest('hex');
   const snapshot = path.join(root, 'a.snapshot'); await writeFile(snapshot, content);
@@ -340,7 +343,7 @@ test('已审批 rollback 使用快照恢复并记录审计', async () => {
   const sha = (value) => createHash('sha256').update(value).digest('hex');
   const manifest = { transactionId: 'tx-rollback', state: 'committing', files: [{ relativePath: 'a.txt', target: path.join(root, 'a.txt'), snapshot, beforeHash: sha(before), afterHash: sha(current) }] };
   const events = [];
-  const result = await executeRecovery({ root, manifest, mode: 'rollback', approved: true, audit: { append: async (event) => events.push(event) } });
+  const result = await executeRecovery({ root, manifest, mode: 'rollback', approved: true, updateManifest: testManifestWriter, audit: { append: async (event) => events.push(event) } });
   assert.equal(result.state, 'rolled_back');
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\\ntwo\\n');
   assert.equal(events[0].type, 'transaction.rollback');
@@ -358,7 +361,7 @@ test('rollback 拒绝 hash 不匹配的快照且不改写目标', async () => {
   const manifest = { transactionId: 'tx-rollback-snapshot-hash', state: 'committing', files: [{
     relativePath: 'a.txt', target, snapshot, beforeHash: sha(before), afterHash: sha(after),
   }] };
-  await assert.rejects(() => executeRecovery({ root, manifest, mode: 'rollback', approved: true }), (error) => error.code === 'RECOVERY_APPLY_FAILED');
+  await assert.rejects(() => executeRecovery({ root, manifest, mode: 'rollback', approved: true, updateManifest: testManifestWriter }), (error) => error.code === 'RECOVERY_APPLY_FAILED');
   assert.equal(await readFile(target, 'utf8'), 'one\nTWO\n');
   assert.deepEqual((await readdir(root)).filter((name) => name.includes('.ocw-recovery-')), []);
 });
@@ -375,7 +378,7 @@ test('rollback staging 替换失败时清理稳定目录中的临时文件', asy
     afterHash: sha(Buffer.from('one\ntwo\n')),
   }] };
   await assert.rejects(() => executeRecovery({
-    root, manifest, mode: 'rollback', approved: true,
+    root, manifest, mode: 'rollback', approved: true, updateManifest: testManifestWriter,
     renameFile: async () => { throw new Error('injected rollback failure'); },
   }), (error) => error.code === 'RECOVERY_APPLY_FAILED');
   assert.equal(await readFile(target, 'utf8'), 'one\ntwo\n');
@@ -399,7 +402,7 @@ test('多文件 recovery 中途失败时回滚已应用文件', async () => {
   await writeFile(manifest.files[0].temp, 'one\\nTWO\\n');
   await writeFile(manifest.files[1].temp, 'alpha\\nBETA\\n');
   let calls = 0;
-  const manifestPath = path.join(root, 'recovery-failed.json'); await writeFile(manifestPath, JSON.stringify(manifest));
+  const manifestPath = transactionManifestPath(root, manifest.transactionId); await mkdir(path.dirname(manifestPath), { recursive: true }); await writeFile(manifestPath, JSON.stringify(manifest));
   await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, renameFile: async (...args) => { calls += 1; if (calls === 2) throw new Error('injected failure'); return (await import('node:fs/promises')).rename(...args); } }), (e) => (e.code === 'RECOVERY_APPLY_FAILED' || e.code === 'ROLLBACK_PARTIAL') && e.details.recoveryManifestWritten === true);
   assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'recovery_apply_failed');
   assert.equal(await readFile(a, 'utf8'), 'one\ntwo\n');
@@ -421,7 +424,7 @@ test('recovery 替换后校验失败仍将已替换文件纳入补偿回滚', as
   const originalRename = (await import('node:fs/promises')).rename;
   let renameCalls = 0;
   await assert.rejects(() => executeRecovery({
-    root, manifest, mode: 'resume', approved: true,
+    root, manifest, mode: 'resume', approved: true, updateManifest: testManifestWriter,
     renameFile: async (...args) => {
       renameCalls += 1;
       if (renameCalls === 1) {
@@ -458,7 +461,7 @@ test('recovery 替换期间可见父目录被替换时仍写入原目录 inode',
   const fsRename = (await import('node:fs/promises')).rename;
   let swapped = false;
   const result = await executeRecovery({
-    root, manifest, mode: 'resume', approved: true,
+    root, manifest, mode: 'resume', approved: true, updateManifest: testManifestWriter,
     renameFile: async (...args) => {
       if (!swapped) {
         swapped = true;
@@ -489,7 +492,7 @@ test('rollback 已应用文件后失败时补偿回到 afterHash', async () => {
   }] };
   let calls = 0;
   await assert.rejects(() => executeRecovery({
-    root, manifest, mode: 'rollback', approved: true,
+    root, manifest, mode: 'rollback', approved: true, updateManifest: testManifestWriter,
     renameFile: async (...args) => {
       calls += 1;
       const result = await (await import('node:fs/promises')).rename(...args);
@@ -575,7 +578,7 @@ test('恢复应用失败且回滚再次失败时保留 ROLLBACK_PARTIAL 现场',
     { relativePath: 'a.txt', target: a, temp: ta, snapshot: sa, beforeHash: sha(Buffer.from('one\ntwo\n')), afterHash: sha(Buffer.from('one\nTWO\n')) },
     { relativePath: 'b.txt', target: b, temp: tb, snapshot: sb, beforeHash: sha(Buffer.from('alpha\nbeta\n')), afterHash: sha(Buffer.from('alpha\nBETA\n')) },
   ] };
-  const manifestPath = path.join(root, 'rollback-partial.json'); await writeFile(manifestPath, JSON.stringify(manifest));
+  const manifestPath = transactionManifestPath(root, manifest.transactionId); await mkdir(path.dirname(manifestPath), { recursive: true }); await writeFile(manifestPath, JSON.stringify(manifest));
   let calls = 0;
   await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, renameFile: async (...args) => {
     calls += 1;
@@ -609,11 +612,12 @@ test('有 manifestPath 时恢复成功自动持久化终态', async () => {
   const target = path.join(root, 'a.txt');
   const snapshot = path.join(root, 'a.snapshot');
   const temp = path.join(root, 'a.temp');
-  const manifestPath = path.join(root, 'tx.json');
+  const manifestPath = transactionManifestPath(root, 'tx-auto-finalize');
   const before = Buffer.from('one\ntwo\n');
   const after = Buffer.from('one\nTWO\n');
   const sha = (value) => createHash('sha256').update(value).digest('hex');
   await writeFile(target, before); await writeFile(snapshot, before); await writeFile(temp, after);
+  await mkdir(path.dirname(manifestPath), { recursive: true });
   const manifest = { transactionId: 'tx-auto-finalize', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, temp, beforeHash: sha(before), afterHash: sha(after) }] };
   await writeFile(manifestPath, JSON.stringify(manifest));
   const result = await executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true });
@@ -622,16 +626,41 @@ test('有 manifestPath 时恢复成功自动持久化终态', async () => {
   assert.deepEqual(await scanPendingTransactions({ root }), []);
 });
 
+test('恢复拒绝非事务目录的 manifestPath，且不覆盖工作区文件', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt'); const snapshot = path.join(root, 'a.snapshot'); const temp = path.join(root, 'a.temp');
+  const before = Buffer.from('one\ntwo\n'); const after = Buffer.from('one\nTWO\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  await writeFile(snapshot, before); await writeFile(temp, after);
+  const manifest = { transactionId: 'tx-path-bound', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, temp, beforeHash: sha(before), afterHash: sha(after) }] };
+  const protectedFile = path.join(root, 'README.md'); await writeFile(protectedFile, 'keep me\n');
+  await assert.rejects(() => executeRecovery({ root, manifest, manifestPath: protectedFile, mode: 'resume', approved: true }), (error) => error.code === 'MANIFEST_PATH_INVALID');
+  assert.equal(await readFile(protectedFile, 'utf8'), 'keep me\n');
+  assert.equal(await readFile(target, 'utf8'), 'one\ntwo\n');
+});
+
+test('恢复没有持久化写入器时在改写前拒绝执行', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt'); const snapshot = path.join(root, 'a.snapshot'); const temp = path.join(root, 'a.temp');
+  const before = Buffer.from('one\ntwo\n'); const after = Buffer.from('one\nTWO\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  await writeFile(snapshot, before); await writeFile(temp, after);
+  const manifest = { transactionId: 'tx-persistence-required', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, temp, beforeHash: sha(before), afterHash: sha(after) }] };
+  await assert.rejects(() => executeRecovery({ root, manifest, mode: 'resume', approved: true }), (error) => error.code === 'MANIFEST_PERSISTENCE_REQUIRED');
+  assert.equal(await readFile(target, 'utf8'), 'one\ntwo\n');
+});
+
 test('恢复完成后审计失败不伪装为恢复失败', async () => {
   const root = await fixture();
   const target = path.join(root, 'a.txt');
   const snapshot = path.join(root, 'a.snapshot');
   const temp = path.join(root, 'a.temp');
-  const manifestPath = path.join(root, 'tx-audit-fail.json');
+  const manifestPath = transactionManifestPath(root, 'tx-audit-fail');
   const before = Buffer.from('one\ntwo\n');
   const after = Buffer.from('one\nTWO\n');
   const sha = (value) => createHash('sha256').update(value).digest('hex');
   await writeFile(target, before); await writeFile(snapshot, before); await writeFile(temp, after);
+  await mkdir(path.dirname(manifestPath), { recursive: true });
   const manifest = { transactionId: 'tx-audit-fail', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, temp, beforeHash: sha(before), afterHash: sha(after) }] };
   await writeFile(manifestPath, JSON.stringify(manifest));
   const result = await executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, audit: { append: async () => { throw new Error('audit unavailable'); } } });
@@ -648,7 +677,7 @@ test('恢复最终状态清单更新失败时返回 FINALIZE_FAILED', async () =
   await writeFile(temp, 'one\\nTWO\\n'); await writeFile(snapshot, 'one\\ntwo\\n');
   const sha = (value) => createHash('sha256').update(value).digest('hex');
   const manifest = { transactionId: 'tx-finalize-fail', state: 'committing', files: [{ relativePath: 'a.txt', target, temp, snapshot, beforeHash: sha(await readFile(target)), afterHash: sha(await readFile(temp)) }] };
-  const manifestPath = path.join(root, 'transaction.json'); await writeFile(manifestPath, JSON.stringify(manifest));
+  const manifestPath = transactionManifestPath(root, 'tx-finalize-fail'); await mkdir(path.dirname(manifestPath), { recursive: true }); await writeFile(manifestPath, JSON.stringify(manifest));
   await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, updateManifest: async () => { throw new Error('manifest unavailable'); } }), (e) => e.code === 'FINALIZE_FAILED' && e.details.recoveryManifestWritten === true);
   assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'finalize_failed');
   assert.equal(await readFile(target, 'utf8'), 'one\\nTWO\\n');

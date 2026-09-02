@@ -22,6 +22,16 @@ function safeRelativePath(value) {
 
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
 
+function canonicalManifestPath(root, transactionId) {
+  return path.resolve(root, '.openclaw-workbench', 'transactions', `${transactionId}.json`);
+}
+
+function assertBoundManifestPath(root, manifest, manifestPath) {
+  if (!manifestPath || path.resolve(manifestPath) !== canonicalManifestPath(root, manifest.transactionId)) {
+    throw new RecoveryError('MANIFEST_PATH_INVALID', 'manifestPath');
+  }
+}
+
 async function assertSafeExistingPath(root, candidate, label) {
   const resolved = path.resolve(candidate);
   if (!inside(root, resolved)) throw new RecoveryError('MANIFEST_PATH_INVALID', label);
@@ -170,7 +180,7 @@ export function decideRecovery(report) {
 
 export async function finalizeAlreadyCommitted({ root, manifest, manifestPath, audit } = {}) {
   validateTransactionManifest({ root, manifest });
-  if (!manifestPath || !inside(root, manifestPath)) throw new RecoveryError('MANIFEST_PATH_INVALID', 'manifestPath');
+  assertBoundManifestPath(root, manifest, manifestPath);
   return withRecoveryLock(root, async () => {
     const report = await inspectPendingTransaction({ root, manifest });
     const decision = decideRecovery(report);
@@ -186,6 +196,7 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
   validateTransactionManifest({ root, manifest });
   if (!approved) throw new RecoveryError('APPROVAL_REQUIRED', 'recovery requires explicit approval');
   if (mode !== 'rollback' && mode !== 'resume') throw new RecoveryError('MODE_INVALID', mode ?? 'missing mode');
+  if (manifestPath) assertBoundManifestPath(root, manifest, manifestPath);
   return withRecoveryLock(root, async () => {
     const report = await inspectPendingTransaction({ root, manifest });
     const decision = decideRecovery(report);
@@ -194,6 +205,7 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
       throw new RecoveryError('RESUME_NOT_APPLICABLE', decision.decision);
     }
     if (mode === 'rollback' && !report.files.every((file) => file.currentMatchesBefore || file.currentMatchesAfter)) throw new RecoveryError('ROLLBACK_CONFLICT', 'current files are not in a known transaction state');
+    if (!manifestPath && !updateManifest) throw new RecoveryError('MANIFEST_PERSISTENCE_REQUIRED', 'recovery requires a durable manifest writer');
     const applied = [];
     try {
       for (const file of manifest.files) {
@@ -216,11 +228,14 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
           if (hash(content) !== file.beforeHash) throw new RecoveryError('SNAPSHOT_HASH_MISMATCH', file.relativePath);
           const temp = `${file.target}.ocw-recovery.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           await writeStableFile(root, temp, content, 'recovery staging write');
+          // 先保留已验证的 after 内容；原 target 被替换后不能再依赖 file.temp 仍存在。
+          const compensation = await readSafeFile(root, file.target, file.relativePath);
+          if (hash(compensation) !== file.afterHash) throw new RecoveryError('COMPENSATION_HASH_MISMATCH', file.relativePath);
           try {
             await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: file.beforeHash, expectedTargetHash: file.afterHash, expectedAfterHash: file.beforeHash });
-            applied.push(file);
+            applied.push({ file, compensation });
           } catch (error) {
-            if (error.details?.replaced) applied.push(file);
+            if (error.details?.replaced) applied.push({ file, compensation });
             await unlinkStableFile(root, temp).catch(() => {});
             throw error;
           }
@@ -228,14 +243,14 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
       }
     } catch (error) {
       const rollbackErrors = [];
-      const appliedPaths = applied.map((file) => file.relativePath);
-      for (const file of [...applied].reverse()) {
+      const appliedPaths = applied.map((item) => item.relativePath ?? item.file.relativePath);
+      for (const appliedItem of [...applied].reverse()) {
+        const file = appliedItem.file ?? appliedItem;
         try {
-          // resume 的补偿回到 before；rollback 的补偿必须回到原来的 after，不能再次写入快照。
-          const compensationSource = mode === 'resume' ? file.snapshot : file.temp;
+          // resume 的补偿回到 before；rollback 使用替换前保留的 after 内容，不依赖被 rename 消耗的 temp。
           const expectedCompensationHash = mode === 'resume' ? file.beforeHash : file.afterHash;
-          if (!compensationSource) throw new RecoveryError('COMPENSATION_MATERIAL_MISSING', file.relativePath);
-          const content = await readSafeFile(root, compensationSource, file.relativePath);
+          const content = mode === 'resume' ? await readSafeFile(root, file.snapshot, file.relativePath) : appliedItem.compensation;
+          if (!content) throw new RecoveryError('COMPENSATION_MATERIAL_MISSING', file.relativePath);
           if (hash(content) !== expectedCompensationHash) throw new RecoveryError('COMPENSATION_HASH_MISMATCH', file.relativePath);
           const temp = `${file.target}.ocw-recovery-rollback-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           await writeStableFile(root, temp, content, 'recovery rollback staging write');
