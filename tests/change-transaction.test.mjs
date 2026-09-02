@@ -419,6 +419,43 @@ test('recovery 替换后校验失败仍将已替换文件纳入补偿回滚', as
   assert.equal(await readFile(target, 'utf8'), 'corrupted\\n');
 });
 
+test('recovery 替换期间可见父目录被替换时仍写入原目录 inode', async () => {
+  const root = await fixture();
+  const outside = await mkdtemp(path.join(tmpdir(), 'ocw-recovery-outside-'));
+  const visibleDir = path.join(root, 'nested');
+  const stableDir = path.join(root, 'nested-original');
+  const target = path.join(visibleDir, 'a.txt');
+  const temp = path.join(visibleDir, 'a.temp');
+  const snapshot = path.join(visibleDir, 'a.snapshot');
+  await mkdir(visibleDir);
+  await writeFile(target, 'one\\ntwo\\n');
+  await writeFile(temp, 'one\\nTWO\\n');
+  await writeFile(snapshot, 'one\\ntwo\\n');
+  await writeFile(path.join(outside, 'a.txt'), 'outside\\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  const manifest = { transactionId: 'tx-recovery-parent-drift', state: 'committing', files: [{
+    relativePath: 'nested/a.txt', target, temp, snapshot,
+    beforeHash: sha(Buffer.from('one\\ntwo\\n')),
+    afterHash: sha(Buffer.from('one\\nTWO\\n')),
+  }] };
+  const fsRename = (await import('node:fs/promises')).rename;
+  let swapped = false;
+  const result = await executeRecovery({
+    root, manifest, mode: 'resume', approved: true,
+    renameFile: async (...args) => {
+      if (!swapped) {
+        swapped = true;
+        await fsRename(visibleDir, stableDir);
+        await symlink(outside, visibleDir);
+      }
+      return fsRename(...args);
+    },
+  });
+  assert.equal(result.state, 'committed');
+  assert.equal(await readFile(path.join(stableDir, 'a.txt'), 'utf8'), 'one\\nTWO\\n');
+  assert.equal(await readFile(path.join(visibleDir, 'a.txt'), 'utf8'), 'outside\\n');
+});
+
 test('多文件混合状态要求审批且可区分恢复路径', async () => {
   const root = await fixture();
   const a = path.join(root, 'a.txt'); const b = path.join(root, 'b.txt');
