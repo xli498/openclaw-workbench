@@ -62,6 +62,17 @@ async function assertWorkspaceDirectory(root, directory, label) {
   return real;
 }
 
+async function writeStableFile(root, filePath, content, label) {
+  let stable;
+  try {
+    stable = await openStableParent(root, filePath);
+    await writeFile(stable.stablePath, content, { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    if (error instanceof TransactionError) throw error;
+    throw new TransactionError('STORAGE_WRITE_FAILED', `${label}: ${error.message}`);
+  } finally { await stable?.directory.close().catch(() => {}); }
+}
+
 async function restoreFileAtomically(root, target, content) {
   const temp = `${target}.ocw-rollback-${randomUUID()}.tmp`;
   try {
@@ -220,8 +231,8 @@ export async function applyPatchTransaction({ root, parsedPatch, declaredPaths, 
     const manifestFiles = () => staged.map((x, index) => ({ relativePath: x.relativePath, target: x.target, temp: x.temp, snapshot: snapshots[index]?.snapshot, afterHash: x.afterHash, beforeHash: snapshots[index]?.beforeHash }));
     await writeManifest(base, manifestPath, { transactionId, state: 'prepared', files: manifestFiles() });
     if (audit) await audit.append({ type: 'transaction.prepared', actor: 'system', transactionId, files: manifestFiles().map((file) => file.relativePath) });
-    for (const item of snapshots) await writeFile(item.snapshot, item.before, { flag: 'wx' });
-    for (const item of staged) await writeFile(item.temp, item.next, { flag: 'wx' });
+    for (const item of snapshots) await writeStableFile(base, item.snapshot, item.before, 'snapshot write');
+    for (const item of staged) await writeStableFile(base, item.temp, item.next, 'staging write');
     const revisionBeforeCommit = getCurrentRevision ? await getCurrentRevision() : currentRevision;
     if (expectedRevision !== undefined && revisionBeforeCommit !== expectedRevision) throw new TransactionError('REVISION_MISMATCH', 'workspace changed during preflight');
     await writeManifest(base, manifestPath, { transactionId, state: 'committing', files: manifestFiles() });
