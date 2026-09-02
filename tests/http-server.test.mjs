@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
 import { controlPanelHtml } from '../runtime/control-panel.mjs';
 import { createEventBus } from '../runtime/event-bus.mjs';
+import { createHash } from 'node:crypto';
 
 async function request(address, pathname, options = {}) {
   const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token-012345', ...(options.headers ?? {}) } });
@@ -46,10 +47,10 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /\.tree-item\.selected/);
     assert.match(controlHtml, /workspacePreviewLabel/);
     assert.match(controlHtml, /aria-labelledby="workspacePreviewLabel"/);
-    assert.match(controlHtml, /只读预览：'+path+'/);
+    assert.match(controlHtml, /只读预览：['"]\+path\+['"]/);
     assert.match(controlHtml, /function treeHasFile\(nodes,path\)/);
     assert.match(controlHtml, /已选文件不再存在/);
-    assert.match(controlHtml, /treeHasFile\(state\.workspaceTree,state\.selectedWorkspaceFile\)/);
+    assert.match(controlHtml, /treeHasFile\(state\.workspaceTree,selected\)/);
     assert.match(controlHtml, /if\(selected&&state\.selectedWorkspaceFile===selected\)await loadWorkspaceFile\(selected\)/);
     assert.match(controlHtml, /e\.status===404&&state\.selectedWorkspaceFile===path/);
     assert.match(controlHtml, /role="tree" aria-label="只读工作区文件树" aria-busy="false"/);
@@ -60,6 +61,37 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /tree\.setAttribute\('aria-busy','true'\)/);
     assert.match(controlHtml, /button\.disabled=true/);
     assert.match(controlHtml, /finally\{tree\.setAttribute\('aria-busy','false'\);button\.disabled=false\}/);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面 recovery 接口只读暴露恢复判定，并隔离无效清单', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-'));
+  const transactionDir = path.join(root, '.openclaw-workbench', 'transactions');
+  const snapshotDir = path.join(root, '.openclaw-workbench', 'snapshots');
+  await mkdir(transactionDir, { recursive: true });
+  await mkdir(snapshotDir, { recursive: true });
+  const target = path.join(root, 'README.md');
+  const before = Buffer.from('before\n');
+  const after = Buffer.from('after\n');
+  await writeFile(target, before);
+  const digest = (value) => createHash('sha256').update(value).digest('hex');
+  await writeFile(path.join(snapshotDir, 'tx-resume-README.md'), before);
+  await writeFile(path.join(root, '.openclaw-workbench', 'temp-after'), after);
+  await writeFile(path.join(transactionDir, 'tx-resume.json'), JSON.stringify({
+    transactionId: 'tx-resume', state: 'committing', files: [{ relativePath: 'README.md', target, temp: path.join(root, '.openclaw-workbench', 'temp-after'), snapshot: path.join(snapshotDir, 'tx-resume-README.md'), beforeHash: digest(before), afterHash: digest(after) }]
+  }));
+  await writeFile(path.join(transactionDir, 'broken.json'), '{not-json');
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const recovery = await request(address, '/v1/recovery');
+    assert.equal(recovery.status, 200);
+    assert.equal(recovery.body.transactions.length, 2);
+    const resume = recovery.body.transactions.find((item) => item.transactionId === 'tx-resume');
+    assert.equal(resume.decision, 'requires_approval');
+    assert.deepEqual(resume.report.files[0].relativePath, 'README.md');
+    const invalid = recovery.body.transactions.find((item) => item.transactionId === 'broken.json');
+    assert.equal(invalid.decision, 'blocked');
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

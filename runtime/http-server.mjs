@@ -12,6 +12,7 @@ import { controlPanelHtml } from './control-panel.mjs';
 import { transition } from './action.mjs';
 import { AdapterError, createOpenClawAgentRunner } from './openclaw-adapter.mjs';
 import { PlanError } from './plan.mjs';
+import { RecoveryError, decideRecovery, inspectPendingTransaction, scanPendingTransactions } from './recovery.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -105,6 +106,7 @@ function errorResponse(error) {
   if (error instanceof EventBusError) return { status: 400, body: safe(error.code, 'event request failed') };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, 'proposal request failed') };
   if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
+  if (error instanceof RecoveryError) return { status: ['SCAN_FAILED', 'MANIFEST_INVALID'].includes(error.code) ? 500 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -184,11 +186,34 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) }));
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
+      if (request.method === 'GET' && url.pathname === '/v1/recovery') {
+        const manifests = await scanPendingTransactions({ root, tolerateInvalid: true });
+        const transactions = [];
+        for (const manifest of manifests) {
+          if (manifest.invalid) {
+            transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: 'blocked', reason: manifest.invalid.code, invalid: manifest.invalid });
+            continue;
+          }
+          const report = await inspectPendingTransaction({ root, manifest });
+          const decision = decideRecovery(report);
+          transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: decision.decision, reason: decision.reason ?? null, states: decision.states, report });
+        }
+        return json(response, 200, { transactions });
+      }
       if (request.method === 'GET' && url.pathname === '/v1/commands') {
         const sessionId = url.searchParams.get('sessionId');
         const actionHash = url.searchParams.get('actionHash');
         const records = await scanCommandLedger({ root });
-        return json(response, 200, { commands: records
+        const storedCommands = proposalStore.list().filter((record) => record.proposal.action.type === 'command').map((record) => ({
+          actionId: record.proposal.action.id,
+          actionHash: record.proposal.action.actionHash,
+          sessionId: record.proposal.action.sessionId,
+          status: record.proposal.action.status,
+          command: record.proposal.command,
+          ...(record.recovery ? { error: { code: 'PROPOSAL_MANUAL_REVIEW', message: record.recovery.reason } } : {})
+        }));
+        const mergedCommands = [...records, ...storedCommands.filter((stored) => !records.some((record) => record.actionHash === stored.actionHash))];
+        return json(response, 200, { commands: mergedCommands
           .filter((record) => (sessionId === null || record.sessionId === sessionId) && (actionHash === null || record.actionHash === actionHash))
           .sort((left, right) => String(right.updatedAt ?? right.claimedAt ?? '').localeCompare(String(left.updatedAt ?? left.claimedAt ?? '')))
           .map(({ ledgerPath, ...record }) => record) });
