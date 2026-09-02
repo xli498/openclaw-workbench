@@ -23,7 +23,7 @@ export async function scanStartupRecovery({ root, audit, onError, onScanError } 
       const report = await inspectPendingTransaction({ root, manifest });
       const decision = decideRecovery(report);
       let finalized = false;
-      if ((decision.decision === 'mark_committed' || manifest.state === 'finalize_failed') && manifest.manifestPath) {
+      if (decision.decision === 'mark_committed' && manifest.manifestPath) {
         await finalizeAlreadyCommitted({ root, manifest, manifestPath: path.resolve(manifest.manifestPath), audit });
         finalized = true;
       }

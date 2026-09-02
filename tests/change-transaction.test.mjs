@@ -265,7 +265,19 @@ test('启动恢复可再次收敛 finalize_failed 且文件已全部达到 after
   const dir = path.join(root, '.openclaw-workbench', 'transactions'); await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, 'tx.json'), JSON.stringify(manifest));
   const results = await scanStartupRecovery({ root });
-  assert.equal(results[0].finalized, true); assert.equal(JSON.parse(await readFile(path.join(dir, 'tx.json'), 'utf8')).state, 'committed');
+  assert.equal(results[0].finalized, true); assert.equal(results[0].decision, 'mark_committed'); assert.equal(JSON.parse(await readFile(path.join(dir, 'tx.json'), 'utf8')).state, 'committed');
+});
+
+test('finalize_failed 文件未完全达到 afterHash 时不会跳过决策强行标记 committed', async () => {
+  const root = await fixture(); const target = path.join(root, 'a.txt'); const snapshot = path.join(root, 'a.snapshot');
+  await writeFile(target, 'changed\n'); await writeFile(snapshot, 'old\n');
+  const digest = (value) => createHash('sha256').update(value).digest('hex');
+  const manifest = { transactionId: 'tx-finalize-conflict', state: 'finalize_failed', files: [{ relativePath: 'a.txt', target, snapshot, beforeHash: digest(Buffer.from('old\n')), afterHash: digest(Buffer.from('one\n')) }] };
+  const dir = path.join(root, '.openclaw-workbench', 'transactions'); await mkdir(dir, { recursive: true });
+  const manifestPath = path.join(dir, 'tx.json'); await writeFile(manifestPath, JSON.stringify(manifest));
+  const results = await scanStartupRecovery({ root });
+  assert.equal(results[0].finalized, false); assert.equal(results[0].decision, 'blocked'); assert.equal(results[0].report.files[0].currentMatchesAfter, false);
+  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'finalize_failed');
 });
 
 test('已全部写入 afterHash 时可原子标记 committed', async () => {
