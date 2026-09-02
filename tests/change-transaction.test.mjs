@@ -604,6 +604,24 @@ test('resume 完成后可更新事务清单并记录最终状态', async () => {
   assert.equal(await readFile(target, 'utf8'), 'one\\nTWO\\n');
 });
 
+test('有 manifestPath 时恢复成功自动持久化终态', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt');
+  const snapshot = path.join(root, 'a.snapshot');
+  const temp = path.join(root, 'a.temp');
+  const manifestPath = path.join(root, 'tx.json');
+  const before = Buffer.from('one\ntwo\n');
+  const after = Buffer.from('one\nTWO\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  await writeFile(target, before); await writeFile(snapshot, before); await writeFile(temp, after);
+  const manifest = { transactionId: 'tx-auto-finalize', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, temp, beforeHash: sha(before), afterHash: sha(after) }] };
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const result = await executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true });
+  assert.equal(result.state, 'committed');
+  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'committed');
+  assert.deepEqual(await scanPendingTransactions({ root }), []);
+});
+
 test('恢复最终状态清单更新失败时返回 FINALIZE_FAILED', async () => {
   const root = await fixture();
   const temp = path.join(root, 'a.temp'); const target = path.join(root, 'a.txt'); const snapshot = path.join(root, 'a.snapshot');

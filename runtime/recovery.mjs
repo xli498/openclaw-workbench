@@ -260,8 +260,10 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
       throw new RecoveryError(failureCode, error.message, { state: failureState, applied: appliedPaths, rollbackErrors, recoveryManifestWritten });
     }
     const finalState = mode === 'rollback' ? 'rolled_back' : 'committed';
-    if (updateManifest) {
-      try { await updateManifest({ ...manifest, state: finalState }); }
+    // 具备清单路径时，成功恢复必须同步落盘终态；否则下次扫描会把已完成事务再次当作 pending。
+    const finalize = updateManifest ?? (manifestPath ? async (next) => atomicWriteManifest(root, manifestPath, next) : null);
+    if (finalize) {
+      try { await finalize({ ...manifest, state: finalState }); }
       catch (error) {
         let recoveryManifestWritten = false;
         if (manifestPath && inside(root, manifestPath)) {
