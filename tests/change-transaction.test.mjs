@@ -1,7 +1,7 @@
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parseUnifiedPatch } from '../runtime/patch-engine.mjs';
@@ -344,6 +344,25 @@ test('已审批 rollback 使用快照恢复并记录审计', async () => {
   assert.equal(result.state, 'rolled_back');
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\\ntwo\\n');
   assert.equal(events[0].type, 'transaction.rollback');
+});
+
+test('rollback staging 替换失败时清理稳定目录中的临时文件', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt');
+  const snapshot = path.join(root, 'a.snapshot');
+  await writeFile(snapshot, 'zero\none\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  const manifest = { transactionId: 'tx-rollback-cleanup', state: 'committing', files: [{
+    relativePath: 'a.txt', target, snapshot,
+    beforeHash: sha(Buffer.from('zero\none\n')),
+    afterHash: sha(Buffer.from('one\ntwo\n')),
+  }] };
+  await assert.rejects(() => executeRecovery({
+    root, manifest, mode: 'rollback', approved: true,
+    renameFile: async () => { throw new Error('injected rollback failure'); },
+  }), (error) => error.code === 'RECOVERY_APPLY_FAILED');
+  assert.equal(await readFile(target, 'utf8'), 'one\ntwo\n');
+  assert.deepEqual((await readdir(root)).filter((name) => name.includes('.ocw-recovery-')), []);
 });
 
 test('多文件 recovery 中途失败时回滚已应用文件', async () => {
