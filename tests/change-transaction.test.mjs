@@ -346,6 +346,23 @@ test('已审批 rollback 使用快照恢复并记录审计', async () => {
   assert.equal(events[0].type, 'transaction.rollback');
 });
 
+test('rollback 拒绝 hash 不匹配的快照且不改写目标', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt');
+  const snapshot = path.join(root, 'a.snapshot');
+  const before = Buffer.from('one\ntwo\n');
+  const after = Buffer.from('one\nTWO\n');
+  await writeFile(target, after);
+  await writeFile(snapshot, 'tampered\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  const manifest = { transactionId: 'tx-rollback-snapshot-hash', state: 'committing', files: [{
+    relativePath: 'a.txt', target, snapshot, beforeHash: sha(before), afterHash: sha(after),
+  }] };
+  await assert.rejects(() => executeRecovery({ root, manifest, mode: 'rollback', approved: true }), (error) => error.code === 'RECOVERY_APPLY_FAILED');
+  assert.equal(await readFile(target, 'utf8'), 'one\nTWO\n');
+  assert.deepEqual((await readdir(root)).filter((name) => name.includes('.ocw-recovery-')), []);
+});
+
 test('rollback staging 替换失败时清理稳定目录中的临时文件', async () => {
   const root = await fixture();
   const target = path.join(root, 'a.txt');

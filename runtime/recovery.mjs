@@ -212,10 +212,12 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
           }
         } else if (mode === 'rollback' && file.snapshot && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesBefore) {
           const content = await readSafeFile(root, file.snapshot, file.relativePath).catch((error) => { throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath, { error: error.message }); });
-          const temp = `${file.target}.ocw-recovery.tmp-${Date.now()}`;
+          if (!content) throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath);
+          if (hash(content) !== file.beforeHash) throw new RecoveryError('SNAPSHOT_HASH_MISMATCH', file.relativePath);
+          const temp = `${file.target}.ocw-recovery.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           await writeStableFile(root, temp, content, 'recovery staging write');
           try {
-            await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: hash(content), expectedTargetHash: file.afterHash, expectedAfterHash: hash(content) });
+            await replaceWithinStableParent({ root, source: temp, target: file.target, renameFile, expectedSourceHash: file.beforeHash, expectedTargetHash: file.afterHash, expectedAfterHash: file.beforeHash });
             applied.push(file);
           } catch (error) {
             if (error.details?.replaced) applied.push(file);
