@@ -73,13 +73,21 @@ async function writeStableFile(root, filePath, content, label) {
   } finally { await stable?.directory.close().catch(() => {}); }
 }
 
+async function unlinkStableFile(root, filePath) {
+  let stable;
+  try {
+    stable = await openStableParent(root, filePath);
+    await unlink(stable.stablePath).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+  } finally { await stable?.directory.close().catch(() => {}); }
+}
+
 async function restoreFileAtomically(root, target, content) {
   const temp = `${target}.ocw-rollback-${randomUUID()}.tmp`;
   try {
-    await writeFile(temp, content, { flag: 'wx' });
+    await writeStableFile(root, temp, content, 'rollback staging write');
     await replaceWithinStableParent({ root, source: temp, target, expectedSourceHash: digest(content), expectedAfterHash: digest(content) });
   } catch (error) {
-    await unlink(temp).catch(() => {});
+    await unlinkStableFile(root, temp).catch(() => {});
     throw error;
   }
 }
@@ -263,7 +271,7 @@ export async function applyPatchTransaction({ root, parsedPatch, declaredPaths, 
     if (audit) await audit.append({ type: 'transaction.committed', actor: 'system', transactionId, files: manifestFiles().map((file) => file.relativePath) });
     return Object.freeze({ transactionId, manifestPath, files: Object.freeze(staged.map((x) => ({ relativePath: x.relativePath, afterHash: x.afterHash }))), snapshots: Object.freeze(snapshots.map((x) => ({ relativePath: x.relativePath, snapshot: x.snapshot }))) });
   } finally {
-    for (const item of staged) if (item.temp) await unlink(item.temp).catch(() => {});
+    for (const item of staged) if (item.temp) await unlinkStableFile(base, item.temp).catch(() => {});
     await releaseLock?.();
     active = false;
   }
