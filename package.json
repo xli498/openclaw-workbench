@@ -11,7 +11,7 @@
     ".": "./runtime/index.mjs",
     "./runtime/*": "./runtime/*.mjs"
   },
-  "files": ["bin", "runtime", "README.md", "docs", "LICENSE"],
+  "files": ["bin", "runtime", "README.md", "docs/00-product-charter.md", "docs/01-integration-boundary.md", "docs/02-threat-model.md", "docs/03-architecture.md", "docs/06-chat-session-api.md", "LICENSE"],
   "type": "module",
   "bin": { "openclaw-workbench": "./bin/workbench.mjs" },
   "engines": { "node": ">=22.19.0" },

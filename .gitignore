@@ -1,0 +1,12 @@
+node_modules/
+*.tgz
+*.log
+.env
+.env.*
+!.env.example
+.openclaw-workbench/
+outputs/
+.DS_Store
+.idea/
+.vscode/
+

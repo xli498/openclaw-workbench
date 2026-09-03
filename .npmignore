@@ -1,0 +1,9 @@
+tests/
+outputs/
+.github/
+.openclaw-workbench/
+docs/04-review-log.md
+docs/05-next-implementation.md
+*.log
+*.tgz
+
