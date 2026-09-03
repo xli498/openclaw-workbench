@@ -144,7 +144,7 @@ function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, eventBus = createEventBus({ root }) } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, eventBus = createEventBus({ root }), __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   if (typeof token !== 'string' || token.length < 16) throw new Error('token must be at least 16 characters');
   if (!['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error('host must be loopback');
@@ -291,6 +291,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         const input = await bodyOf(request);
         const claim = proposalStore.claim(proposal.action.id, input.actionHash);
         try {
+          await __testHooks?.onProposalClaimed?.(claim);
           const result = proposal.command
             ? await approveAndRunCommand({ proposal: claim.proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision })
             : await approveAndApplyPatch({ proposal: claim.proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision });

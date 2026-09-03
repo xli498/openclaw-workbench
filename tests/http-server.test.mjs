@@ -479,7 +479,16 @@ test('控制面提供会话和提案列表，且默认只暴露公开字段', as
 
 test('待审批提案可拒绝或取消，执行中提案不能被取消', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-reject-'));
-  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  let markClaimed;
+  let releaseClaim;
+  const claimed = new Promise((resolve) => { markClaimed = resolve; });
+  const release = new Promise((resolve) => { releaseClaim = resolve; });
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    __testHooks: { onProposalClaimed: async () => { markClaimed(); await release; } }
+  });
   const address = await app.listen();
   try {
     const denied = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'reject', argv: ['pwd'] }) });
@@ -494,10 +503,12 @@ test('待审批提案可拒绝或取消，执行中提案不能被取消', async
     const approveUrl = `/v1/proposals/${executing.body.proposal.action.id}/approve`;
     const approveOptions = { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: executing.body.proposal.action.actionHash }) };
     const pending = request(address, approveUrl, approveOptions);
+    await claimed;
     const cancelBusy = await request(address, `/v1/proposals/${executing.body.proposal.action.id}/cancel`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' } });
     assert.equal(cancelBusy.status, 409);
+    releaseClaim();
     await pending;
-  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { releaseClaim(); await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test('Plan 复核结果可查询并持久化到重启后的会话快照', async () => {
