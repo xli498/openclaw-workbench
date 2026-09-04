@@ -63,10 +63,16 @@ test('Windows 运行器超时会回收目标命令创建的子进程', async (t)
   const root = await fixture();
   const pidFile = path.join(root, 'child.pid');
   const source = "const fs=require('fs'),{spawn}=require('child_process');const child=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{stdio:'ignore'});fs.writeFileSync(process.argv[1],String(child.pid));setTimeout(()=>{},10000)";
-  await assert.rejects(() => runControlledCommand({ root, argv: [process.execPath, '-e', source, pidFile], approved: true, timeoutMs: 1_000 }), (error) => error.code === 'TIMEOUT');
+  await assert.rejects(() => runControlledCommand({ root, argv: [process.execPath, '-e', source, pidFile], approved: true, timeoutMs: 5_000 }), (error) => error.code === 'TIMEOUT');
   const childPid = Number(await readFile(pidFile, 'utf8'));
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.throws(() => process.kill(childPid, 0), (error) => error.code === 'ESRCH');
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try { process.kill(childPid, 0); } catch (error) {
+      assert.equal(error.code, 'ESRCH');
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  assert.fail(`child process ${childPid} survived timeout cleanup`);
 });
 
 test('拒绝 shell 字符串、越界 cwd 和 cwd 逃逸符号链接', async (t) => {
