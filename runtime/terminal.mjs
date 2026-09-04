@@ -179,7 +179,7 @@ export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = D
     // The Windows runner compiles its small in-process anchor once before it can
     // begin the target timeout. Keep a bounded startup allowance so this outer
     // guard does not kill the runner and strand its child during compilation.
-    const timer = setTimeout(() => { timedOut = true; kill(); finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`)); }, WINDOWS ? timeoutMs + 5_000 : timeoutMs);
+    const timer = setTimeout(() => { timedOut = true; kill(); finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`)); }, WINDOWS ? timeoutMs + 15_000 : timeoutMs);
     const collect = (target, chunk) => {
       outputBytes += chunk.byteLength;
       if (outputBytes > maxOutputBytes) { outputLimited = true; kill(); return target; }

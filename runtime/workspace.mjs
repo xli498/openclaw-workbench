@@ -120,7 +120,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         const { stdout } = await execFileAsync('git', ['-C', rootReal, 'rev-parse', 'HEAD'], { timeout: 5_000, maxBuffer: 64 * 1024 });
         return stdout.trim() || null;
       } catch (error) {
-        if (error.code === 128 || /not a git repository/i.test(error.stderr ?? '')) return null;
+        if (error.code === 128 || /not a git repository/i.test(`${error.stderr ?? ''}\n${error.message ?? ''}`)) return null;
         throw new WorkspaceError('GIT_UNAVAILABLE', `cannot read git revision: ${error.message}`);
       }
     },
@@ -197,7 +197,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         return `sha256:${digest.digest('hex')}`;
       } catch (error) {
         if (error instanceof WorkspaceError) throw error;
-        if (error.code === 128 || /not a git repository/i.test(error.stderr ?? '')) {
+        if (error.code === 128 || /not a git repository/i.test(`${error.stderr ?? ''}\n${error.message ?? ''}`)) {
           const digest = createHash('sha256').update('non-git\0');
           const visitedDirectories = new Set();
           const scan = async (directory, prefix = '') => {

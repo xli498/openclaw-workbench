@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rename, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rename, symlink, writeFile } from 'node:fs/promises';
 import { renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { openStableCwd, runControlledCommand } from '../runtime/terminal.mjs';
 
-async function fixture() { return mkdtemp(path.join(tmpdir(), 'ocw-terminal-')); }
+async function fixture() { return realpath(await mkdtemp(path.join(tmpdir(), 'ocw-terminal-'))); }
 
 test('终端执行需要明确审批，并使用工作区 cwd', async () => {
   const root = await fixture();
