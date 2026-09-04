@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createChatSessionManager, SessionError } from '../runtime/session.mjs';
 import { writeSnapshotAtomically } from '../runtime/snapshot-store.mjs';
+import { symlinkOrSkip } from './test-support.mjs';
 
 test('会话消息可原子持久化并在新 manager 中恢复', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-session-store-'));
@@ -86,19 +87,20 @@ test('拒绝重复会话 ID 和非法消息快照', async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('拒绝指向工作区外的会话快照符号链接', async () => {
+test('拒绝指向工作区外的会话快照符号链接', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-session-symlink-'));
   const outside = await mkdtemp(join(tmpdir(), 'ocw-session-outside-'));
   try {
     await mkdir(join(root, '.openclaw-workbench'));
     const target = join(outside, 'sessions.json');
     await writeFile(target, JSON.stringify({ version: 1, sessions: [] }));
-    await symlink(target, join(root, '.openclaw-workbench', 'sessions.json'));
+    if (!await symlinkOrSkip(t, target, join(root, '.openclaw-workbench', 'sessions.json'))) return;
     assert.throws(() => createChatSessionManager({ root }), { code: 'SESSION_STORE_INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });
 
-test('会话快照在首次写入和原子覆盖后保持 owner-only 权限', async () => {
+test('会话快照在首次写入和原子覆盖后保持 owner-only 权限', async (t) => {
+  if (process.platform === 'win32') return t.skip('Windows does not expose POSIX owner-only mode bits');
   const root = await mkdtemp(join(tmpdir(), 'ocw-session-mode-'));
   try {
     const manager = createChatSessionManager({ root });
@@ -131,7 +133,8 @@ test('两个会话 manager 基于不同快照版本写入时拒绝后写者覆�
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('打开父目录后路径被替换为外部符号链接时，快照仍写入原目录 inode', async () => {
+test('打开父目录后路径被替换为外部符号链接时，快照仍写入原目录 inode', async (t) => {
+  if (process.platform === 'win32') return t.skip('Windows native helper rejects a replaced visible parent path; inode anchoring is covered on POSIX');
   const root = await mkdtemp(join(tmpdir(), 'ocw-session-anchor-'));
   const outside = await mkdtemp(join(tmpdir(), 'ocw-session-anchor-outside-'));
   try {

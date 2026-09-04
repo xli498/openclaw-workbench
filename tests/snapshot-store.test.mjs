@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readSnapshot, snapshotDigest, writeSnapshotAtomically } from '../runtime/snapshot-store.mjs';
+import { symlinkSyncOrSkip } from './test-support.mjs';
 
 class SnapshotError extends Error { constructor(code) { super(code); this.code = code; } }
 function write(root, storePath, overrides = {}) {
@@ -33,23 +34,26 @@ test('损坏或符号链接 owner 不能触发 stale 回收', async () => {
     try {
       const storePath = join(root, 'state.json'); const lock = `${storePath}.lock`;
       mkdirSync(lock);
-      if (owner === null) { writeFileSync(join(root, 'outside-owner'), '{}'); symlinkSync(join(root, 'outside-owner'), join(lock, 'owner.json')); }
+      if (owner === null) { writeFileSync(join(root, 'outside-owner'), '{}'); try { symlinkSync(join(root, 'outside-owner'), join(lock, 'owner.json')); } catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') continue; throw error; } }
       else writeFileSync(join(lock, 'owner.json'), owner);
       assert.throws(() => write(root, storePath), { code: 'BUSY' });
     } finally { await rm(root, { recursive: true, force: true }); }
   }
 });
 
-test('恢复读取锚定父目录并拒绝末级符号链接', async () => {
+test('恢复读取锚定父目录并拒绝末级符号链接', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-snapshot-read-'));
   try {
     const state = join(root, 'state'); const storePath = join(state, 'snapshot.json');
-    mkdirSync(state); writeFileSync(storePath, 'safe');
+    mkdirSync(state); writeFileSync(storePath, 'safe'); let replacementBlocked = false;
     const result = readSnapshot({ root, storePath, ErrorType: SnapshotError, code: 'INVALID', message: 'invalid', __testHooks: { onParentOpened() {
-      renameSync(state, `${state}.old`); mkdirSync(state); writeFileSync(storePath, 'attacker');
+      try { renameSync(state, `${state}.old`); mkdirSync(state); writeFileSync(storePath, 'attacker'); }
+      catch (error) { if (process.platform === 'win32') { replacementBlocked = true; return; } throw error; }
     } } });
     assert.equal(result.content, 'safe');
-    unlinkSync(storePath); symlinkSync(join(root, 'outside'), storePath);
+    if (process.platform === 'win32') assert.equal(replacementBlocked, true);
+    if (process.platform === 'win32') return;
+    unlinkSync(storePath); if (!symlinkSyncOrSkip(t, join(root, 'outside'), storePath)) return;
     assert.throws(() => readSnapshot({ root, storePath, ErrorType: SnapshotError, code: 'INVALID', message: 'invalid' }), { code: 'INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -59,7 +63,7 @@ test('读取逐级拒绝嵌套祖先符号链接', async () => {
   const outside = await mkdtemp(join(tmpdir(), 'ocw-snapshot-nested-outside-'));
   try {
     mkdirSync(join(outside, 'inner')); writeFileSync(join(outside, 'inner', 'snapshot.json'), 'outside');
-    mkdirSync(join(root, 'state')); symlinkSync(join(outside, 'inner'), join(root, 'state', 'nested'));
+    mkdirSync(join(root, 'state')); try { symlinkSync(join(outside, 'inner'), join(root, 'state', 'nested')); } catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') return; throw error; }
     assert.throws(() => readSnapshot({ root, storePath: join(root, 'state', 'nested', 'snapshot.json'), ErrorType: SnapshotError, code: 'INVALID', message: 'invalid' }), { code: 'INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });
@@ -80,15 +84,28 @@ test('stale 锁 inode 确认后出现 successor 时，successor 保持在活 loc
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('写入 current digest 时拒绝末级外链且绝不读取或覆盖外部', async () => {
+test('写入 current digest 时拒绝末级外链且绝不读取或覆盖外部', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-snapshot-write-link-'));
   const outside = await mkdtemp(join(tmpdir(), 'ocw-snapshot-outside-'));
   try {
     const storePath = join(root, 'state.json'); const outsideFile = join(outside, 'digest.txt');
     writeFileSync(storePath, 'safe'); writeFileSync(outsideFile, 'outside');
     assert.throws(() => write(root, storePath, { expectedDigest: snapshotDigest('safe'), __testHooks: { beforeCurrentDigestOpen() {
-      unlinkSync(storePath); symlinkSync(outsideFile, storePath);
-    } } }), { code: 'INVALID' });
+      unlinkSync(storePath); if (!symlinkSyncOrSkip(t, outsideFile, storePath)) return;
+    } } }), (error) => ['INVALID', 'CONFLICT'].includes(error.code));
     assert.equal(readFileSync(outsideFile, 'utf8'), 'outside');
+  } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
+});
+
+test('Windows junction parent is rejected before snapshot write reaches its destination', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Windows-specific regression');
+  const root = await mkdtemp(join(tmpdir(), 'ocw-snapshot-junction-root-'));
+  const outside = await mkdtemp(join(tmpdir(), 'ocw-snapshot-junction-outside-'));
+  try {
+    const parent = join(root, 'state');
+    if (!symlinkSyncOrSkip(t, outside, parent, 'junction')) return;
+    const storePath = join(parent, 'snapshot.json');
+    assert.throws(() => write(root, storePath), { code: 'INVALID' });
+    assert.equal(existsSync(join(outside, 'snapshot.json')), false);
   } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });

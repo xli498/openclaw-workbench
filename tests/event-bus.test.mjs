@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEventBus, EventBusError } from '../runtime/event-bus.mjs';
+import { symlinkOrSkip } from './test-support.mjs';
 
 test('事件总线按序发布并支持游标读取与上限淘汰', () => {
   const bus = createEventBus({ limit: 2, clock: () => new Date('2026-01-01T00:00:00.000Z') });
@@ -96,14 +97,14 @@ test('拒绝重复事件 ID 和缺少事件 ID 的快照', async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('拒绝指向工作区外的事件快照符号链接', async () => {
+test('拒绝指向工作区外的事件快照符号链接', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-events-symlink-'));
   const outside = await mkdtemp(join(tmpdir(), 'ocw-events-outside-'));
   try {
     await mkdir(join(root, '.openclaw-workbench'));
     const target = join(outside, 'events.json');
     await writeFile(target, JSON.stringify({ version: 1, sequence: 0, events: [] }));
-    await symlink(target, join(root, '.openclaw-workbench', 'events.json'));
+    if (!await symlinkOrSkip(t, target, join(root, '.openclaw-workbench', 'events.json'))) return;
     assert.throws(() => createEventBus({ root }), { code: 'EVENT_STORE_INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });

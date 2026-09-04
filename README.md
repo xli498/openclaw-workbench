@@ -36,7 +36,9 @@ node bin/workbench.mjs \
   --openclaw-command-env OPENCLAW_WORKBENCH_COMMAND
 ```
 
-服务从环境变量读取至少 16 个字符的 `OPENCLAW_WORKBENCH_TOKEN` 与 `OPENCLAW_WORKBENCH_APPROVAL_TOKEN`；令牌禁止通过命令行传入或提交到仓库。`OPENCLAW_WORKBENCH_COMMAND` 可选，默认 `openclaw`；Windows 可设置为 `openclaw.cmd` 或 OpenClaw 可执行文件的完整路径。服务默认监听 `127.0.0.1`；`--host` 仅允许 `127.0.0.1`、`::1` 或 `localhost`，`--port` 默认为 `0`（由操作系统分配空闲端口）。服务在启动恢复扫描完成后才开始监听；收到 `SIGINT`/`SIGTERM` 时会关闭 HTTP 服务、结束 SSE 连接，并取消进行中的 Agent 回合。
+`OPENCLAW_WORKBENCH_COMMAND` 可选，默认值为 `openclaw`。Windows 可将它设为 `openclaw.cmd` 或 OpenClaw 可执行文件的完整路径；Workbench 会把同一个命令用于只读诊断和本地 Agent 调用。命令通过环境变量读取，不会出现在令牌参数中，也不会修改 OpenClaw 配置。
+
+服务从环境变量读取至少 16 个字符的 `OPENCLAW_WORKBENCH_TOKEN` 与 `OPENCLAW_WORKBENCH_APPROVAL_TOKEN`，禁止把令牌放进命令行参数或提交到仓库。服务默认监听 `127.0.0.1`；`--host` 仅允许 `127.0.0.1`、`::1` 或 `localhost`，`--port` 默认为 `0`（由操作系统分配空闲端口）。服务在启动恢复扫描完成后才开始监听；收到 `SIGINT`/`SIGTERM` 时会关闭 HTTP 服务、结束 SSE 连接，并取消进行中的 Agent 回合。
 
 也可从 Node API 启动：
 
@@ -76,7 +78,7 @@ Plan 会话支持 `POST /v1/sessions/:id/plan` 的多模型只读复核；传入
 
 事件可通过只读 `GET /v1/events` 轮询，或通过 Bearer 鉴权的 `GET /v1/events/stream?after=<sequence>` 使用 SSE 接收历史事件和后续事件（含 keep-alive）；事件流不是审批或执行入口。当前未实现 Gateway WebSocket Adapter 或 WebSocket 控制面。
 
-Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前仍不包含桌面 UI、MCP 管理、OpenClaw channel/Gateway 生命周期接入和公网 Bridge。
+Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前已有本地 Web 控制台，但仍不包含桌面壳、MCP 管理、OpenClaw channel/Gateway 生命周期接入和公网 Bridge。
 
 ## 能力状态
 
@@ -88,7 +90,8 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 命令终态持久化与启动扫描 | 已实现；未完成动作只进入人工复核 |
 | 审计哈希链与并发追加锁 | 已实现 |
 | OpenClaw channel/Gateway 生命周期接入 | 未实现 |
-| UI、MCP 管理、公网 Bridge | 未实现 |
+| 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
+| MCP 管理、公网 Bridge | 未实现 |
 | 生产部署承诺 | 不承诺 |
 
 ## 安全边界
@@ -101,6 +104,20 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 - 这套库不能替代宿主机权限隔离、容器隔离、密钥管理或 OpenClaw 正式审批系统。
 
 `GET /v1/status` 提供不含会话内容、提案内容或 ID 的 `persistedState` 汇总，用于识别重启后的人工复核数量和恢复事件；该接口只读，不会恢复或执行任何中断操作。
+
+`GET /v1/audit?limit=<n>` 只读返回最近的脱敏审计事件，最多 500 条；控制台可查看并导出这份脱敏 JSON。未显式注入 audit 时，服务会惰性写入工作区 `.openclaw-workbench/audit.jsonl`；命令预览、完整错误文本、环境变量、凭据和绝对路径不会通过该接口返回。
+
+## OpenClaw 兼容性诊断
+
+`GET /v1/openclaw/diagnostics` 是已鉴权的只读探针。它只以 `shell: false` 运行配置的 OpenClaw CLI 的固定 `--version` 参数，并使用 5 秒和 16 KiB 输出上限。
+
+- `ready`：CLI 返回了可解析的版本号。
+- `unavailable` / `CLI_NOT_FOUND`：Workbench 无法运行配置的 CLI 命令。
+- `unavailable` / `CLI_UNAVAILABLE`：CLI 未能完成受限的只读探针。
+
+该探针不认证到 OpenClaw、不读取或修改 OpenClaw 配置、不启动 Gateway、不调用模型、不修改工作区，也不返回 stderr、环境变量或凭据。
+
+`GET /v1/openclaw/mcp` 是同样已鉴权的只读 MCP 探针。它固定运行 `openclaw mcp status --json`，只返回 Server 数量、脱敏后的名称和状态，不返回原始配置、命令参数、环境变量或错误文本。`ready` 表示 CLI 成功返回可解析的 Server 状态；CLI 不存在、超时或返回非 JSON 时分别映射为 `CLI_NOT_FOUND`、`CLI_UNAVAILABLE` 或 `INVALID_RESPONSE`。该接口不会启动 MCP Server、调用工具或修改 MCP 注册表。
 
 本地快照仅允许工作区内的普通文件，发现快照或快照目录为符号链接即拒绝恢复/写入；快照写入后固定为 `0600`，创建目录为 `0700`。这不是宿主机隔离的替代品。
 

@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { approveAndRunCommand, createCommandProposal, WorkflowError } from '../runtime/workflow.mjs';
+import { symlinkOrSkip } from './test-support.mjs';
 
 async function fixture() { return mkdtemp(path.join(tmpdir(), 'ocw-command-workflow-')); }
 
@@ -53,7 +54,7 @@ test('命令 action 跨进程持久化防重放且启动不自动执行', async 
   await assert.rejects(() => approveAndRunCommand({ proposal: freshProposal, root, approved: true, currentRevision: 'r1' }), (error) => error.code === 'COMMAND_REPLAYED');
 });
 
-test('伪造或符号链接命令账本记录不能阻断审批执行', async () => {
+test('伪造或符号链接命令账本记录不能阻断审批执行', async (t) => {
   const root = await fixture();
   const proposal = await createCommandProposal({ root, argv: ['pwd'], sessionId: 'ledger-bound', currentRevision: 'r1' });
   const directory = path.join(root, '.openclaw-workbench', 'commands');
@@ -64,6 +65,6 @@ test('伪造或符号链接命令账本记录不能阻断审批执行', async ()
   await (await import('node:fs/promises')).unlink(file);
   const outside = path.join(root, 'outside-ledger.json');
   await writeFile(outside, '{}');
-  await symlink(outside, file);
+  if (!await symlinkOrSkip(t, outside, file)) return;
   await assert.rejects(() => approveAndRunCommand({ proposal, root, approved: true, currentRevision: 'r1' }), (error) => error.code === 'COMMAND_LEDGER_FAILED');
 });

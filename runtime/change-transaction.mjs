@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import process from 'node:process';
 import path from 'node:path';
 import { validatePatchTargets } from './patch-engine.mjs';
+import { openWindowsPathLock, runWindowsFileOperation } from './windows-path-lock.mjs';
 
 export class TransactionError extends Error {
   constructor(code, message, details = {}) { super(message); this.name = 'TransactionError'; this.code = code; this.details = details; }
@@ -44,14 +46,12 @@ function applyHunks(original, hunks) {
 }
 
 async function writeManifest(root, filePath, manifest) {
-  let stable;
   const tempName = `${path.basename(filePath)}.tmp-${randomUUID()}`;
-  try {
-    stable = await openStableParent(root, filePath);
-    await writeFile(path.join(stable.stableParent, tempName), JSON.stringify(manifest), { flag: 'wx', mode: 0o600 });
-    try { await rename(path.join(stable.stableParent, tempName), stable.stablePath); }
-    catch (error) { await unlink(path.join(stable.stableParent, tempName)).catch(() => {}); throw error; }
-  } finally { await stable?.directory.close().catch(() => {}); }
+  const tempPath = path.join(path.dirname(filePath), tempName);
+  const content = JSON.stringify(manifest);
+  await writeStableFile(root, tempPath, content, 'manifest staging write');
+  try { await replaceWithinStableParent({ root, source: tempPath, target: filePath, expectedSourceHash: digest(content), expectedAfterHash: digest(content) }); }
+  catch (error) { await unlinkStableFile(root, tempPath).catch(() => {}); throw error; }
 }
 
 async function assertWorkspaceDirectory(root, directory, label) {
@@ -65,6 +65,14 @@ async function assertWorkspaceDirectory(root, directory, label) {
 export async function writeStableFile(root, filePath, content, label) {
   let stable;
   try {
+    if (process.platform === 'win32') {
+      const candidatePath = path.resolve(filePath);
+      const parentPath = path.dirname(candidatePath);
+      const rootReal = await realpath(root);
+      const parentReal = await realpath(parentPath);
+      await runWindowsFileOperation({ operation: 'write', root: rootReal, parent: parentPath, target: candidatePath, expectedParent: parentReal, contentBase64: Buffer.from(content).toString('base64'), replaceIfExists: false, expectTargetMissing: true });
+      return;
+    }
     stable = await openStableParent(root, filePath);
     await writeFile(stable.stablePath, content, { flag: 'wx', mode: 0o600 });
   } catch (error) {
@@ -76,6 +84,14 @@ export async function writeStableFile(root, filePath, content, label) {
 export async function unlinkStableFile(root, filePath) {
   let stable;
   try {
+    if (process.platform === 'win32') {
+      const candidatePath = path.resolve(filePath);
+      const parentPath = path.dirname(candidatePath);
+      const rootReal = await realpath(root);
+      const parentReal = await realpath(parentPath);
+      await runWindowsFileOperation({ operation: 'delete', root: rootReal, parent: parentPath, target: candidatePath, expectedParent: parentReal });
+      return;
+    }
     stable = await openStableParent(root, filePath);
     await unlink(stable.stablePath).catch((error) => { if (error.code !== 'ENOENT') throw error; });
   } finally { await stable?.directory.close().catch(() => {}); }
@@ -112,6 +128,15 @@ export async function openStableParent(root, candidate) {
   if (parentPath !== base && !parentPath.startsWith(`${base}${path.sep}`)) throw new TransactionError('PATH_ESCAPE', candidatePath);
   const parentReal = await realpath(parentPath).catch((error) => { throw new TransactionError('TARGET_PARENT_UNAVAILABLE', error.message); });
   if (parentReal !== parentPath || (parentReal !== base && !parentReal.startsWith(`${base}${path.sep}`))) throw new TransactionError('TARGET_PARENT_CHANGED', candidatePath);
+  if (process.platform === 'win32') {
+    const info = await lstat(parentPath).catch((error) => { throw new TransactionError('STABLE_DIRECTORY_UNAVAILABLE', error.message); });
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new TransactionError('STABLE_DIRECTORY_UNAVAILABLE', 'target parent must be a regular directory');
+    let lock;
+    try {
+      lock = openWindowsPathLock({ root: base, parent: parentPath, target: candidatePath, expectedParent: parentReal });
+      return { directory: { close: async () => lock?.close() }, stableParent: parentReal, candidatePath, stablePath: path.join(parentReal, path.basename(candidatePath)) };
+    } catch (error) { lock?.close(); throw new TransactionError('STABLE_DIRECTORY_UNAVAILABLE', error.message); }
+  }
   const directory = await open(parentPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
     .catch((error) => { throw new TransactionError('STABLE_DIRECTORY_UNAVAILABLE', error.message); });
   try {
@@ -130,6 +155,13 @@ export async function replaceWithinStableParent({ root, source, target, renameFi
   const targetPath = path.resolve(target);
   const parentPath = path.dirname(targetPath);
   if (path.dirname(sourcePath) !== parentPath) throw new TransactionError('PATH_ESCAPE', 'atomic replacement must stay in one workspace directory');
+  if (process.platform === 'win32' && renameFile === rename) {
+    const rootReal = await realpath(root);
+    const parentReal = await realpath(parentPath);
+    await runWindowsFileOperation({ operation: 'replace', root: rootReal, parent: parentPath, target: targetPath, source: sourcePath, expectedParent: parentReal, expectedSourceHash, expectedTargetHash });
+    if (expectedAfterHash !== undefined && digest(await readStableRegular(targetPath, 'committed target')) !== expectedAfterHash) throw new TransactionError('POST_VERIFY_FAILED', 'committed content hash mismatch', { replaced: true });
+    return;
+  }
   let stable;
   try {
     stable = await openStableParent(root, targetPath);
