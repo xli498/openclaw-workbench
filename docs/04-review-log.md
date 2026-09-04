@@ -389,3 +389,10 @@
 - `HOME` 与 `TMPDIR` 固定继承宿主运行环境，不接受调用方覆盖。
 - 防止受控 `git`/`npm` 命令改用外部配置目录，或将临时文件写入调用方指定位置。
 - 新增环境覆盖回归测试；当前结果：全量 `npm test` 待本轮复跑确认，`git diff --check` 待本轮复跑确认。
+
+## 2026-09-04：配置导入红蓝复审
+
+- 红队攻击：错误 base hash、控制 token 冒充 approval token、actionHash 篡改/重放、路径穿越、Windows 盘符路径、内部目录和伪造备份。
+- 蓝队结果：配置写入采用两阶段审批、哈希门禁和已有 anchored snapshot 原子写入；备份只使用生成的随机 ID，原始配置内容不进入审计或提案快照。
+- 回归结果：`tests/security-red-team.test.mjs` 5/5 通过；`tests/config-store.test.mjs` 5 通过、1 个 Windows 符号链接场景因 Developer Mode 未启用而跳过；HTTP 配置导入/冲突/回滚 2/2 通过；整仓 `260 tests / 241 pass / 0 fail / 19 skipped`。
+- 产品边界：当前只管理工作区内 JSON 副本，不宣称已接管用户目录中的 OpenClaw 配置、Gateway 或 MCP 工具。

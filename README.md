@@ -6,7 +6,7 @@
 
 ## 当前可运行入口
 
-包入口：`import { startWorkbench, createPatchProposal, approveAndApplyPatch } from 'openclaw-workbench'`。运行时提供本地工作区启动扫描、恢复编排、Patch 审批应用闭环和独立的受控命令执行器，不会接管 OpenClaw 配置。
+包入口：`import { startWorkbench, createPatchProposal, approveAndApplyPatch, readConfig, importConfig, rollbackConfig } from 'openclaw-workbench'`。运行时提供本地工作区启动扫描、恢复编排、Patch 审批应用闭环、配置备份/回滚和独立的受控命令执行器；不会自动接管 OpenClaw Gateway。
 
 ```bash
 npm test
@@ -80,6 +80,8 @@ Plan 会话支持 `POST /v1/sessions/:id/plan` 的多模型只读复核；传入
 
 Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前已有本地 Web 控制台，但仍不包含桌面壳、MCP 管理、OpenClaw channel/Gateway 生命周期接入和公网 Bridge。
 
+配置管理垂直切片提供 `GET /v1/config`、`POST /v1/config/import`、`POST /v1/config/rollback` 和 `POST /v1/config/:actionId/approve`。配置文件必须是工作区内的相对 `.json` 文件（默认 `openclaw.json`）；导入会先创建 `.openclaw-workbench/config-backups/` 下的备份，写入前和写入时都校验 `expectedHash`，冲突返回 `409 CONFIG_CONFLICT`。创建提案只返回相对路径、大小和哈希，原始配置内容不写入 proposals 快照、不返回 UI，也不进入审计；待审批提案只保存在当前进程，重启后必须重新创建。
+
 ## 能力状态
 
 | 能力 | 状态 |
@@ -89,6 +91,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 命令 action 跨进程原子 claim 防重放 | 已实现 |
 | 命令终态持久化与启动扫描 | 已实现；未完成动作只进入人工复核 |
 | 审计哈希链与并发追加锁 | 已实现 |
+| 配置导入、备份、哈希冲突和回滚 | 已实现；仅限工作区 JSON，需独立审批 |
 | OpenClaw channel/Gateway 生命周期接入 | 未实现 |
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
 | MCP 管理、公网 Bridge | 未实现 |
