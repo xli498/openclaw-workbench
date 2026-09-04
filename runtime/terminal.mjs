@@ -13,6 +13,7 @@ const MAX_ARG_COUNT = 256;
 const MAX_ARG_BYTES = 64 * 1024;
 const MAX_SINGLE_ARG_BYTES = 16 * 1024;
 const SAFE_ENV_KEYS = new Set(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']);
+const WINDOWS_ANCHOR_READY = 'OCW_WINDOWS_ANCHOR_READY';
 const WINDOWS = process.platform === 'win32';
 const WINDOWS_ANCHOR_RUNNER = fileURLToPath(new URL('./windows-anchor-runner.ps1', import.meta.url));
 const TRUSTED_EXECUTABLE_DIRECTORIES = Object.freeze(WINDOWS
@@ -179,7 +180,9 @@ export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = D
     // The Windows runner compiles its small in-process anchor once before it can
     // begin the target timeout. Keep a bounded startup allowance so this outer
     // guard does not kill the runner and strand its child during compilation.
-    const timer = setTimeout(() => { timedOut = true; kill(); finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`)); }, WINDOWS ? timeoutMs + 15_000 : timeoutMs);
+    let timer;
+    const scheduleTimeout = (delay) => { timer = setTimeout(() => { timedOut = true; kill(); finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`)); }, delay); };
+    scheduleTimeout(WINDOWS ? timeoutMs + 15_000 : timeoutMs);
     const collect = (target, chunk) => {
       outputBytes += chunk.byteLength;
       if (outputBytes > maxOutputBytes) { outputLimited = true; kill(); return target; }
@@ -187,7 +190,17 @@ export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = D
     };
     signal?.addEventListener('abort', abort, { once: true });
     child.stdout.on('data', (chunk) => { stdout = collect(stdout, chunk); });
-    child.stderr.on('data', (chunk) => { stderr = collect(stderr, chunk); });
+    child.stderr.on('data', (chunk) => {
+      if (WINDOWS) {
+        const text = chunk.toString();
+        if (text.includes(WINDOWS_ANCHOR_READY)) {
+          clearTimeout(timer);
+          scheduleTimeout(timeoutMs);
+          chunk = Buffer.from(text.replaceAll(`${WINDOWS_ANCHOR_READY}\r\n`, '').replaceAll(`${WINDOWS_ANCHOR_READY}\n`, '').replaceAll(WINDOWS_ANCHOR_READY, ''), 'utf8');
+        }
+      }
+      stderr = collect(stderr, chunk);
+    });
     child.on('error', (error) => finish(reject, new TerminalError('SPAWN_FAILED', error.message)));
     child.on('close', (code, signalName) => {
       if (settled) return;

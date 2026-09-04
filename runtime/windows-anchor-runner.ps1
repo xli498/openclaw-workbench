@@ -131,8 +131,9 @@ public static class OcwWindowsAnchor
             string current = rootPath;
             foreach (string part in suffix.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries)) {
                 current = Path.Combine(current, part);
-                locks.Add(LockDirectory(current));
+            locks.Add(LockDirectory(current));
             }
+            Console.Error.WriteLine("OCW_WINDOWS_ANCHOR_READY");
             var start = new ProcessStartInfo {
                 FileName = executable,
                 Arguments = String.Join(" ", Array.ConvertAll(argv ?? new string[0], QuoteArgument)),
