@@ -24,6 +24,11 @@ export function isSensitiveWorkspacePath(relativePath, patterns = DEFAULT_SENSIT
   return patterns.some((pattern) => pattern.test(normalized));
 }
 
+function isInternalStatePath(relativePath) {
+  const normalized = relativePath.replaceAll('\\', '/');
+  return normalized === INTERNAL_STATE_DIRECTORY || normalized.startsWith(`${INTERNAL_STATE_DIRECTORY}/`);
+}
+
 export class WorkspaceError extends Error {
   constructor(code, message, details = {}) {
     super(message);
@@ -92,7 +97,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         const nodes = [];
         for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
           const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
-          if (relativePath === INTERNAL_STATE_DIRECTORY || relativePath.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(relativePath)) continue;
+          if (isInternalStatePath(relativePath) || isSensitive(relativePath)) continue;
           count += 1;
           if (count > maxEntries) throw new WorkspaceError('TREE_LIMIT', 'workspace tree exceeds entry limit', { maxEntries });
           const absolutePath = path.join(directory, entry.name);
@@ -166,17 +171,17 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
       };
       try {
         const [{ stdout: head }, { stdout: tracked }, { stdout: untracked }] = await Promise.all([
-          execFileAsync('/usr/bin/git', ['-C', rootReal, 'rev-parse', 'HEAD'], { timeout: 5_000, maxBuffer: 64 * 1024 }),
-          execFileAsync('/usr/bin/git', ['-C', rootReal, 'ls-files', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
-          execFileAsync('/usr/bin/git', ['-C', rootReal, 'ls-files', '--others', '--exclude-standard', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
+          execFileAsync('git', ['-C', rootReal, 'rev-parse', 'HEAD'], { timeout: 5_000, maxBuffer: 64 * 1024 }),
+          execFileAsync('git', ['-C', rootReal, 'ls-files', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
+          execFileAsync('git', ['-C', rootReal, 'ls-files', '--others', '--exclude-standard', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
         ]);
         const digest = createHash('sha256').update(head).update('\0');
         for (const relativePath of [...new Set([...tracked.split('\0'), ...untracked.split('\0')].filter(Boolean))].sort()) {
-          if (isSensitive(relativePath) || relativePath === '.openclaw-workbench' || relativePath.startsWith(`.openclaw-workbench${path.sep}`)) continue;
+          if (isSensitive(relativePath) || isInternalStatePath(relativePath)) continue;
           accountEntry();
           const resolved = await resolveSafe(relativePath, { allowMissing: true });
           const targetRelative = path.relative(rootReal, resolved.targetReal);
-          if (targetRelative === INTERNAL_STATE_DIRECTORY || targetRelative.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(targetRelative)) {
+          if (isInternalStatePath(targetRelative) || isSensitive(targetRelative)) {
             throw new WorkspaceError('SENSITIVE_PATH', 'workspace revision encountered an alias to excluded state', { path: relativePath, target: targetRelative });
           }
           const info = await stat(resolved.targetReal).catch((error) => {
@@ -203,7 +208,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
             const entries = await readdir(directory, { withFileTypes: true });
             for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
               const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
-              if (relativePath === INTERNAL_STATE_DIRECTORY || relativePath.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(relativePath)) continue;
+              if (isInternalStatePath(relativePath) || isSensitive(relativePath)) continue;
               accountEntry();
               const absolutePath = path.join(directory, entry.name);
               const info = await lstat(absolutePath);
@@ -212,7 +217,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
                 const targetReal = await realpath(absolutePath);
                 if (targetReal !== rootReal && !targetReal.startsWith(`${rootReal}${path.sep}`)) throw new WorkspaceError('SYMLINK_ESCAPE', 'workspace revision encountered a symlink outside the workspace', { path: relativePath });
                 const targetRelative = path.relative(rootReal, targetReal);
-                if (targetRelative === INTERNAL_STATE_DIRECTORY || targetRelative.startsWith(`${INTERNAL_STATE_DIRECTORY}${path.sep}`) || isSensitive(targetRelative)) {
+                if (isInternalStatePath(targetRelative) || isSensitive(targetRelative)) {
                   throw new WorkspaceError('SENSITIVE_PATH', 'workspace revision encountered a symlink to excluded state', { path: relativePath, target: targetRelative });
                 }
                 digest.update(relativePath).update('\0symlink\0').update(link).update('\0');
