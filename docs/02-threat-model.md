@@ -71,4 +71,5 @@ proposed → inspected → awaiting_approval → approved → executing → veri
 - 能证明失败或取消不会留下孤儿进程。
 - 能证明日志、诊断包和错误消息不含 API Key、Cookie、密码和完整 SecretRef 值。
 - 能证明配置冲突不会静默覆盖他人修改。
+- 能证明配置导入只接受工作区内 JSON、先备份再原子写入，且无独立审批不会改变文件；回滚只接受 Workbench 生成的备份 ID。
 - 能证明更新失败可恢复到上一版本。

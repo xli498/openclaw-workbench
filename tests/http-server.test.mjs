@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -67,6 +67,65 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
     assert.match(controlHtml, /tree\.setAttribute\('aria-busy','true'\)/);
     assert.match(controlHtml, /button\.disabled=true/);
     assert.match(controlHtml, /finally\{tree\.setAttribute\('aria-busy','false'\);button\.disabled=false\}/);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('配置导入必须经过独立审批，成功后只返回哈希和备份 ID', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-config-'));
+  const before = '{"mode":"old"}\n';
+  const after = '{"mode":"new","prompt":"<script>alert(1)</script>"}\n';
+  await writeFile(path.join(root, 'openclaw.json'), before);
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const current = await request(address, '/v1/config');
+    assert.equal(current.status, 200);
+    assert.equal(current.body.config.hash, createHash('sha256').update(before).digest('hex'));
+    assert.deepEqual(current.body.config.keys, ['mode']);
+    const proposal = await request(address, '/v1/config/import', { method: 'POST', body: JSON.stringify({ sessionId: 'config-http', relativePath: 'openclaw.json', expectedHash: current.body.config.hash, content: after }) });
+    assert.equal(proposal.status, 201, JSON.stringify(proposal.body));
+    assert.equal(proposal.body.proposal.action.status, 'awaiting_approval');
+    assert.equal('content' in proposal.body.proposal.config, false);
+    assert.equal(await readFile(path.join(root, 'openclaw.json'), 'utf8'), before);
+    const missingApproval = await request(address, `/v1/config/${proposal.body.proposal.action.id}/approve`, { method: 'POST', body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    assert.equal(missingApproval.status, 403);
+    assert.equal(missingApproval.body.error, 'APPROVAL_AUTH_REQUIRED');
+    const approved = await request(address, `/v1/config/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    assert.equal(approved.body.config.afterHash, createHash('sha256').update(after).digest('hex'));
+    assert.equal('backupPath' in approved.body.config, false);
+    assert.equal(JSON.stringify(approved.body).includes('<script>'), false);
+    const replay = await request(address, `/v1/config/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    assert.equal(replay.status, 404);
+    const audit = await request(address, '/v1/audit');
+    assert.equal(audit.status, 200);
+    assert.equal(JSON.stringify(audit.body).includes('<script>'), false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('配置导入审批前发生变化时阻断并保留现场，回滚使用绑定备份', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-config-conflict-'));
+  const before = '{"mode":"old"}\n';
+  const after = '{"mode":"new"}\n';
+  const changed = '{"mode":"changed"}\n';
+  await writeFile(path.join(root, 'openclaw.json'), before);
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const current = await request(address, '/v1/config');
+    const proposal = await request(address, '/v1/config/import', { method: 'POST', body: JSON.stringify({ sessionId: 'config-conflict', expectedHash: current.body.config.hash, content: after }) });
+    await writeFile(path.join(root, 'openclaw.json'), changed);
+    const blocked = await request(address, `/v1/config/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.body.error, 'CONFIG_CONFLICT');
+    assert.equal(await readFile(path.join(root, 'openclaw.json'), 'utf8'), changed);
+    const imported = await request(address, '/v1/config/import', { method: 'POST', body: JSON.stringify({ sessionId: 'config-rollback', expectedHash: createHash('sha256').update(changed).digest('hex'), content: after }) });
+    const importedResult = await request(address, `/v1/config/${imported.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: imported.body.proposal.action.actionHash }) });
+    const rollback = await request(address, '/v1/config/rollback', { method: 'POST', body: JSON.stringify({ sessionId: 'config-rollback', expectedHash: importedResult.body.config.afterHash, backupId: importedResult.body.config.backupId }) });
+    assert.equal(rollback.status, 201);
+    const rolledBack = await request(address, `/v1/config/${rollback.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: rollback.body.proposal.action.actionHash }) });
+    assert.equal(rolledBack.status, 200, JSON.stringify(rolledBack.body));
+    assert.equal(await readFile(path.join(root, 'openclaw.json'), 'utf8'), changed);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 

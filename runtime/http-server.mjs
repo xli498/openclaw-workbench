@@ -11,12 +11,17 @@ import { scanCommandLedger } from './command-ledger.mjs';
 import { createWorkspace, WorkspaceError } from './workspace.mjs';
 import { controlPanelHtml } from './control-panel.mjs';
 import { transition } from './action.mjs';
+import { createAction } from './action.mjs';
 import { AdapterError, createOpenClawAgentRunner, inspectOpenClaw, inspectOpenClawMcp } from './openclaw-adapter.mjs';
 import { createFileAuditLog } from './audit.mjs';
 import { PlanError } from './plan.mjs';
 import { RecoveryError, decideRecovery, inspectPendingTransaction, scanPendingTransactions } from './recovery.mjs';
+import { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId } from './config-store.mjs';
+import { snapshotDigest } from './snapshot-store.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
+const MAX_CONFIG_PROPOSALS = 32;
+const MAX_CONFIG_PROPOSAL_BYTES = 8 * 1024 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DECIMAL_INTEGER_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 
@@ -109,6 +114,7 @@ function errorResponse(error) {
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, 'proposal request failed') };
   if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
   if (error instanceof RecoveryError) return { status: ['SCAN_FAILED', 'MANIFEST_INVALID'].includes(error.code) ? 500 : 400, body: safe(error.code, error.message) };
+  if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -146,6 +152,10 @@ function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
+function publicConfigProposal(proposal) {
+  return { action: proposal.action, config: { relativePath: proposal.config.relativePath, operation: proposal.config.operation, ...(proposal.config.operation === 'import' ? { contentHash: proposal.config.contentHash, contentBytes: proposal.config.contentBytes } : { backupId: proposal.config.backupId }) } };
+}
+
 function publicAuditEvent(event) {
   const safe = {};
   for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'code', 'state']) {
@@ -174,6 +184,8 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   if (typeof token !== 'string' || token.length < 16) throw new Error('token must be at least 16 characters');
   if (!['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error('host must be loopback');
   const proposals = new Map();
+  const configProposals = new Map();
+  const configReservations = new Map();
   const effectiveAudit = audit ?? createLazyAuditLog(root);
   const proposalStore = createProposalStore({ root });
   const adapterConfig = adapter ? { ...adapter, command: adapter.command ?? 'openclaw' } : null;
@@ -198,6 +210,58 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
+      if (request.method === 'GET' && url.pathname === '/v1/config') return json(response, 200, { config: await readConfig({ root }) });
+      if (request.method === 'POST' && (url.pathname === '/v1/config/import' || url.pathname === '/v1/config/rollback')) {
+        const input = await bodyOf(request);
+        const operation = url.pathname.endsWith('/import') ? 'import' : 'rollback';
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new ConfigError('SESSION_REQUIRED', 'sessionId is required');
+        const expectedHash = input.expectedHash ?? null;
+        const current = await readConfig({ root, relativePath: input.relativePath ?? 'openclaw.json' });
+        if (expectedHash !== current.hash) throw new ConfigError('CONFIG_CONFLICT', 'config changed before proposal', { expectedHash, actualHash: current.hash });
+        const config = operation === 'import'
+          ? { operation, relativePath: current.relativePath, content: input.content, contentHash: typeof input.content === 'string' ? snapshotDigest(input.content) : null, contentBytes: typeof input.content === 'string' ? Buffer.byteLength(input.content) : 0, expectedHash }
+          : { operation, relativePath: current.relativePath, backupId: validateBackupId(input.backupId), expectedHash };
+        if (operation === 'import' && (typeof config.content !== 'string' || config.contentBytes > 256 * 1024)) throw new ConfigError('CONFIG_CONTENT_INVALID', 'config content must be a string below the request limit');
+        const pendingBytes = [...configProposals.values()].reduce((total, item) => total + (item.config.contentBytes ?? 0), 0) + [...configReservations.values()].reduce((total, bytes) => total + bytes, 0);
+        if (configProposals.size + configReservations.size >= MAX_CONFIG_PROPOSALS || pendingBytes + (config.contentBytes ?? 0) > MAX_CONFIG_PROPOSAL_BYTES) throw new ConfigError('CONFIG_PROPOSAL_LIMIT', 'too many pending config proposals');
+        const preview = operation === 'import' ? { operation, relativePath: current.relativePath, contentHash: config.contentHash, contentBytes: config.contentBytes, expectedHash: config.expectedHash } : { operation, relativePath: current.relativePath, backupId: config.backupId, expectedHash: config.expectedHash };
+        const action = transition(transition(createAction({ type: 'config', sessionId: input.sessionId, workspaceRevision: current.hash ?? 'missing', target: current.relativePath, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, config });
+        configReservations.set(action.id, config.contentBytes ?? 0);
+        try {
+          if (effectiveAudit) await effectiveAudit.append({ type: 'config.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, operation, relativePath: current.relativePath, contentHash: config.contentHash ?? null });
+        } catch (error) {
+          configReservations.delete(action.id);
+          throw error;
+        }
+        configReservations.delete(action.id);
+        configProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicConfigProposal(proposal) });
+      }
+      const configApproval = url.pathname.match(/^\/v1\/config\/([^/]+)\/approve$/);
+      if (request.method === 'POST' && configApproval) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const proposal = configProposals.get(configApproval[1]);
+        if (!proposal) return json(response, 404, { error: 'CONFIG_PROPOSAL_NOT_FOUND', message: 'config proposal not found' });
+        const input = await bodyOf(request);
+        if (input.actionHash !== proposal.action.actionHash) throw new ConfigError('CONFIG_ACTION_HASH_MISMATCH', 'approval must bind the current config action hash');
+        const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
+        if (effectiveAudit) await effectiveAudit.append({ type: 'config.approved', actor: 'user', actionId: approved.id, sessionId: approved.sessionId, actionHash: approved.actionHash, operation: proposal.config.operation });
+        try {
+          const result = proposal.config.operation === 'import'
+            ? await importConfig({ root, relativePath: proposal.config.relativePath, expectedHash: proposal.config.expectedHash, content: proposal.config.content })
+            : await rollbackConfig({ root, relativePath: proposal.config.relativePath, backupId: proposal.config.backupId, expectedHash: proposal.config.expectedHash });
+          const verified = transition(transition(approved, 'executing'), 'verified');
+          configProposals.delete(proposal.action.id);
+          if (effectiveAudit) await effectiveAudit.append({ type: 'config.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, operation: proposal.config.operation, beforeHash: result.beforeHash, afterHash: result.afterHash, backupId: result.backupId ?? null });
+          const { backupPath: _backupPath, ...publicResult } = result;
+          return json(response, 200, { action: verified, config: publicResult });
+        } catch (error) {
+          configProposals.delete(proposal.action.id);
+          if (effectiveAudit) await effectiveAudit.append({ type: 'config.failed', actor: 'system', actionId: proposal.action.id, sessionId: proposal.action.sessionId, actionHash: proposal.action.actionHash, operation: proposal.config.operation, code: error.code ?? 'CONFIG_FAILED' });
+          throw error;
+        }
+      }
       await startupState;
       if (request.method === 'GET' && url.pathname === '/v1/events/stream') {
         const after = singleQueryInteger(url.searchParams, 'after', 0);
