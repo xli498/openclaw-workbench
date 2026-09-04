@@ -404,3 +404,10 @@
 - 健康检查只接受显式注入的只读探针，默认 `NOT_CONFIGURED`，不会启动 Server、建立 transport 或调用工具。
 - 红队攻击覆盖 shell 注入、凭据 URL、环境变量值、工具路径越权、token 互换、actionHash 重放和自动执行；定向 + 红队共 16 项，15 pass、1 Windows symlink skip、0 fail。
 - 产品边界：真实 MCP transport、Server 进程生命周期和工具执行仍未开放，不以注册表或健康状态冒充已接入 OpenClaw MCP。
+
+## 2026-09-05：模型档案与连接测试红蓝复审
+
+- 新增持久化模型档案注册表：provider/protocol/model/capabilities/SecretRef 引用校验，原子快照、默认禁用和重启恢复。
+- 新增审批 API 和非联网连接探针；审批绑定 session、actionHash 和独立 approval token，探针不接触 SecretRef 解析值。
+- 红队覆盖 SecretRef 值、凭据 endpoint、敏感 query、协议注入、token 互换、actionHash 重放和自动联网；模型定向与红队共 14 项全部通过。
+- 产品边界：真实 provider SDK、密钥环解析、模型调用和 Gateway WebSocket 仍未开放。

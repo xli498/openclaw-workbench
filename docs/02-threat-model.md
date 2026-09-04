@@ -74,4 +74,5 @@ proposed → inspected → awaiting_approval → approved → executing → veri
 - 能证明配置导入只接受工作区内 JSON、先备份再原子写入，且无独立审批不会改变文件；回滚只接受 Workbench 生成的备份 ID。
 - 能证明 MCP 注册只写入脱敏元数据，默认禁用；命令、端点、环境变量值和工具名不能通过注入绕过 schema。
 - 能证明 MCP 工具授权绑定当前注册配置哈希且需要独立审批；健康检查不会自动启动 Server 或调用工具。
+- 能证明模型档案不保存 API key 或 SecretRef 值，连接测试默认不联网且不会调用真实模型；档案注册需要独立审批。
 - 能证明更新失败可恢复到上一版本。

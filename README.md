@@ -92,6 +92,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 命令终态持久化与启动扫描 | 已实现；未完成动作只进入人工复核 |
 | 审计哈希链与并发追加锁 | 已实现 |
 | 配置导入、备份、哈希冲突和回滚 | 已实现；仅限工作区 JSON，需独立审批 |
+| 模型档案、SecretRef 引用和连接测试 | 已实现受控元数据骨架；默认禁用，不解析密钥或联网 |
 | OpenClaw channel/Gateway 生命周期接入 | 未实现 |
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
 | MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具 |
@@ -128,6 +129,12 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 `GET /v1/mcp/servers` 查看 Workbench 自己的本地注册表；`POST /v1/mcp/servers` 创建注册提案，必须使用独立 `x-approval-token` 调用 `/v1/mcp/servers/<actionId>/approve` 才会写入。注册记录只保存 Server 名称、transport、命令/端点、环境变量名称、工具 allowlist 和布尔权限；不会保存环境变量值、token 或 URL 用户密码。所有新 Server 默认 `enabled:false`。
 
 `POST /v1/mcp/servers/<serverId>/authorize` 以当前 `configHash` 创建工具授权提案，审批时再次校验哈希，防止并发修改覆盖授权。`GET /v1/mcp/servers/<serverId>/health` 只调用调用方显式注入的只读探针；默认返回 `NOT_CONFIGURED`，不会启动 MCP Server、建立 transport 或执行工具。真实 transport、进程生命周期和工具执行仍未开放。
+
+## 模型档案与连接测试
+
+`GET /v1/models` 查看 Workbench 的本地模型档案；`POST /v1/models` 创建档案提案，使用独立 `x-approval-token` 调用 `/v1/models/<actionId>/approve` 才会登记。档案只保存 provider、protocol、model、能力列表、无密钥的 `env:`/`keychain:` SecretRef 引用和健康摘要；新档案默认 `enabled:false`，不会保存 API key 或 SecretRef 解析值。
+
+`GET /v1/models/<profileId>/health` 只调用显式注入的连接探针；默认返回 `NOT_CONFIGURED`，不联网、不读取 SecretRef、不调用真实模型。真实供应商 SDK、密钥环解析、模型调用和 Gateway 生命周期仍未开放。
 
 本地快照仅允许工作区内的普通文件，发现快照或快照目录为符号链接即拒绝恢复/写入；快照写入后固定为 `0600`，创建目录为 `0700`。这不是宿主机隔离的替代品。
 
