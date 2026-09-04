@@ -37,11 +37,18 @@ public static class OcwWindowsFileOps
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder path, uint length, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint length);
     const int FileRenameInfo = 3;
     const int FileDispositionInfo = 4;
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(SafeFileHandle handle, int type, IntPtr info, uint size);
 
-    static string Canonical(string value) { var result = (value ?? "").Replace('/', '\\').TrimEnd('\\'); return result.StartsWith("\\\\?\\", StringComparison.Ordinal) ? result.Substring(4) : result; }
+    static string Canonical(string value) {
+        var result = (value ?? "").Replace('/', '\\').TrimEnd('\\');
+        if (result.StartsWith("\\\\?\\", StringComparison.Ordinal)) result = result.Substring(4);
+        var buffer = new StringBuilder(32768);
+        var length = GetLongPathName(result, buffer, (uint)buffer.Capacity);
+        return length > 0 && length < buffer.Capacity ? buffer.ToString() : result;
+    }
     static string FinalPath(SafeFileHandle handle) { var buffer = new StringBuilder(1024); if (GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, 0) == 0) throw new IOException("final path unavailable"); return Canonical(buffer.ToString()); }
     static SafeFileHandle OpenDirectory(string path, string expected) {
         var handle = CreateFile(path, GenericRead, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);

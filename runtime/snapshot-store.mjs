@@ -1,6 +1,6 @@
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { basename, dirname, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import process from 'node:process';
 import { openWindowsPathLock, runWindowsFileOperationSync } from './windows-path-lock.mjs';
 
@@ -10,6 +10,17 @@ const DIR_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O
 function inside(root, target) {
   const path = relative(root, target);
   return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !path.includes(`${sep}..${sep}`));
+}
+
+function canonicalSnapshotPaths(root, storePath, ErrorType, code, message) {
+  const declaredRoot = resolve(root);
+  const realRoot = realpathSync(declaredRoot);
+  const declaredTarget = resolve(storePath);
+  const relativeTarget = relative(declaredRoot, declaredTarget);
+  if (!relativeTarget || relativeTarget === '..' || relativeTarget.startsWith(`..${sep}`) || isAbsolute(relativeTarget)) throw new ErrorType(code, message);
+  const target = resolve(realRoot, relativeTarget);
+  if (!inside(realRoot, target)) throw new ErrorType(code, message);
+  return Object.freeze({ realRoot, target });
 }
 
 function openAnchoredDirectory(pathname, ErrorType, code, message) {
@@ -62,8 +73,8 @@ function readAnchoredRegularFile(parent, name) {
 }
 
 function openExistingAnchoredParent(root, pathname, ErrorType, code, message) {
-  const realRoot = realpathSync(resolve(root));
-  const targetParent = resolve(dirname(pathname));
+  const { realRoot, target } = canonicalSnapshotPaths(root, pathname, ErrorType, code, message);
+  const targetParent = dirname(target);
   if (!inside(realRoot, targetParent)) throw new ErrorType(code, message);
   let current = openAnchoredDirectory(realRoot, ErrorType, code, message);
   try {
@@ -126,11 +137,7 @@ function recoverStaleLock(parent, lockName, { staleLockMs, now, ErrorType, code,
 }
 
 export function assertSafeSnapshotPath({ root, storePath, ErrorType, code, message }) {
-  const declaredRoot = resolve(root);
-  const realRoot = realpathSync(declaredRoot);
-  if (declaredRoot !== realRoot) throw new ErrorType(code, message);
-  const target = resolve(storePath);
-  if (!inside(realRoot, target)) throw new ErrorType(code, message);
+  const { target } = canonicalSnapshotPaths(root, storePath, ErrorType, code, message);
   const stat = lstatSync(target, { throwIfNoEntry: false });
   if (stat?.isSymbolicLink() || (stat && !stat.isFile())) throw new ErrorType(code, message);
 }
@@ -140,7 +147,7 @@ export function snapshotDigest(content) { return createHash('sha256').update(con
 export function readSnapshot({ root, storePath, ErrorType, code, message, __testHooks, __windowsAnchored = false } = {}) {
   assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
   if (process.platform === 'win32' && !__windowsAnchored && __testHooks) {
-    const target = resolve(storePath); const parentPath = dirname(target); const realRoot = realpathSync(resolve(root));
+    const { target, realRoot } = canonicalSnapshotPaths(root, storePath, ErrorType, code, message); const parentPath = dirname(target);
     let expectedParent;
     try { expectedParent = realpathSync(parentPath); } catch { return Object.freeze({ content: null, digest: null }); }
     let lock;
@@ -156,7 +163,8 @@ export function readSnapshot({ root, storePath, ErrorType, code, message, __test
     __testHooks?.onParentOpened?.({ parentPath: parent.path, storePath });
     if (process.platform === 'win32') {
       if (!lstatSync(storePath, { throwIfNoEntry: false })) return Object.freeze({ content: null, digest: null });
-      const encoded = runWindowsFileOperationSync({ operation: 'read', root: realpathSync(resolve(root)), parent: dirname(resolve(storePath)), target: resolve(storePath), expectedParent: realpathSync(dirname(resolve(storePath))) });
+      const { target, realRoot } = canonicalSnapshotPaths(root, storePath, ErrorType, code, message);
+      const encoded = runWindowsFileOperationSync({ operation: 'read', root: realRoot, parent: dirname(target), target, expectedParent: realpathSync(dirname(target)) });
       const content = Buffer.from(encoded, 'base64').toString('utf8');
       return Object.freeze({ content, digest: snapshotDigest(content) });
     }
@@ -173,8 +181,7 @@ export function readSnapshot({ root, storePath, ErrorType, code, message, __test
 // Create missing parents only through opened directory FDs. No mkdir call ever
 // traverses the mutable complete parent pathname.
 function openOrCreateAnchoredParent({ root, storePath, ErrorType, code, message }) {
-  const declaredRoot = resolve(root); const realRoot = realpathSync(declaredRoot); const target = resolve(storePath);
-  if (declaredRoot !== realRoot || !inside(realRoot, target)) throw new ErrorType(code, message);
+  const { realRoot, target } = canonicalSnapshotPaths(root, storePath, ErrorType, code, message);
   let current = openAnchoredDirectory(realRoot, ErrorType, code, message);
   try {
     for (const segment of relative(realRoot, dirname(target)).split(sep).filter(Boolean)) {
@@ -189,7 +196,7 @@ function openOrCreateAnchoredParent({ root, storePath, ErrorType, code, message 
 export function writeSnapshotAtomically({ root, storePath, payload, expectedDigest, ErrorType, code, message, busyCode, busyMessage, conflictCode, conflictMessage, temporaryName, staleLockMs = DEFAULT_STALE_LOCK_MS, now = Date.now(), __testHooks, __windowsAnchored = false } = {}) {
   assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
   if (process.platform === 'win32' && !__windowsAnchored && __testHooks) {
-    const target = resolve(storePath); const parentPath = dirname(target); const realRoot = realpathSync(resolve(root));
+    const { target, realRoot } = canonicalSnapshotPaths(root, storePath, ErrorType, code, message); const parentPath = dirname(target);
     try { mkdirSync(parentPath, { recursive: true }); } catch { throw new ErrorType(code, message); }
     let expectedParent;
     try { expectedParent = realpathSync(parentPath); } catch { throw new ErrorType(code, message); }
@@ -201,7 +208,7 @@ export function writeSnapshotAtomically({ root, storePath, payload, expectedDige
     finally { lock?.close(); }
   }
   if (process.platform === 'win32' && !__windowsAnchored) {
-    try { mkdirSync(dirname(resolve(storePath)), { recursive: true }); } catch { throw new ErrorType(code, message); }
+    try { mkdirSync(dirname(canonicalSnapshotPaths(root, storePath, ErrorType, code, message).target), { recursive: true }); } catch { throw new ErrorType(code, message); }
   }
   const parent = openOrCreateAnchoredParent({ root, storePath, ErrorType, code, message });
   const targetName = basename(storePath);
@@ -230,8 +237,9 @@ export function writeSnapshotAtomically({ root, storePath, payload, expectedDige
     catch (error) { if (error?.code === 'ENOENT') current = { digest: null }; else throw new ErrorType(code, message); }
     if (current.digest !== expectedDigest) throw new ErrorType(conflictCode, conflictMessage);
     if (process.platform === 'win32') {
+      const { realRoot, target } = canonicalSnapshotPaths(root, storePath, ErrorType, code, message);
       runWindowsFileOperationSync({
-        operation: 'write', root: realpathSync(resolve(root)), parent: dirname(resolve(storePath)), target: resolve(storePath), expectedParent: realpathSync(dirname(resolve(storePath))),
+        operation: 'write', root: realRoot, parent: dirname(target), target, expectedParent: realpathSync(dirname(target)),
         expectedTargetHash: expectedDigest ?? undefined, contentBase64: Buffer.from(payload).toString('base64'), replaceIfExists: current.digest !== null, expectTargetMissing: current.digest === null,
       });
     } else {

@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { approveAndRunCommand, createCommandProposal, WorkflowError } from '../runtime/workflow.mjs';
 import { symlinkOrSkip } from './test-support.mjs';
 
-async function fixture() { return mkdtemp(path.join(tmpdir(), 'ocw-command-workflow-')); }
+async function fixture() { return realpath(await mkdtemp(path.join(tmpdir(), 'ocw-command-workflow-'))); }
 
 test('命令提案必须处于 Terminal 模式并经明确审批', async () => {
   const root = await fixture();

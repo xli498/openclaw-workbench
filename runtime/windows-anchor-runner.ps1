@@ -50,6 +50,57 @@ public static class OcwWindowsAnchor
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation information);
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct JobObjectBasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct IoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JobObjectExtendedLimitInformation
+    {
+        public JobObjectBasicLimitInformation BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JobObjectExtendedLimitInformation info, uint length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
+
     static SafeFileHandle LockDirectory(string directory)
     {
         SafeFileHandle handle = CreateFile(
@@ -119,6 +170,19 @@ public static class OcwWindowsAnchor
         catch { }
     }
 
+    static IntPtr CreateKillOnCloseJob()
+    {
+        var job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) return IntPtr.Zero;
+        var info = new JobObjectExtendedLimitInformation();
+        info.BasicLimitInformation.LimitFlags = 0x2000;
+        if (!SetInformationJobObject(job, 9, ref info, (uint)Marshal.SizeOf(typeof(JobObjectExtendedLimitInformation)))) {
+            CloseHandle(job);
+            return IntPtr.Zero;
+        }
+        return job;
+    }
+
     public static int Run(string root, string relativeCwd, string executable, string[] argv, int timeoutMs)
     {
         var locks = new List<SafeFileHandle>();
@@ -131,8 +195,9 @@ public static class OcwWindowsAnchor
             string current = rootPath;
             foreach (string part in suffix.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries)) {
                 current = Path.Combine(current, part);
-                locks.Add(LockDirectory(current));
+            locks.Add(LockDirectory(current));
             }
+            Console.Error.WriteLine("OCW_WINDOWS_ANCHOR_READY");
             var start = new ProcessStartInfo {
                 FileName = executable,
                 Arguments = String.Join(" ", Array.ConvertAll(argv ?? new string[0], QuoteArgument)),
@@ -143,21 +208,26 @@ public static class OcwWindowsAnchor
                 CreateNoWindow = true
             };
             using (var process = Process.Start(start)) {
+                var job = CreateKillOnCloseJob();
+                if (job != IntPtr.Zero && !AssignProcessToJobObject(job, process.Handle)) { CloseHandle(job); job = IntPtr.Zero; }
                 var stdout = process.StandardOutput.ReadToEndAsync();
                 var stderr = process.StandardError.ReadToEndAsync();
                 if (!process.WaitForExit(timeoutMs)) {
+                    if (job != IntPtr.Zero) TerminateJobObject(job, 124);
                     KillTree(process.Id);
                     process.WaitForExit();
                     stdout.Wait();
                     stderr.Wait();
                     Console.Out.Write(stdout.Result);
                     Console.Error.Write(stderr.Result);
+                    if (job != IntPtr.Zero) CloseHandle(job);
                     return 124;
                 }
                 stdout.Wait();
                 stderr.Wait();
                 Console.Out.Write(stdout.Result);
                 Console.Error.Write(stderr.Result);
+                if (job != IntPtr.Zero) CloseHandle(job);
                 return process.ExitCode;
             }
         }

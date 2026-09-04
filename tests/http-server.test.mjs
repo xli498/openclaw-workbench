@@ -142,7 +142,7 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
     const unauthorized = await fetch(`http://${address.address}:${address.port}/health`);
     assert.equal(unauthorized.status, 401);
     const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'http-test', argv: ['pwd'] }) });
-    assert.equal(proposal.status, 201);
+    assert.equal(proposal.status, 201, JSON.stringify(proposal.body));
     const approved = await request(address, `/v1/proposals/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
     assert.equal(approved.status, 200);
     assert.equal(approved.body.action.status, 'verified');
@@ -330,6 +330,7 @@ test('控制面可显式使用受限 OpenClaw CLI Adapter，并将其失败安�
   const address = await app.listen();
   try {
     const created = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+    assert.ok(created.body.session, JSON.stringify(created.body));
     const response = await request(address, `/v1/sessions/${created.body.session.id}/messages`, { method: 'POST', body: JSON.stringify({ message: 'hello', local: false }) });
     assert.equal(response.status, 502);
     assert.equal(response.body.error, 'PROCESS_FAILED');
@@ -394,6 +395,7 @@ test('审批请求不能用 currentRevision 覆盖服务端工作区版本', asy
   const address = await app.listen();
   try {
     const proposal = await request(address, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'revision-binding', argv: ['pwd'] }) });
+    assert.ok(proposal.body.proposal, JSON.stringify(proposal.body));
     await writeFile(path.join(root, 'tracked.txt'), 'after');
     const approval = await request(address, `/v1/proposals/${proposal.body.proposal.action.id}/approve`, {
       method: 'POST',
