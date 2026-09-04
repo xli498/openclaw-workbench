@@ -89,9 +89,9 @@ test('workspace revision 对扫描条目和字节数设置硬上限', async () =
 
 test('工作区内容 revision 识别修改、新增和删除', async () => {
   const root = await fixture();
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['add', 'ok.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['add', 'ok.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
   const ws = await createWorkspace(root);
   const initial = await ws.workspaceRevision();
   await writeFile(path.join(root, 'ok.txt'), 'changed');
@@ -108,18 +108,18 @@ test('工作区内容 revision 识别修改、新增和删除', async () => {
 test('Git 工作区 revision 拒绝经已跟踪别名读取敏感文件', async () => {
   const root = await fixture();
   await symlink(path.join(root, '.env'), path.join(root, 'alias.txt'));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['add', 'alias.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'alias'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['add', 'alias.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'alias'], { cwd: root }, (error) => error ? reject(error) : resolve()));
   const ws = await createWorkspace(root);
   await assert.rejects(() => ws.workspaceRevision(), (error) => error.code === 'SENSITIVE_PATH');
 });
 
 test('Git 工作区 revision 同样执行条目与字节预算', async () => {
   const root = await fixture();
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['add', 'ok.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'budget'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['add', 'ok.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'budget'], { cwd: root }, (error) => error ? reject(error) : resolve()));
   await assert.rejects(() => createWorkspace(root, { maxRevisionEntries: 0 }).then((ws) => ws.workspaceRevision()), (error) => error.code === 'REVISION_LIMIT');
   await assert.rejects(() => createWorkspace(root, { maxRevisionBytes: 2 }).then((ws) => ws.workspaceRevision()), (error) => error.code === 'REVISION_LIMIT');
 });

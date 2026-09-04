@@ -31,11 +31,12 @@ node bin/workbench.mjs \
   --root "$PWD" \
   --host 127.0.0.1 \
   --port 4312 \
-  --token "$WORKBENCH_TOKEN" \
-  --approval-token "$WORKBENCH_APPROVAL_TOKEN"
+  --token-env OPENCLAW_WORKBENCH_TOKEN \
+  --approval-token-env OPENCLAW_WORKBENCH_APPROVAL_TOKEN \
+  --openclaw-command-env OPENCLAW_WORKBENCH_COMMAND
 ```
 
-`--token` 与 `--approval-token` 必须分别提供至少 16 个字符的随机值，且不得提交到仓库。服务默认监听 `127.0.0.1`；`--host` 仅允许 `127.0.0.1`、`::1` 或 `localhost`，`--port` 默认为 `0`（由操作系统分配空闲端口）。服务在启动恢复扫描完成后才开始监听；收到 `SIGINT`/`SIGTERM` 时会关闭 HTTP 服务、结束 SSE 连接，并取消进行中的 Agent 回合。
+服务从环境变量读取至少 16 个字符的 `OPENCLAW_WORKBENCH_TOKEN` 与 `OPENCLAW_WORKBENCH_APPROVAL_TOKEN`；令牌禁止通过命令行传入或提交到仓库。`OPENCLAW_WORKBENCH_COMMAND` 可选，默认 `openclaw`；Windows 可设置为 `openclaw.cmd` 或 OpenClaw 可执行文件的完整路径。服务默认监听 `127.0.0.1`；`--host` 仅允许 `127.0.0.1`、`::1` 或 `localhost`，`--port` 默认为 `0`（由操作系统分配空闲端口）。服务在启动恢复扫描完成后才开始监听；收到 `SIGINT`/`SIGTERM` 时会关闭 HTTP 服务、结束 SSE 连接，并取消进行中的 Agent 回合。
 
 也可从 Node API 启动：
 
