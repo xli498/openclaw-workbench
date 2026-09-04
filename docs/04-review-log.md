@@ -396,3 +396,11 @@
 - 蓝队结果：配置写入采用两阶段审批、哈希门禁和已有 anchored snapshot 原子写入；备份只使用生成的随机 ID，原始配置内容不进入审计或提案快照。
 - 回归结果：`tests/security-red-team.test.mjs` 5/5 通过；`tests/config-store.test.mjs` 5 通过、1 个 Windows 符号链接场景因 Developer Mode 未启用而跳过；HTTP 配置导入/冲突/回滚 2/2 通过；整仓 `260 tests / 241 pass / 0 fail / 19 skipped`。
 - 产品边界：当前只管理工作区内 JSON 副本，不宣称已接管用户目录中的 OpenClaw 配置、Gateway 或 MCP 工具。
+
+## 2026-09-05：MCP 注册与工具授权红蓝复审
+
+- 新增受控本地 MCP 注册表：原子快照、重启恢复、重复 ID/快照 symlink 拒绝、命令/端点/环境名/工具 allowlist schema 校验。
+- 新增审批 API：注册和工具授权均绑定 session、config/action hash 和独立 approval token；注册完成后仍保持 `enabled:false`。
+- 健康检查只接受显式注入的只读探针，默认 `NOT_CONFIGURED`，不会启动 Server、建立 transport 或调用工具。
+- 红队攻击覆盖 shell 注入、凭据 URL、环境变量值、工具路径越权、token 互换、actionHash 重放和自动执行；定向 + 红队共 16 项，15 pass、1 Windows symlink skip、0 fail。
+- 产品边界：真实 MCP transport、Server 进程生命周期和工具执行仍未开放，不以注册表或健康状态冒充已接入 OpenClaw MCP。

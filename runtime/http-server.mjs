@@ -18,10 +18,12 @@ import { PlanError } from './plan.mjs';
 import { RecoveryError, decideRecovery, inspectPendingTransaction, scanPendingTransactions } from './recovery.mjs';
 import { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId } from './config-store.mjs';
 import { snapshotDigest } from './snapshot-store.mjs';
+import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
 const MAX_CONFIG_PROPOSAL_BYTES = 8 * 1024 * 1024;
+const MAX_MCP_PROPOSALS = 64;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DECIMAL_INTEGER_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 
@@ -115,6 +117,7 @@ function errorResponse(error) {
   if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
   if (error instanceof RecoveryError) return { status: ['SCAN_FAILED', 'MANIFEST_INVALID'].includes(error.code) ? 500 : 400, body: safe(error.code, error.message) };
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
+  if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -156,9 +159,13 @@ function publicConfigProposal(proposal) {
   return { action: proposal.action, config: { relativePath: proposal.config.relativePath, operation: proposal.config.operation, ...(proposal.config.operation === 'import' ? { contentHash: proposal.config.contentHash, contentBytes: proposal.config.contentBytes } : { backupId: proposal.config.backupId }) } };
 }
 
+function publicMcpProposal(proposal) {
+  return { action: proposal.action, server: proposal.server, ...(proposal.operation ? { operation: proposal.operation } : {}) };
+}
+
 function publicAuditEvent(event) {
   const safe = {};
-  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'code', 'state']) {
+  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'operation', 'status', 'code', 'state']) {
     if (typeof event?.[field] === 'string' && event[field].length <= 256) safe[field] = event[field];
   }
   if (Array.isArray(event?.files)) {
@@ -177,7 +184,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, eventBus, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, eventBus, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -186,12 +193,16 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const proposals = new Map();
   const configProposals = new Map();
   const configReservations = new Map();
+  const mcpProposals = new Map();
+  const mcpReservations = new Set();
+  const mcpRegistry = createMcpRegistry({ root });
   const effectiveAudit = audit ?? createLazyAuditLog(root);
   const proposalStore = createProposalStore({ root });
   const adapterConfig = adapter ? { ...adapter, command: adapter.command ?? 'openclaw' } : null;
   const agentRunner = runAgentFn ?? (adapterConfig ? createOpenClawAgentRunner(adapterConfig) : undefined);
   const inspect = inspectOpenClawFn ?? ((options) => inspectOpenClaw(options));
   const inspectMcp = inspectOpenClawMcpFn ?? ((options) => inspectOpenClawMcp(options));
+  const inspectMcpServer = inspectMcpServerFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
   const sessions = createChatSessionManager({ root, runAgentFn: agentRunner });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
@@ -210,6 +221,72 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
+      if (request.method === 'GET' && url.pathname === '/v1/mcp/servers') return json(response, 200, { servers: mcpRegistry.list() });
+      const mcpHealth = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/health$/);
+      if (request.method === 'GET' && mcpHealth) {
+        const serverRecord = mcpRegistry.get(mcpHealth[1]);
+        if (!serverRecord) return json(response, 404, { error: 'MCP_NOT_FOUND', message: 'MCP server not found' });
+        let result;
+        try { result = await inspectMcpServer({ server: serverRecord }); }
+        catch (error) { result = { status: 'error', code: error.code ?? 'MCP_HEALTH_FAILED' }; }
+        const health = { status: ['ready', 'unavailable', 'error', 'unknown'].includes(result?.status) ? result.status : 'error', ...(typeof result?.code === 'string' && result.code.length <= 128 ? { code: result.code } : {}) };
+        const updated = mcpRegistry.updateHealth(serverRecord.id, health);
+        if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.health.checked', actor: 'system', serverId: updated.id, status: health.status, code: health.code ?? null });
+        return json(response, 200, { server: { id: updated.id, name: updated.name, enabled: updated.enabled }, health });
+      }
+      if (request.method === 'POST' && url.pathname === '/v1/mcp/servers') {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new McpRegistryError('MCP_SESSION_REQUIRED', 'sessionId is required');
+        if (mcpProposals.size + mcpReservations.size >= MAX_MCP_PROPOSALS) throw new McpRegistryError('MCP_PROPOSAL_LIMIT', 'too many pending MCP proposals');
+        const serverConfig = normalizeMcpServer(input);
+        const action = transition(transition(createAction({ type: 'mcp.register', sessionId: input.sessionId, workspaceRevision: serverConfig.configHash, target: serverConfig.id, preview: serverConfig, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, server: serverConfig, operation: 'register' });
+        mcpReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, serverId: serverConfig.id, operation: 'register' }); }
+        catch (error) { mcpReservations.delete(action.id); throw error; }
+        mcpReservations.delete(action.id);
+        mcpProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicMcpProposal(proposal) });
+      }
+      const mcpAuthorize = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/authorize$/);
+      if (request.method === 'POST' && mcpAuthorize) {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new McpRegistryError('MCP_SESSION_REQUIRED', 'sessionId is required');
+        if (mcpProposals.size + mcpReservations.size >= MAX_MCP_PROPOSALS) throw new McpRegistryError('MCP_PROPOSAL_LIMIT', 'too many pending MCP proposals');
+        if (!Array.isArray(input.tools)) throw new McpRegistryError('MCP_TOOLS_INVALID', 'tools must be an array');
+        const serverConfig = mcpRegistry.get(mcpAuthorize[1]);
+        if (!serverConfig) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+        const nextTools = normalizeMcpServer({ ...serverConfig, tools: input.tools }).tools;
+        const preview = { serverId: serverConfig.id, expectedConfigHash: input.configHash, tools: nextTools };
+        const action = transition(transition(createAction({ type: 'mcp.authorize_tools', sessionId: input.sessionId, workspaceRevision: serverConfig.configHash, target: serverConfig.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, server: serverConfig, operation: 'authorize_tools', expectedConfigHash: input.configHash, tools: nextTools });
+        mcpReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, serverId: serverConfig.id, operation: 'authorize_tools' }); }
+        catch (error) { mcpReservations.delete(action.id); throw error; }
+        mcpReservations.delete(action.id);
+        mcpProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicMcpProposal(proposal) });
+      }
+      const mcpApproval = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/approve$/);
+      if (request.method === 'POST' && mcpApproval) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const proposal = mcpProposals.get(mcpApproval[1]);
+        if (!proposal) return json(response, 404, { error: 'MCP_PROPOSAL_NOT_FOUND', message: 'MCP proposal not found' });
+        const input = await bodyOf(request);
+        if (input.actionHash !== proposal.action.actionHash) throw new McpRegistryError('MCP_ACTION_HASH_MISMATCH', 'approval must bind the current MCP action hash');
+        const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
+        try {
+          const server = proposal.operation === 'register' ? mcpRegistry.register(proposal.server) : mcpRegistry.authorizeTools(proposal.server.id, proposal.tools, proposal.expectedConfigHash);
+          const verified = transition(transition(approved, 'executing'), 'verified');
+          mcpProposals.delete(proposal.action.id);
+          if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, serverId: server.id, operation: proposal.operation });
+          return json(response, 200, { action: verified, server });
+        } catch (error) {
+          mcpProposals.delete(proposal.action.id);
+          if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.failed', actor: 'system', actionId: proposal.action.id, sessionId: proposal.action.sessionId, actionHash: proposal.action.actionHash, serverId: proposal.server.id, operation: proposal.operation, code: error.code ?? 'MCP_FAILED' });
+          throw error;
+        }
+      }
       if (request.method === 'GET' && url.pathname === '/v1/config') return json(response, 200, { config: await readConfig({ root }) });
       if (request.method === 'POST' && (url.pathname === '/v1/config/import' || url.pathname === '/v1/config/rollback')) {
         const input = await bodyOf(request);

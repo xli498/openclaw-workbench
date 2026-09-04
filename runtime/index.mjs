@@ -12,6 +12,7 @@ export { EventBusError, createEventBus } from './event-bus.mjs';
 export { ProposalStoreError, createProposalStore } from './proposal-store.mjs';
 export { inspectOpenClaw } from './openclaw-adapter.mjs';
 export { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId } from './config-store.mjs';
+export { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {
   if (!root) throw new Error('root is required');
