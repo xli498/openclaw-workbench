@@ -182,7 +182,7 @@ export async function runControlledCommand({ root, argv, cwd, env, timeoutMs = D
     // guard does not kill the runner and strand its child during compilation.
     let timer;
     const scheduleTimeout = (delay) => { timer = setTimeout(() => { timedOut = true; kill(); finish(reject, new TerminalError('TIMEOUT', `command exceeded ${timeoutMs}ms`)); }, delay); };
-    scheduleTimeout(WINDOWS ? timeoutMs + 15_000 : timeoutMs);
+    scheduleTimeout(WINDOWS ? timeoutMs + 60_000 : timeoutMs);
     const collect = (target, chunk) => {
       outputBytes += chunk.byteLength;
       if (outputBytes > maxOutputBytes) { outputLimited = true; kill(); return target; }

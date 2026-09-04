@@ -64,7 +64,12 @@ test('Windows 运行器超时会回收目标命令创建的子进程', async (t)
   const pidFile = path.join(root, 'child.pid');
   const source = "const fs=require('fs'),{spawn}=require('child_process');const child=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{stdio:'ignore'});fs.writeFileSync(process.argv[1],String(child.pid));setTimeout(()=>{},10000)";
   await assert.rejects(() => runControlledCommand({ root, argv: [process.execPath, '-e', source, pidFile], approved: true, timeoutMs: 5_000 }), (error) => error.code === 'TIMEOUT');
-  const childPid = Number(await readFile(pidFile, 'utf8'));
+  let childPid;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try { childPid = Number(await readFile(pidFile, 'utf8')); break; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; await new Promise((resolve) => setTimeout(resolve, 250)); }
+  }
+  assert.ok(Number.isInteger(childPid) && childPid > 0, 'timed-out command did not publish its child PID');
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try { process.kill(childPid, 0); } catch (error) {
       assert.equal(error.code, 'ESRCH');
