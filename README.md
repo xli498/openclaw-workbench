@@ -94,7 +94,8 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 配置导入、备份、哈希冲突和回滚 | 已实现；仅限工作区 JSON，需独立审批 |
 | OpenClaw channel/Gateway 生命周期接入 | 未实现 |
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
-| MCP 管理、公网 Bridge | 未实现 |
+| MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具 |
+| 公网 Bridge | 未实现 |
 | 生产部署承诺 | 不承诺 |
 
 ## 安全边界
@@ -121,6 +122,12 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 该探针不认证到 OpenClaw、不读取或修改 OpenClaw 配置、不启动 Gateway、不调用模型、不修改工作区，也不返回 stderr、环境变量或凭据。
 
 `GET /v1/openclaw/mcp` 是同样已鉴权的只读 MCP 探针。它固定运行 `openclaw mcp status --json`，只返回 Server 数量、脱敏后的名称和状态，不返回原始配置、命令参数、环境变量或错误文本。`ready` 表示 CLI 成功返回可解析的 Server 状态；CLI 不存在、超时或返回非 JSON 时分别映射为 `CLI_NOT_FOUND`、`CLI_UNAVAILABLE` 或 `INVALID_RESPONSE`。该接口不会启动 MCP Server、调用工具或修改 MCP 注册表。
+
+## MCP 注册与授权
+
+`GET /v1/mcp/servers` 查看 Workbench 自己的本地注册表；`POST /v1/mcp/servers` 创建注册提案，必须使用独立 `x-approval-token` 调用 `/v1/mcp/servers/<actionId>/approve` 才会写入。注册记录只保存 Server 名称、transport、命令/端点、环境变量名称、工具 allowlist 和布尔权限；不会保存环境变量值、token 或 URL 用户密码。所有新 Server 默认 `enabled:false`。
+
+`POST /v1/mcp/servers/<serverId>/authorize` 以当前 `configHash` 创建工具授权提案，审批时再次校验哈希，防止并发修改覆盖授权。`GET /v1/mcp/servers/<serverId>/health` 只调用调用方显式注入的只读探针；默认返回 `NOT_CONFIGURED`，不会启动 MCP Server、建立 transport 或执行工具。真实 transport、进程生命周期和工具执行仍未开放。
 
 本地快照仅允许工作区内的普通文件，发现快照或快照目录为符号链接即拒绝恢复/写入；快照写入后固定为 `0600`，创建目录为 `0700`。这不是宿主机隔离的替代品。
 

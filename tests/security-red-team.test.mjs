@@ -118,3 +118,42 @@ test('红队攻击：并发配置提案 reservation 也受数量上限约束', a
     assert.equal(audits <= 32, true);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('红队攻击：MCP 注册拒绝命令注入、凭据 URL、环境值和工具路径越权', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-red-team-mcp-input-'));
+  const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL });
+  const address = await app.listen();
+  try {
+    for (const body of [
+      { sessionId: 'red-mcp', id: 'inject', transport: 'stdio', command: 'node;whoami' },
+      { sessionId: 'red-mcp', id: 'credential', transport: 'sse', endpoint: 'https://user:pass@example.test/mcp' },
+      { sessionId: 'red-mcp', id: 'env', transport: 'stdio', command: 'node', envKeys: ['API_KEY=secret'] },
+      { sessionId: 'red-mcp', id: 'tool', transport: 'stdio', command: 'node', tools: ['../read_file'] },
+    ]) {
+      const response = await request(address, '/v1/mcp/servers', { method: 'POST', body: JSON.stringify(body) });
+      assert.equal(response.status, 400, JSON.stringify(body));
+      const serialized = JSON.stringify(response.body);
+      assert.equal(serialized.includes('node;whoami'), false);
+      assert.equal(serialized.includes('https://user:pass@example.test/mcp'), false);
+      assert.equal(serialized.includes('API_KEY=secret'), false);
+    }
+    assert.deepEqual((await request(address, '/v1/mcp/servers')).body.servers, []);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('红队攻击：MCP 健康检查不会默认启动未授权 Server', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-red-team-mcp-exec-'));
+  const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL });
+  const address = await app.listen();
+  try {
+    const missing = await request(address, '/v1/mcp/servers/unknown/health');
+    assert.equal(missing.status, 404);
+    const proposal = await request(address, '/v1/mcp/servers', { method: 'POST', body: JSON.stringify({ sessionId: 'red-mcp', id: 'disabled', transport: 'stdio', command: 'node', tools: ['read_file'] }) });
+    await request(address, `/v1/mcp/servers/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    const health = await request(address, '/v1/mcp/servers/disabled/health');
+    assert.equal(health.status, 200);
+    assert.equal(health.body.health.status, 'unavailable');
+    assert.equal(health.body.health.code, 'NOT_CONFIGURED');
+    assert.equal((await request(address, '/v1/mcp/servers')).body.servers[0].enabled, false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
