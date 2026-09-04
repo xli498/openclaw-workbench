@@ -19,6 +19,7 @@ import { RecoveryError, decideRecovery, inspectPendingTransaction, scanPendingTr
 import { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId } from './config-store.mjs';
 import { snapshotDigest } from './snapshot-store.mjs';
 import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
+import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
@@ -118,6 +119,7 @@ function errorResponse(error) {
   if (error instanceof RecoveryError) return { status: ['SCAN_FAILED', 'MANIFEST_INVALID'].includes(error.code) ? 500 : 400, body: safe(error.code, error.message) };
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
+  if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -163,9 +165,13 @@ function publicMcpProposal(proposal) {
   return { action: proposal.action, server: proposal.server, ...(proposal.operation ? { operation: proposal.operation } : {}) };
 }
 
+function publicModelProposal(proposal) {
+  return { action: proposal.action, profile: proposal.profile };
+}
+
 function publicAuditEvent(event) {
   const safe = {};
-  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'operation', 'status', 'code', 'state']) {
+  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'profileId', 'operation', 'status', 'code', 'state']) {
     if (typeof event?.[field] === 'string' && event[field].length <= 256) safe[field] = event[field];
   }
   if (Array.isArray(event?.files)) {
@@ -184,7 +190,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, eventBus, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, eventBus, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -195,6 +201,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const configReservations = new Map();
   const mcpProposals = new Map();
   const mcpReservations = new Set();
+  const modelProposals = new Map();
+  const modelReservations = new Set();
+  const MAX_MODEL_PROPOSALS = 64;
+  const modelRegistry = createModelRegistry({ root });
   const mcpRegistry = createMcpRegistry({ root });
   const effectiveAudit = audit ?? createLazyAuditLog(root);
   const proposalStore = createProposalStore({ root });
@@ -203,6 +213,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const inspect = inspectOpenClawFn ?? ((options) => inspectOpenClaw(options));
   const inspectMcp = inspectOpenClawMcpFn ?? ((options) => inspectOpenClawMcp(options));
   const inspectMcpServer = inspectMcpServerFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
+  const inspectModelProfile = inspectModelProfileFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
   const sessions = createChatSessionManager({ root, runAgentFn: agentRunner });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
@@ -222,6 +233,37 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/mcp/servers') return json(response, 200, { servers: mcpRegistry.list() });
+      if (request.method === 'GET' && url.pathname === '/v1/models') return json(response, 200, { models: modelRegistry.list() });
+      const modelHealth = url.pathname.match(/^\/v1\/models\/([^/]+)\/health$/);
+      if (request.method === 'GET' && modelHealth) {
+        const profile = modelRegistry.get(modelHealth[1]);
+        if (!profile) return json(response, 404, { error: 'MODEL_NOT_FOUND', message: 'model profile not found' });
+        let result; try { result = await inspectModelProfile({ profile }); } catch (error) { result = { status: 'error', code: error.code ?? 'MODEL_HEALTH_FAILED' }; }
+        const health = { status: ['ready', 'unavailable', 'error', 'unknown'].includes(result?.status) ? result.status : 'error', ...(typeof result?.code === 'string' && result.code.length <= 128 ? { code: result.code } : {}) };
+        const updated = modelRegistry.updateHealth(profile.id, health);
+        if (effectiveAudit) await effectiveAudit.append({ type: 'model.health.checked', actor: 'system', profileId: updated.id, status: health.status, code: health.code ?? null });
+        return json(response, 200, { profile: { id: updated.id, provider: updated.provider, model: updated.model, enabled: updated.enabled }, health });
+      }
+      if (request.method === 'POST' && url.pathname === '/v1/models') {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new ModelRegistryError('MODEL_SESSION_REQUIRED', 'sessionId is required');
+        if (modelProposals.size + modelReservations.size >= MAX_MODEL_PROPOSALS) throw new ModelRegistryError('MODEL_PROPOSAL_LIMIT', 'too many pending model proposals');
+        const profile = normalizeModelProfile(input);
+        const action = transition(transition(createAction({ type: 'model.register', sessionId: input.sessionId, workspaceRevision: profile.configHash, target: profile.id, preview: profile, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, profile }); modelReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: profile.id }); } catch (error) { modelReservations.delete(action.id); throw error; }
+        modelReservations.delete(action.id); modelProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicModelProposal(proposal) });
+      }
+      const modelApproval = url.pathname.match(/^\/v1\/models\/([^/]+)\/approve$/);
+      if (request.method === 'POST' && modelApproval) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const proposal = modelProposals.get(modelApproval[1]); if (!proposal) return json(response, 404, { error: 'MODEL_PROPOSAL_NOT_FOUND', message: 'model proposal not found' });
+        const input = await bodyOf(request); if (input.actionHash !== proposal.action.actionHash) throw new ModelRegistryError('MODEL_ACTION_HASH_MISMATCH', 'approval must bind the current model action hash');
+        const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
+        try { const profile = modelRegistry.register(proposal.profile); const verified = transition(transition(approved, 'executing'), 'verified'); modelProposals.delete(proposal.action.id); if (effectiveAudit) await effectiveAudit.append({ type: 'model.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, profileId: profile.id }); return json(response, 200, { action: verified, profile }); }
+        catch (error) { modelProposals.delete(proposal.action.id); if (effectiveAudit) await effectiveAudit.append({ type: 'model.failed', actor: 'system', actionId: proposal.action.id, sessionId: proposal.action.sessionId, actionHash: proposal.action.actionHash, profileId: proposal.profile.id, code: error.code ?? 'MODEL_FAILED' }); throw error; }
+      }
       const mcpHealth = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/health$/);
       if (request.method === 'GET' && mcpHealth) {
         const serverRecord = mcpRegistry.get(mcpHealth[1]);

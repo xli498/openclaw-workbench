@@ -34,5 +34,5 @@ jobs:
           node-version: '22.19.0'
       - run: npm install --ignore-scripts --package-lock=false
       - name: Windows runtime compatibility
-        run: npm test -- --test-name-pattern="CLI|Windows|OpenClaw 诊断|MCP|配置|红队|终端执行需要|审批后执行命令|命令失败、超时和取消|控制面提供健康|审批请求不能用 currentRevision|工作区内容 revision|明确审批后完成 Patch"
+        run: npm test -- --test-name-pattern="CLI|Windows|OpenClaw 诊断|MCP|模型|配置|红队|终端执行需要|审批后执行命令|命令失败、超时和取消|控制面提供健康|审批请求不能用 currentRevision|工作区内容 revision|明确审批后完成 Patch"
       - run: git diff --check

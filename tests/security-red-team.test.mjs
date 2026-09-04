@@ -157,3 +157,23 @@ test('红队攻击：MCP 健康检查不会默认启动未授权 Server', async 
     assert.equal((await request(address, '/v1/mcp/servers')).body.servers[0].enabled, false);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('红队攻击：模型配置拒绝 SecretRef 值、凭据 endpoint 和协议注入', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-red-team-model-input-'));
+  const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL });
+  const address = await app.listen();
+  try {
+    for (const body of [
+      { sessionId: 'red-model', id: 'secret', provider: 'acme', protocol: 'openai-compatible', model: 'x', endpoint: 'https://api.example.test', secretRef: 'sk-live-secret' },
+      { sessionId: 'red-model', id: 'url', provider: 'acme', protocol: 'openai-compatible', model: 'x', endpoint: 'https://user:pass@example.test' , secretRef: 'env:KEY' },
+      { sessionId: 'red-model', id: 'query', provider: 'acme', protocol: 'openai-compatible', model: 'x', endpoint: 'https://example.test?clientsecret=secret', secretRef: 'env:KEY' },
+      { sessionId: 'red-model', id: 'protocol', provider: 'acme', protocol: 'javascript:alert(1)', model: 'x', endpoint: 'https://example.test', secretRef: 'env:KEY' },
+    ]) {
+      const response = await request(address, '/v1/models', { method: 'POST', body: JSON.stringify(body) });
+      assert.equal(response.status, 400);
+      assert.equal(JSON.stringify(response.body).includes('sk-live-secret'), false);
+      assert.equal(JSON.stringify(response.body).includes('user:pass'), false);
+    }
+    assert.deepEqual((await request(address, '/v1/models')).body.models, []);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
