@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rename, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, symlink, writeFile } from 'node:fs/promises';
 import { renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { openStableCwd, runControlledCommand } from '../runtime/terminal.mjs';
 
 async function fixture() { return mkdtemp(path.join(tmpdir(), 'ocw-terminal-')); }
@@ -16,7 +17,60 @@ test('终端执行需要明确审批，并使用工作区 cwd', async () => {
   assert.equal(result.stdout.trim(), root);
 });
 
-test('拒绝 shell 字符串、越界 cwd 和 cwd 逃逸符号链接', async () => {
+test('Windows 也能打开受控 cwd，不依赖 Linux procfs', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Windows-specific regression');
+  const root = await fixture();
+  const stable = await openStableCwd(root, '.');
+  assert.equal(stable.cwdReal, root);
+  assert.equal(stable.procPath, root);
+  assert.equal(typeof stable.handle.fd, 'number');
+  await stable.handle.close();
+});
+
+test('Windows 受控命令经目录锚定运行器启动，不把目标命令交给 shell', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Windows-specific regression');
+  const root = await fixture(); let seen;
+  const result = await runControlledCommand({
+    root, argv: [process.execPath, '--version'], approved: true,
+    __testHooks: { spawn: (command, args, options) => {
+      seen = { command, args, options };
+      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      queueMicrotask(() => { child.stdout.emit('data', Buffer.from('ok')); child.emit('close', 0); });
+      return child;
+    } },
+  });
+  assert.match(seen.command, /powershell\.exe$/i);
+  assert.equal(seen.options.shell, false);
+  const payload = seen.args[seen.args.indexOf('-Payload') + 1];
+  assert.deepEqual(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')), { root, cwd: '.', executable: process.execPath, argv: ['--version'], timeoutMs: 120_000 });
+  assert.equal(result.stdout, 'ok');
+});
+
+test('Windows 目录锚定运行器保留带空格的 argv 并在 cwd 内执行', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Windows-specific regression');
+  const root = await fixture();
+  const result = await runControlledCommand({
+    root,
+    argv: [process.execPath, '-e', 'console.log(process.cwd());console.log(process.argv[1])', 'argument with spaces'],
+    approved: true,
+    timeoutMs: 30_000,
+  });
+  assert.deepEqual(result.stdout.trim().split(/\r?\n/), [root, 'argument with spaces']);
+});
+
+test('Windows 运行器超时会回收目标命令创建的子进程', async (t) => {
+  if (process.platform !== 'win32') return t.skip('Windows-specific regression');
+  const root = await fixture();
+  const pidFile = path.join(root, 'child.pid');
+  const source = "const fs=require('fs'),{spawn}=require('child_process');const child=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{stdio:'ignore'});fs.writeFileSync(process.argv[1],String(child.pid));setTimeout(()=>{},10000)";
+  await assert.rejects(() => runControlledCommand({ root, argv: [process.execPath, '-e', source, pidFile], approved: true, timeoutMs: 1_000 }), (error) => error.code === 'TIMEOUT');
+  const childPid = Number(await readFile(pidFile, 'utf8'));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.throws(() => process.kill(childPid, 0), (error) => error.code === 'ESRCH');
+});
+
+test('拒绝 shell 字符串、越界 cwd 和 cwd 逃逸符号链接', async (t) => {
+  if (process.platform === 'win32') return t.skip('Windows symlink creation requires unavailable local privilege');
   const root = await fixture();
   const outside = await fixture();
   await symlink(outside, path.join(root, 'escape'));
@@ -25,7 +79,8 @@ test('拒绝 shell 字符串、越界 cwd 和 cwd 逃逸符号链接', async () 
   await assert.rejects(() => runControlledCommand({ root, argv: ['pwd'], cwd: 'escape', approved: true }), (error) => error.code === 'SYMLINK_ESCAPE');
 });
 
-test('稳定 cwd 句柄在目录改名后仍锚定原目录', async () => {
+test('稳定 cwd 句柄在目录改名后仍锚定原目录', async (t) => {
+  if (process.platform === 'win32') return t.skip('Windows uses the native directory-anchor runner instead of procfs');
   const root = await fixture();
   const original = path.join(root, 'work');
   const moved = path.join(root, 'moved');
@@ -46,7 +101,8 @@ test('稳定 cwd 句柄在目录改名后仍锚定原目录', async () => {
   } finally { await stable.handle.close(); }
 });
 
-test('受控命令在打开 cwd 后替换可见父路径，仍在原目录 inode 中执行', async () => {
+test('受控命令在打开 cwd 后替换可见父路径，仍在原目录 inode 中执行', async (t) => {
+  if (process.platform === 'win32') return t.skip('Windows symlink creation requires unavailable local privilege');
   const root = await fixture();
   const outside = await fixture();
   const work = path.join(root, 'work');

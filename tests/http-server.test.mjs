@@ -8,6 +8,8 @@ import { createWorkbenchServer } from '../runtime/http-server.mjs';
 import { controlPanelHtml } from '../runtime/control-panel.mjs';
 import { createEventBus } from '../runtime/event-bus.mjs';
 import { createHash } from 'node:crypto';
+import vm from 'node:vm';
+import { symlinkOrSkip } from './test-support.mjs';
 
 async function request(address, pathname, options = {}) {
   const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token-012345', ...(options.headers ?? {}) } });
@@ -68,7 +70,7 @@ test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感�
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-test('控制面 recovery 接口只读暴露恢复判定，并隔离无效清单', async () => {
+test('控制面 recovery 接口只读暴露恢复判定，并隔离无效清单', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-'));
   const transactionDir = path.join(root, '.openclaw-workbench', 'transactions');
   const snapshotDir = path.join(root, '.openclaw-workbench', 'snapshots');
@@ -89,7 +91,7 @@ test('控制面 recovery 接口只读暴露恢复判定，并隔离无效清单'
   }));
   await writeFile(path.join(transactionDir, 'broken.json'), '{not-json');
   const escapedSnapshot = path.join(snapshotDir, 'escaped-snapshot');
-  await symlink(externalSnapshot, escapedSnapshot);
+  if (!await symlinkOrSkip(t, externalSnapshot, escapedSnapshot)) return;
   await writeFile(path.join(transactionDir, 'inspection-failure.json'), JSON.stringify({
     transactionId: 'inspection-failure', state: 'committing', files: [{ relativePath: 'README.md', target, temp: path.join(root, '.openclaw-workbench', 'temp-after'), snapshot: escapedSnapshot, beforeHash: digest(before), afterHash: digest(after) }]
   }));
@@ -147,6 +149,97 @@ test('本地控制面提供健康检查、鉴权和命令提案审批执行', as
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('控制面暴露已鉴权的 OpenClaw 诊断且不泄露 stderr', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-diagnostics-'));
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    inspectOpenClawFn: async () => ({ status: 'unavailable', code: 'CLI_NOT_FOUND', command: 'openclaw' }),
+  });
+  const address = await app.listen();
+  try {
+    const result = await request(address, '/v1/openclaw/diagnostics');
+    assert.deepEqual(result.body, { status: 'unavailable', code: 'CLI_NOT_FOUND', command: 'openclaw' });
+    const unauthenticated = await fetch(`http://${address.address}:${address.port}/v1/openclaw/diagnostics`);
+    assert.equal(unauthenticated.status, 401);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面暴露已鉴权的只读 MCP 诊断摘要', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-mcp-diagnostics-'));
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    inspectOpenClawMcpFn: async ({ command }) => ({ status: 'ready', command, serverCount: 1, servers: [{ name: 'filesystem', status: 'healthy' }] }),
+  });
+  const address = await app.listen();
+  try {
+    const result = await request(address, '/v1/openclaw/mcp');
+    assert.deepEqual(result.body, { status: 'ready', command: 'openclaw', serverCount: 1, servers: [{ name: 'filesystem', status: 'healthy' }] });
+    const unauthenticated = await fetch(`http://${address.address}:${address.port}/v1/openclaw/mcp`);
+    assert.equal(unauthenticated.status, 401);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('OpenClaw 诊断与 Agent adapter 使用同一个配置命令', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-diagnostics-command-'));
+  let seen;
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    adapter: { command: 'custom-openclaw.cmd' },
+    inspectOpenClawFn: async (options) => { seen = options; return { status: 'unavailable', code: 'CLI_NOT_FOUND', command: options.command }; },
+  });
+  const address = await app.listen();
+  try {
+    const result = await request(address, '/v1/openclaw/diagnostics');
+    assert.deepEqual(seen, { command: 'custom-openclaw.cmd' });
+    assert.equal(result.body.command, 'custom-openclaw.cmd');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('审计接口只读返回脱敏事件并限制结果数量', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-audit-'));
+  const audit = { list: async () => [
+    { id: '1', timestamp: '2026-09-04T00:00:00.000Z', type: 'action.proposed', actor: 'user', sessionId: 's1', actionId: 'a1', actionHash: 'hash', files: ['README.md'], preview: 'Bearer secret-token', path: 'C:\\private\\secret' },
+    { id: '2', timestamp: '2026-09-04T00:01:00.000Z', type: 'action.verified', actor: 'system', actionId: 'a1' },
+  ] };
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', audit });
+  const address = await app.listen();
+  try {
+    const result = await request(address, '/v1/audit?limit=1');
+    assert.equal(result.status, 200);
+    assert.equal(result.body.events.length, 1);
+    assert.deepEqual(result.body.events[0], { id: '2', timestamp: '2026-09-04T00:01:00.000Z', type: 'action.verified', actor: 'system', actionId: 'a1' });
+    assert.equal(JSON.stringify(result.body).includes('secret-token'), false);
+    assert.equal(JSON.stringify(result.body).includes('private'), false);
+    const empty = await request(address, '/v1/audit?limit=0');
+    assert.deepEqual(empty.body.events, []);
+    const unauthorized = await fetch(`http://${address.address}:${address.port}/v1/audit`);
+    assert.equal(unauthorized.status, 401);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('未注入 audit 时服务默认持久化提案审计并可在重启后读取', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-default-audit-'));
+  const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const firstAddress = await first.listen();
+  const proposal = await request(firstAddress, '/v1/proposals/command', { method: 'POST', body: JSON.stringify({ sessionId: 'audit-session', argv: ['pwd'] }) });
+  assert.equal(proposal.status, 201);
+  const firstAudit = await request(firstAddress, '/v1/audit');
+  assert.equal(firstAudit.body.events.some((event) => event.type === 'command.proposed'), true);
+  await first.close();
+  const second = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const secondAddress = await second.listen();
+  try {
+    const restored = await request(secondAddress, '/v1/audit');
+    assert.equal(restored.body.events.some((event) => event.type === 'command.proposed'), true);
+  } finally { await second.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('关闭本地服务会终止 SSE 与进行中的 Agent 回合', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-close-'));
   let started;
@@ -169,6 +262,12 @@ test('控制面严格校验 CSP nonce 格式', () => {
   for (const nonce of ['short', 'ABCDEFGHIJKLMNOPQRSTUV==', 'ABCDEFGHIJKLMNOPQRSTUV!X', 'ABCDEFGHIJKLMNOPQRSTUVW=']) {
     assert.throws(() => controlPanelHtml(nonce), /nonce must be base64/);
   }
+});
+
+test('控制面生成的内联脚本可被浏览器解析', () => {
+  const html = controlPanelHtml('ABCDEFGHIJKLMNOPQRSTUVWX');
+  const script = html.match(/<script[^>]*>([\s\S]*)<\/script>/)?.[1];
+  assert.doesNotThrow(() => new vm.Script(script));
 });
 
 test('本地控制面提供带安全策略响应头的控制台页面', async () => {
@@ -196,6 +295,12 @@ test('本地控制面提供带安全策略响应头的控制台页面', async ()
     assert.match(html, /批准执行/);
     assert.match(html, /Workspace Inspector/);
     assert.match(html, /workspaceTree/);
+    assert.match(html, /openclawStatus/);
+    assert.match(html, /refreshOpenClaw/);
+    assert.match(html, /v1\/openclaw\/diagnostics/);
+    assert.match(html, /v1\/openclaw\/mcp/);
+    assert.match(html, /auditOutput/);
+    assert.match(html, /v1\/audit/);
     assert.match(html, /workspacePreview/);
     assert.match(html, /proposalStatus/);
     assert.match(html, /查看 Patch Diff/);
@@ -282,9 +387,9 @@ test('控制面拒绝无 token、弱 token 或非回环绑定，并要求独立�
 test('审批请求不能用 currentRevision 覆盖服务端工作区版本', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-revision-binding-'));
   await writeFile(path.join(root, 'tracked.txt'), 'before');
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['add', 'tracked.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
-  await new Promise((resolve, reject) => execFile('/usr/bin/git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['add', 'tracked.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
+  await new Promise((resolve, reject) => execFile('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
   const address = await app.listen();
   try {

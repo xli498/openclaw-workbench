@@ -10,7 +10,8 @@ import { scanCommandLedger } from './command-ledger.mjs';
 import { createWorkspace, WorkspaceError } from './workspace.mjs';
 import { controlPanelHtml } from './control-panel.mjs';
 import { transition } from './action.mjs';
-import { AdapterError, createOpenClawAgentRunner } from './openclaw-adapter.mjs';
+import { AdapterError, createOpenClawAgentRunner, inspectOpenClaw, inspectOpenClawMcp } from './openclaw-adapter.mjs';
+import { createFileAuditLog } from './audit.mjs';
 import { PlanError } from './plan.mjs';
 import { RecoveryError, decideRecovery, inspectPendingTransaction, scanPendingTransactions } from './recovery.mjs';
 
@@ -144,15 +145,40 @@ function publicProposal(proposal) {
   return { action: proposal.action, command: proposal.command, parsedPatch: proposal.parsedPatch, workspaceRevision: proposal.workspaceRevision, policy: proposal.policy, commandPolicy: proposal.commandPolicy };
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, eventBus = createEventBus({ root }), __testHooks } = {}) {
+function publicAuditEvent(event) {
+  const safe = {};
+  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'code', 'state']) {
+    if (typeof event?.[field] === 'string' && event[field].length <= 256) safe[field] = event[field];
+  }
+  if (Array.isArray(event?.files)) {
+    const files = event.files.filter((file) => typeof file === 'string' && file.length <= 512).slice(0, 128);
+    if (files.length) safe.files = files;
+  }
+  return safe;
+}
+
+function createLazyAuditLog(root) {
+  let ready;
+  const get = () => (ready ??= createFileAuditLog({ root, filePath: '.openclaw-workbench/audit.jsonl' }));
+  return Object.freeze({
+    append(event) { return get().then((log) => log.append(event)); },
+    list() { return get().then((log) => log.list()); },
+  });
+}
+
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, eventBus = createEventBus({ root }), __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   if (typeof token !== 'string' || token.length < 16) throw new Error('token must be at least 16 characters');
   if (!['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error('host must be loopback');
   const proposals = new Map();
+  const effectiveAudit = audit ?? createLazyAuditLog(root);
   const proposalStore = createProposalStore({ root });
-  const agentRunner = runAgentFn ?? (adapter ? createOpenClawAgentRunner(adapter) : undefined);
+  const adapterConfig = adapter ? { ...adapter, command: adapter.command ?? 'openclaw' } : null;
+  const agentRunner = runAgentFn ?? (adapterConfig ? createOpenClawAgentRunner(adapterConfig) : undefined);
+  const inspect = inspectOpenClawFn ?? ((options) => inspectOpenClaw(options));
+  const inspectMcp = inspectOpenClawMcpFn ?? ((options) => inspectOpenClawMcp(options));
   const sessions = createChatSessionManager({ root, runAgentFn: agentRunner });
-  const startupState = startWorkbench({ root, audit });
+  const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
   const liveStreams = new Set();
   const server = http.createServer(async (request, response) => {
@@ -167,6 +193,8 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         return response.end(controlPanelHtml(nonce));
       }
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
+      if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
+      if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
       await startupState;
       if (request.method === 'GET' && url.pathname === '/v1/events/stream') {
         const after = singleQueryInteger(url.searchParams, 'after', 0);
@@ -186,6 +214,11 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) }));
       if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
+      if (request.method === 'GET' && url.pathname === '/v1/audit') {
+        const records = typeof effectiveAudit?.list === 'function' ? await effectiveAudit.list() : [];
+        const limit = Math.min(500, singleQueryInteger(url.searchParams, 'limit', 100));
+        return json(response, 200, { events: (limit === 0 ? [] : records.slice(-limit)).map(publicAuditEvent) });
+      }
       if (request.method === 'GET' && url.pathname === '/v1/recovery') {
         const manifests = await scanPendingTransactions({ root, tolerateInvalid: true });
         const transactions = [];
@@ -249,7 +282,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'POST' && sessionTool) {
         const session = sessions.getSession(sessionTool[1]);
         const input = await bodyOf(request);
-        const proposal = await createCodeToolProposal({ mode: session.mode, tool: input.tool, input: { ...input.input, sessionId: session.id }, root, audit });
+        const proposal = await createCodeToolProposal({ mode: session.mode, tool: input.tool, input: { ...input.input, sessionId: session.id }, root, audit: effectiveAudit });
         proposals.set(proposal.action.id, proposal);
         proposalStore.put(proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: session.id, actionId: proposal.action.id, requestId, data: { tool: input.tool, actionType: proposal.action.type, status: proposal.action.status } });
@@ -265,7 +298,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'POST' && url.pathname === '/v1/proposals/patch') {
         const input = await bodyOf(request);
-        const proposal = await createPatchProposal({ ...input, root, audit, currentRevision: await currentWorkspaceRevision() });
+        const proposal = await createPatchProposal({ ...input, root, audit: effectiveAudit, currentRevision: await currentWorkspaceRevision() });
         proposals.set(proposal.action.id, proposal);
         proposalStore.put(proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
@@ -273,7 +306,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'POST' && url.pathname === '/v1/proposals/command') {
         const input = await bodyOf(request);
-        const proposal = await createCommandProposal({ ...input, root, audit, currentRevision: await currentWorkspaceRevision() });
+        const proposal = await createCommandProposal({ ...input, root, audit: effectiveAudit, currentRevision: await currentWorkspaceRevision() });
         proposals.set(proposal.action.id, proposal);
         proposalStore.put(proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
@@ -293,8 +326,8 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         try {
           await __testHooks?.onProposalClaimed?.(claim);
           const result = proposal.command
-            ? await approveAndRunCommand({ proposal: claim.proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision })
-            : await approveAndApplyPatch({ proposal: claim.proposal, root, approved: true, audit, getCurrentRevision: currentWorkspaceRevision });
+            ? await approveAndRunCommand({ proposal: claim.proposal, root, approved: true, audit: effectiveAudit, getCurrentRevision: currentWorkspaceRevision })
+            : await approveAndApplyPatch({ proposal: claim.proposal, root, approved: true, audit: effectiveAudit, getCurrentRevision: currentWorkspaceRevision });
           proposalStore.markTerminal(proposal.action.id, result.action, claim.claim.token);
           proposals.delete(proposal.action.id);
           eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
@@ -323,7 +356,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         proposals.delete(proposal.action.id);
         const verb = reject[2] === 'deny' ? 'denied' : 'cancelled';
         eventBus.publish({ type: `proposal.${verb}`, sessionId: action.sessionId, actionId: action.id, requestId, data: { actionType: action.type, status: action.status } });
-        if (audit) await audit.append({ type: `action.${verb}`, actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash });
+        if (effectiveAudit) await effectiveAudit.append({ type: `action.${verb}`, actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash });
         return json(response, 200, { proposal: publicProposal(record.proposal) });
       }
       const proposalDiff = url.pathname.match(/^\/v1\/proposals\/([^/]+)\/diff$/);

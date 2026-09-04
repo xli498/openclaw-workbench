@@ -142,7 +142,7 @@ test('恢复扫描拒绝 transactions 目录符号链接', async () => {
   const stateRoot = path.join(root, '.openclaw-workbench');
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-transactions-outside-'));
   await mkdir(stateRoot, { recursive: true });
-  await symlink(outside, path.join(stateRoot, 'transactions'));
+  try { await symlink(outside, path.join(stateRoot, 'transactions')); } catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') return; throw error; }
   await assert.rejects(() => scanPendingTransactions({ root }), (error) => error.code === 'SCAN_FAILED');
 });
 
@@ -157,7 +157,7 @@ test('事务存储目录是符号链接时拒绝写入', async () => {
   const workbench = path.join(root, '.openclaw-workbench');
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-storage-outside-'));
   await mkdir(workbench, { recursive: true });
-  await symlink(outside, path.join(workbench, 'transactions'));
+  try { await symlink(outside, path.join(workbench, 'transactions')); } catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') return; throw error; }
   await assert.rejects(() => applyPatchTransaction({ root, parsedPatch: parsed, declaredPaths: ['a.txt'] }), (e) => e.code === 'STORAGE_PATH_CHANGED');
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n');
   assert.equal((await (await import('node:fs/promises')).readdir(outside)).length, 0);
@@ -169,7 +169,7 @@ test('快照存储目录是符号链接时拒绝写入', async () => {
   const workbench = path.join(root, '.openclaw-workbench');
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-snapshot-outside-'));
   await mkdir(workbench, { recursive: true });
-  await symlink(outside, path.join(workbench, 'snapshots'));
+  try { await symlink(outside, path.join(workbench, 'snapshots')); } catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') return; throw error; }
   await assert.rejects(() => applyPatchTransaction({ root, parsedPatch: parsed, declaredPaths: ['a.txt'] }), (e) => e.code === 'STORAGE_PATH_CHANGED');
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n');
   assert.equal((await (await import('node:fs/promises')).readdir(outside)).length, 0);
@@ -184,7 +184,7 @@ test('检查恢复材料时拒绝符号链接逃逸', async () => {
   const root = await fixture();
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-outside-'));
   const link = path.join(root, 'escape');
-  await symlink(outside, link);
+  try { await symlink(outside, link); } catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') return; throw error; }
   const manifest = { transactionId: 'tx-escape', state: 'committing', files: [{ relativePath: 'escape/a.txt', target: path.join(link, 'a.txt'), snapshot: path.join(root, 'snap'), beforeHash: 'bad', afterHash: 'bad' }] };
   await assert.rejects(() => inspectPendingTransaction({ root, manifest }), (e) => e.code === 'RECOVERY_PATH_ESCAPE');
 });
@@ -460,7 +460,7 @@ test('recovery 替换期间可见父目录被替换时仍写入原目录 inode',
   }] };
   const fsRename = (await import('node:fs/promises')).rename;
   let swapped = false;
-  const result = await executeRecovery({
+  const recovery = () => executeRecovery({
     root, manifest, mode: 'resume', approved: true, updateManifest: testManifestWriter,
     renameFile: async (...args) => {
       if (!swapped) {
@@ -471,6 +471,13 @@ test('recovery 替换期间可见父目录被替换时仍写入原目录 inode',
       return fsRename(...args);
     },
   });
+  if (process.platform === 'win32') {
+    await assert.rejects(recovery, (error) => error.code === 'RECOVERY_APPLY_FAILED');
+    assert.equal(swapped, true);
+    assert.equal(await readFile(target, 'utf8'), 'one\\ntwo\\n');
+    return;
+  }
+  const result = await recovery();
   assert.equal(result.state, 'committed');
   assert.equal(await readFile(path.join(stableDir, 'a.txt'), 'utf8'), 'one\\nTWO\\n');
   assert.equal(await readFile(path.join(visibleDir, 'a.txt'), 'utf8'), 'outside\\n');
@@ -694,7 +701,7 @@ test('补丁事务拒绝符号链接目标，防止读取工作区外内容', as
   const outside = path.join(tmpdir(), `ocw-outside-${Date.now()}.txt`);
   await writeFile(outside, 'outside\n');
   await (await import('node:fs/promises')).unlink(target);
-  await symlink(outside, target);
+  try { await symlink(outside, target); } catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') return; throw error; }
   const patch = parseUnifiedPatch('--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-outside\n+two\n');
   await assert.rejects(() => applyPatchTransaction({ root, parsedPatch: patch, declaredPaths: ['a.txt'] }), (error) => error.code === 'SYMLINK_TARGET' || error.code === 'TARGET_UNAVAILABLE');
   await (await import('node:fs/promises')).unlink(outside);

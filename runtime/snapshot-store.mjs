@@ -1,6 +1,8 @@
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, relative, resolve, sep } from 'node:path';
+import process from 'node:process';
+import { openWindowsPathLock, runWindowsFileOperationSync } from './windows-path-lock.mjs';
 
 const DEFAULT_STALE_LOCK_MS = 5 * 60_000;
 const DIR_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
@@ -13,6 +15,14 @@ function inside(root, target) {
 function openAnchoredDirectory(pathname, ErrorType, code, message) {
   let fd;
   try {
+    if (process.platform === 'win32') {
+      const info = lstatSync(pathname);
+      if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('not a directory');
+      const fd = openSync(pathname, fsConstants.O_RDONLY);
+      const opened = fstatSync(fd);
+      if (!opened.isDirectory()) throw new Error('not a directory');
+      return Object.freeze({ fd, path: realpathSync(pathname), stat: opened });
+    }
     fd = openSync(pathname, DIR_FLAGS);
     const procPath = `/proc/self/fd/${fd}`;
     // /proc/self/fd is required: all follow-up names are resolved from this inode,
@@ -26,7 +36,7 @@ function openAnchoredDirectory(pathname, ErrorType, code, message) {
   }
 }
 
-function closeDirectory(directory) { if (directory) closeSync(directory.fd); }
+function closeDirectory(directory) { if (directory?.fd !== undefined && directory.fd !== null) closeSync(directory.fd); }
 
 function entry(parent, name) { return resolve(parent.path, name); }
 function sameIdentity(left, right) { return left && right && left.dev === right.dev && left.ino === right.ino; }
@@ -127,12 +137,29 @@ export function assertSafeSnapshotPath({ root, storePath, ErrorType, code, messa
 
 export function snapshotDigest(content) { return createHash('sha256').update(content).digest('hex'); }
 
-export function readSnapshot({ root, storePath, ErrorType, code, message, __testHooks } = {}) {
+export function readSnapshot({ root, storePath, ErrorType, code, message, __testHooks, __windowsAnchored = false } = {}) {
   assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
+  if (process.platform === 'win32' && !__windowsAnchored && __testHooks) {
+    const target = resolve(storePath); const parentPath = dirname(target); const realRoot = realpathSync(resolve(root));
+    let expectedParent;
+    try { expectedParent = realpathSync(parentPath); } catch { return Object.freeze({ content: null, digest: null }); }
+    let lock;
+    try {
+      lock = openWindowsPathLock({ root: realRoot, parent: parentPath, target, expectedParent });
+      return readSnapshot({ root, storePath, ErrorType, code, message, __testHooks, __windowsAnchored: true });
+    } catch (error) { throw error instanceof ErrorType ? error : new ErrorType(code, message); }
+    finally { lock?.close(); }
+  }
   const parent = openExistingAnchoredParent(root, storePath, ErrorType, code, message);
   if (!parent) return Object.freeze({ content: null, digest: null });
   try {
     __testHooks?.onParentOpened?.({ parentPath: parent.path, storePath });
+    if (process.platform === 'win32') {
+      if (!lstatSync(storePath, { throwIfNoEntry: false })) return Object.freeze({ content: null, digest: null });
+      const encoded = runWindowsFileOperationSync({ operation: 'read', root: realpathSync(resolve(root)), parent: dirname(resolve(storePath)), target: resolve(storePath), expectedParent: realpathSync(dirname(resolve(storePath))) });
+      const content = Buffer.from(encoded, 'base64').toString('utf8');
+      return Object.freeze({ content, digest: snapshotDigest(content) });
+    }
     const file = readAnchoredRegularFile(parent, basename(storePath));
     if (!file) return Object.freeze({ content: null, digest: null });
     return Object.freeze({ content: file.content, digest: snapshotDigest(file.content) });
@@ -159,8 +186,23 @@ function openOrCreateAnchoredParent({ root, storePath, ErrorType, code, message 
   } catch (error) { closeDirectory(current); throw error instanceof ErrorType ? error : new ErrorType(code, message); }
 }
 
-export function writeSnapshotAtomically({ root, storePath, payload, expectedDigest, ErrorType, code, message, busyCode, busyMessage, conflictCode, conflictMessage, temporaryName, staleLockMs = DEFAULT_STALE_LOCK_MS, now = Date.now(), __testHooks } = {}) {
+export function writeSnapshotAtomically({ root, storePath, payload, expectedDigest, ErrorType, code, message, busyCode, busyMessage, conflictCode, conflictMessage, temporaryName, staleLockMs = DEFAULT_STALE_LOCK_MS, now = Date.now(), __testHooks, __windowsAnchored = false } = {}) {
   assertSafeSnapshotPath({ root, storePath, ErrorType, code, message });
+  if (process.platform === 'win32' && !__windowsAnchored && __testHooks) {
+    const target = resolve(storePath); const parentPath = dirname(target); const realRoot = realpathSync(resolve(root));
+    try { mkdirSync(parentPath, { recursive: true }); } catch { throw new ErrorType(code, message); }
+    let expectedParent;
+    try { expectedParent = realpathSync(parentPath); } catch { throw new ErrorType(code, message); }
+    let lock;
+    try {
+      lock = openWindowsPathLock({ root: realRoot, parent: parentPath, target, expectedParent });
+      return writeSnapshotAtomically({ root, storePath, payload, expectedDigest, ErrorType, code, message, busyCode, busyMessage, conflictCode, conflictMessage, temporaryName, staleLockMs, now, __testHooks, __windowsAnchored: true });
+    } catch (error) { throw error instanceof ErrorType ? error : new ErrorType(code, message); }
+    finally { lock?.close(); }
+  }
+  if (process.platform === 'win32' && !__windowsAnchored) {
+    try { mkdirSync(dirname(resolve(storePath)), { recursive: true }); } catch { throw new ErrorType(code, message); }
+  }
   const parent = openOrCreateAnchoredParent({ root, storePath, ErrorType, code, message });
   const targetName = basename(storePath);
   const lockName = `${targetName}.lock`;
@@ -187,9 +229,16 @@ export function writeSnapshotAtomically({ root, storePath, payload, expectedDige
     }
     catch (error) { if (error?.code === 'ENOENT') current = { digest: null }; else throw new ErrorType(code, message); }
     if (current.digest !== expectedDigest) throw new ErrorType(conflictCode, conflictMessage);
-    writeFileSync(resolve(parent.path, temporary), payload, { mode: 0o600, flag: 'wx' });
-    renameSync(resolve(parent.path, temporary), resolve(parent.path, targetName));
-    temporary = null;
+    if (process.platform === 'win32') {
+      runWindowsFileOperationSync({
+        operation: 'write', root: realpathSync(resolve(root)), parent: dirname(resolve(storePath)), target: resolve(storePath), expectedParent: realpathSync(dirname(resolve(storePath))),
+        expectedTargetHash: expectedDigest ?? undefined, contentBase64: Buffer.from(payload).toString('base64'), replaceIfExists: current.digest !== null, expectTargetMissing: current.digest === null,
+      });
+    } else {
+      writeFileSync(resolve(parent.path, temporary), payload, { mode: 0o600, flag: 'wx' });
+      renameSync(resolve(parent.path, temporary), resolve(parent.path, targetName));
+      temporary = null;
+    }
     return snapshotDigest(payload);
   } catch (error) {
     primaryError = error;

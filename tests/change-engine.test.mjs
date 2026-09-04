@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { applyTextChange, ChangeError, rollbackTextChange } from '../runtime/change-engine.mjs';
 import { createHash } from 'node:crypto';
+import { symlinkOrSkip } from './test-support.mjs';
 
 const hash = (s) => createHash('sha256').update(s).digest('hex');
 
@@ -29,11 +30,11 @@ test('hash 不匹配时拒绝写入且不生成快照', async () => {
   assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'old\n');
 });
 
-test('拒绝写入逃逸的符号链接', async () => {
+test('拒绝写入逃逸的符号链接', async (t) => {
   const root = await fixture();
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-change-outside-'));
   await writeFile(path.join(outside, 'x.txt'), 'outside\n');
-  await symlink(path.join(outside, 'x.txt'), path.join(root, 'link.txt'));
+  if (!await symlinkOrSkip(t, path.join(outside, 'x.txt'), path.join(root, 'link.txt'))) return;
   await assert.rejects(() => applyTextChange({ root, relativePath: 'link.txt', expectedHash: hash('outside\n'), nextContent: 'bad' }), (e) => e.code === 'SYMLINK_ESCAPE');
 });
 
@@ -48,13 +49,13 @@ test('拒绝工作区外的 snapshot 目录', async () => {
   await assert.rejects(() => applyTextChange({ root, relativePath: 'a.txt', expectedHash: hash('old\n'), nextContent: 'new\n', snapshotDir: outside }), (e) => e.code === 'PATH_ESCAPE');
 });
 
-test('回滚拒绝工作区外 snapshot 和逃逸符号链接', async () => {
+test('回滚拒绝工作区外 snapshot 和逃逸符号链接', async (t) => {
   const root = await fixture();
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-change-outside-'));
   const snapshot = path.join(outside, 'snapshot');
   await writeFile(snapshot, 'old\n');
   await assert.rejects(() => rollbackTextChange({ root, relativePath: 'a.txt', snapshot }), (e) => e.code === 'PATH_ESCAPE');
   const link = path.join(root, 'snapshot-link');
-  await symlink(snapshot, link);
+  if (!await symlinkOrSkip(t, snapshot, link)) return;
   await assert.rejects(() => rollbackTextChange({ root, relativePath: 'a.txt', snapshot: link }), (e) => e.code === 'SYMLINK_ESCAPE');
 });

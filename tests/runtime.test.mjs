@@ -8,6 +8,7 @@ import { actionHash, assertWorkspaceRevision, createAction, transition } from '.
 import { createAuditLog, createFileAuditLog, verifyAuditChain } from '../runtime/audit.mjs';
 import { AdapterError, buildAgentArgv, parseAgentJson, runAgent } from '../runtime/openclaw-adapter.mjs';
 import { createEventBus } from '../runtime/event-bus.mjs';
+import { symlinkOrSkip } from './test-support.mjs';
 
 test('Adapter 使用 argv 参数，不启用 shell，并要求明确会话目标', () => {
   const argv = buildAgentArgv({ message: '只输出状态', sessionKey: 'workbench-test', thinking: 'minimal', local: true });
@@ -139,11 +140,11 @@ test('文件审计日志可接管已过期且进程不存在的锁', async () =>
   assert.equal(verifyAuditChain(records), true);
 });
 
-test('文件审计日志拒绝路径逃逸和已存在的符号链接', async () => {
+test('文件审计日志拒绝路径逃逸和已存在的符号链接', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-audit-safe-'));
   await assert.rejects(() => createFileAuditLog({ root, filePath: '../outside.jsonl' }), /audit_invalid_path/);
   const outside = path.join(root, 'outside.jsonl');
   await writeFile(outside, '');
-  await symlink(outside, path.join(root, 'audit-link.jsonl'));
+  if (!await symlinkOrSkip(t, outside, path.join(root, 'audit-link.jsonl'))) return;
   await assert.rejects(() => createFileAuditLog({ root, filePath: 'audit-link.jsonl' }), /audit_path_escape/);
 });

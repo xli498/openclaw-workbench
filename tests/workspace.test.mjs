@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWorkspace } from '../runtime/workspace.mjs';
+import { symlinkOrSkip } from './test-support.mjs';
 
 async function fixture() {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-'));
@@ -27,11 +28,11 @@ test('拦截绝对路径、路径穿越和敏感文件', async () => {
   await assert.rejects(() => ws.read('.env'), (e) => e.code === 'SENSITIVE_PATH');
 });
 
-test('拦截符号链接逃逸', async () => {
+test('拦截符号链接逃逸', async (t) => {
   const root = await fixture();
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-outside-'));
   await writeFile(path.join(outside, 'secret.txt'), 'outside');
-  await symlink(path.join(outside, 'secret.txt'), path.join(root, 'link.txt'));
+  if (!await symlinkOrSkip(t, path.join(outside, 'secret.txt'), path.join(root, 'link.txt'))) return;
   const ws = await createWorkspace(root);
   await assert.rejects(() => ws.read('link.txt'), (e) => e.code === 'SYMLINK_ESCAPE');
 });
@@ -63,18 +64,18 @@ test('非 Git 工作区 revision 绑定普通内容变化并忽略内部状态�
   assert.equal(await ws.workspaceRevision(), changed);
 });
 
-test('非 Git 工作区 revision 拒绝指向工作区外的符号链接', async () => {
+test('非 Git 工作区 revision 拒绝指向工作区外的符号链接', async (t) => {
   const root = await fixture();
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-revision-outside-'));
   await writeFile(path.join(outside, 'secret.txt'), 'outside');
-  await symlink(path.join(outside, 'secret.txt'), path.join(root, 'escape.txt'));
+  if (!await symlinkOrSkip(t, path.join(outside, 'secret.txt'), path.join(root, 'escape.txt'))) return;
   const ws = await createWorkspace(root);
   await assert.rejects(() => ws.workspaceRevision(), (error) => error.code === 'SYMLINK_ESCAPE');
 });
 
-test('非 Git 工作区 revision 拒绝经别名读取敏感文件', async () => {
+test('非 Git 工作区 revision 拒绝经别名读取敏感文件', async (t) => {
   const root = await fixture();
-  await symlink(path.join(root, '.env'), path.join(root, 'innocent.txt'));
+  if (!await symlinkOrSkip(t, path.join(root, '.env'), path.join(root, 'innocent.txt'))) return;
   const ws = await createWorkspace(root);
   await assert.rejects(() => ws.workspaceRevision(), (error) => error.code === 'SENSITIVE_PATH');
 });
@@ -105,9 +106,9 @@ test('工作区内容 revision 识别修改、新增和删除', async () => {
   assert.notEqual(deleted, added);
 });
 
-test('Git 工作区 revision 拒绝经已跟踪别名读取敏感文件', async () => {
+test('Git 工作区 revision 拒绝经已跟踪别名读取敏感文件', async (t) => {
   const root = await fixture();
-  await symlink(path.join(root, '.env'), path.join(root, 'alias.txt'));
+  if (!await symlinkOrSkip(t, path.join(root, '.env'), path.join(root, 'alias.txt'))) return;
   await new Promise((resolve, reject) => execFile('git', ['init'], { cwd: root }, (error) => error ? reject(error) : resolve()));
   await new Promise((resolve, reject) => execFile('git', ['add', 'alias.txt'], { cwd: root }, (error) => error ? reject(error) : resolve()));
   await new Promise((resolve, reject) => execFile('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'alias'], { cwd: root }, (error) => error ? reject(error) : resolve()));
