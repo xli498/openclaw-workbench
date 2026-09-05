@@ -4,6 +4,9 @@ import { StringDecoder } from 'node:string_decoder';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
+const SHELL_PATTERN = /[;&|<>`$()\r\n]/;
+const SECRET_PATTERN = /(?:bearer|token|password|secret|api[_ -]?key)\s*[:=]|:\/\/[^/\s:]+:[^@\s]+@/i;
+const SECRET_FLAG_PATTERN = /(?:^|\s)(?:--?|\/)(?:token|password|secret|api[-_ ]?key)(?:\s|=|$)/i;
 
 export class McpTransportError extends Error {
   constructor(code, message, details = {}) {
@@ -19,10 +22,17 @@ function validateString(value, code, label, max = 512) {
   return value;
 }
 
+function validateExecutablePart(value, code, label) {
+  validateString(value, code, label);
+  if (SHELL_PATTERN.test(value) || SECRET_PATTERN.test(value) || SECRET_FLAG_PATTERN.test(value)) {
+    throw new McpTransportError(code, `${label} contains unsafe shell or credential material`);
+  }
+}
+
 function validateOptions({ command, args = [], requestTimeoutMs, maxFrameBytes }) {
-  validateString(command, 'MCP_COMMAND_INVALID', 'command');
+  validateExecutablePart(command, 'MCP_COMMAND_INVALID', 'command');
   if (!Array.isArray(args) || args.length > 64) throw new McpTransportError('MCP_ARGS_INVALID', 'args are invalid');
-  for (const arg of args) validateString(arg, 'MCP_ARGS_INVALID', 'arg');
+  for (const arg of args) validateExecutablePart(arg, 'MCP_ARGS_INVALID', 'arg');
   for (const [name, value] of [['requestTimeoutMs', requestTimeoutMs], ['maxFrameBytes', maxFrameBytes]]) {
     if (!Number.isSafeInteger(value) || value < 1) throw new McpTransportError('MCP_CONFIG_INVALID', `${name} must be a positive safe integer`);
   }

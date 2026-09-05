@@ -50,6 +50,12 @@ test('MCP stdio transport starts explicitly with shell disabled', async () => {
   await transport.close();
 });
 
+test('MCP stdio transport rejects shell-danger characters in command and args', () => {
+  assert.throws(() => createMcpStdioTransport({ command: 'node;whoami' }), (error) => error.code === 'MCP_COMMAND_INVALID');
+  assert.throws(() => createMcpStdioTransport({ command: 'node', args: ['server.mjs|whoami'] }), (error) => error.code === 'MCP_ARGS_INVALID');
+  assert.doesNotThrow(() => createMcpStdioTransport({ command: process.execPath, args: ['server.mjs'] }));
+});
+
 test('MCP stdio transport correlates JSON-RPC responses by id', async () => {
   const { child, transport } = harness();
   await transport.start();

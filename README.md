@@ -128,7 +128,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 `GET /v1/mcp/servers` 查看 Workbench 自己的本地注册表；`POST /v1/mcp/servers` 创建注册提案，必须使用独立 `x-approval-token` 调用 `/v1/mcp/servers/<actionId>/approve` 才会写入。注册记录只保存 Server 名称、transport、命令/端点、环境变量名称、工具 allowlist 和布尔权限；不会保存环境变量值、token 或 URL 用户密码。所有新 Server 默认 `enabled:false`。
 
-`POST /v1/mcp/servers/<serverId>/authorize` 以当前 `configHash` 创建工具授权提案，审批时再次校验哈希，防止并发修改覆盖授权。`GET /v1/mcp/servers/<serverId>/health` 只调用调用方显式注入的只读探针；默认返回 `NOT_CONFIGURED`。`createMcpStdioTransport` 提供显式启动的 `shell:false` stdio JSON-RPC 传输边界，支持请求关联、超时、取消、关闭清理和帧大小门禁；它不读取 SecretRef、不自动重启，也不替代审批、allowlist 或工具编排。SSE/streamable HTTP transport、OpenClaw 私有协议和工具执行仍未开放。
+`POST /v1/mcp/servers/<serverId>/authorize` 以当前 `configHash` 创建工具授权提案，审批时再次校验哈希，防止并发修改覆盖授权。`GET /v1/mcp/servers/<serverId>/health` 只调用调用方显式注入的只读探针；默认返回 `NOT_CONFIGURED`。`createMcpStdioTransport` 提供显式启动的 `shell:false` stdio JSON-RPC 传输边界，command/args 同样拒绝 shell 元字符、凭据标签和 URL userinfo，支持请求关联、超时、取消、关闭清理和帧大小门禁；它不读取 SecretRef、不自动重启，也不替代审批、allowlist 或工具编排。SSE/streamable HTTP transport、OpenClaw 私有协议和工具执行仍未开放。
 
 ## 模型档案与连接测试
 
