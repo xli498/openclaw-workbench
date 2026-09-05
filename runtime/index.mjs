@@ -14,6 +14,7 @@ export { inspectOpenClaw } from './openclaw-adapter.mjs';
 export { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId } from './config-store.mjs';
 export { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
 export { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
+export { GatewayAdapterError, createGatewayAdapter } from './gateway-adapter.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {
   if (!root) throw new Error('root is required');

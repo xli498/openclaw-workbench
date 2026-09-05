@@ -76,7 +76,7 @@ Chat 会话接口遵循 ShunCode 的 Ask / Plan / Code 三模式：`POST /v1/ses
 
 Plan 会话支持 `POST /v1/sessions/:id/plan` 的多模型只读复核；传入 `debate: true` 时执行四阶段 `proposal → challenge → response → judge`，可用 `judgeModel` 指定裁判模型。结果通过 `rounds.proposals`、`rounds.critiques`、`rounds.responses`、`rounds.verdict` 返回，并保留失败信息和人工复核语义；Plan 不会创建 Patch、运行 Terminal 或自动执行建议。
 
-事件可通过只读 `GET /v1/events` 轮询，或通过 Bearer 鉴权的 `GET /v1/events/stream?after=<sequence>` 使用 SSE 接收历史事件和后续事件（含 keep-alive）；事件流不是审批或执行入口。当前未实现 Gateway WebSocket Adapter 或 WebSocket 控制面。
+事件可通过只读 `GET /v1/events` 轮询，或通过 Bearer 鉴权的 `GET /v1/events/stream?after=<sequence>` 使用 SSE 接收历史事件和后续事件（含 keep-alive）；事件流不是审批或执行入口。`createGatewayAdapter` 只提供显式调用的回环 WebSocket 传输边界，固定禁止公网地址，不自动连接、启动 Gateway、读取密钥或执行 MCP 工具；OpenClaw 私有协议、channel 生命周期、WebSocket 控制面和公网 Bridge 仍未实现。
 
 Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前已有本地 Web 控制台，但仍不包含桌面壳、MCP 管理、OpenClaw channel/Gateway 生命周期接入和公网 Bridge。
 
@@ -93,7 +93,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 审计哈希链与并发追加锁 | 已实现 |
 | 配置导入、备份、哈希冲突和回滚 | 已实现；仅限工作区 JSON，需独立审批 |
 | 模型档案、SecretRef 引用和连接测试 | 已实现受控元数据骨架；默认禁用，不解析密钥或联网 |
-| OpenClaw channel/Gateway 生命周期接入 | 未实现 |
+| Gateway WebSocket 传输边界 | 已实现回环连接/请求关联/超时取消；未实现 OpenClaw 协议和生命周期 |
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
 | MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具 |
 | 公网 Bridge | 未实现 |
