@@ -89,3 +89,54 @@ test('MCP 工具授权必须审批并绑定当前配置哈希', async () => {
     assert.deepEqual(approved.body.server.tools, ['read_file']);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('MCP 启用和停用必须单独审批并绑定 configHash', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-enable-http-'));
+  const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/mcp/servers', { method: 'POST', body: JSON.stringify(input({ id: 'toggle' })) });
+    await request(address, `/v1/mcp/servers/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    const current = (await request(address, '/v1/mcp/servers')).body.servers[0];
+    const proposal = await request(address, '/v1/mcp/servers/toggle/enable', { method: 'POST', body: JSON.stringify({ sessionId: 'mcp-session', configHash: current.configHash }) });
+    assert.equal(proposal.status, 201);
+    assert.equal((await request(address, '/v1/mcp/servers')).body.servers[0].enabled, false);
+    const bad = await request(address, `/v1/mcp/servers/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: '0'.repeat(64) }) });
+    assert.equal(bad.status, 409);
+    const approved = await request(address, `/v1/mcp/servers/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 200);
+    assert.equal(approved.body.server.enabled, true);
+    const disabled = await request(address, '/v1/mcp/servers/toggle/disable', { method: 'POST', body: JSON.stringify({ sessionId: 'mcp-session', configHash: approved.body.server.configHash }) });
+    assert.equal(disabled.status, 201);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('红队攻击：MCP 启用不能用控制 token、旧 hash 或重复审批绕过', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-enable-red-team-'));
+  const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/mcp/servers', { method: 'POST', body: JSON.stringify(input({ id: 'red-toggle' })) });
+    await request(address, `/v1/mcp/servers/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    const current = (await request(address, '/v1/mcp/servers')).body.servers[0];
+    const proposal = await request(address, '/v1/mcp/servers/red-toggle/enable', { method: 'POST', body: JSON.stringify({ sessionId: 'mcp-session', configHash: current.configHash }) });
+    const swapped = await request(address, `/v1/mcp/servers/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': TOKEN }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    assert.equal(swapped.status, 403);
+    const tampered = await request(address, `/v1/mcp/servers/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: '0'.repeat(64) }) });
+    assert.equal(tampered.status, 409);
+    const changed = await request(address, '/v1/mcp/servers/red-toggle/authorize', { method: 'POST', body: JSON.stringify({ sessionId: 'mcp-session', configHash: current.configHash, tools: ['list_files'] }) });
+    assert.equal(changed.status, 201);
+    const changedApproved = await request(address, `/v1/mcp/servers/${changed.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: changed.body.proposal.action.actionHash }) });
+    assert.equal(changedApproved.status, 200);
+    const stale = await request(address, `/v1/mcp/servers/${proposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: proposal.body.proposal.action.actionHash }) });
+    assert.equal(stale.status, 409);
+    assert.equal((await request(address, '/v1/mcp/servers')).body.servers[0].enabled, false);
+    const latest = (await request(address, '/v1/mcp/servers')).body.servers[0];
+    const approvedProposal = await request(address, '/v1/mcp/servers/red-toggle/enable', { method: 'POST', body: JSON.stringify({ sessionId: 'mcp-session', configHash: latest.configHash }) });
+    const approved = await request(address, `/v1/mcp/servers/${approvedProposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: approvedProposal.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 200);
+    const replay = await request(address, `/v1/mcp/servers/${approvedProposal.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: approvedProposal.body.proposal.action.actionHash }) });
+    assert.equal(replay.status, 404);
+    assert.equal((await request(address, '/v1/mcp/servers')).body.servers[0].enabled, true);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});

@@ -85,6 +85,23 @@ test('工具授权要求当前配置哈希且只保留 allowlist', async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('MCP registry enable state changes only with current config hash', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-enable-'));
+  try {
+    const registry = createMcpRegistry({ root });
+    const created = registry.register(server({ id: 'enable-me' }));
+    assert.equal(created.enabled, false);
+    assert.throws(() => registry.setEnabled('enable-me', true, '0'.repeat(64)), { code: 'MCP_CONFLICT' });
+    const enabled = registry.setEnabled('enable-me', true, created.configHash);
+    assert.equal(enabled.enabled, true);
+    assert.notEqual(enabled.configHash, created.configHash);
+    const restored = createMcpRegistry({ root }).get('enable-me');
+    assert.equal(restored.enabled, true);
+    const disabled = registry.setEnabled('enable-me', false, enabled.configHash);
+    assert.equal(disabled.enabled, false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('注册表快照符号链接被拒绝，不读取工作区外文件', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-symlink-'));
   const outside = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-outside-'));
