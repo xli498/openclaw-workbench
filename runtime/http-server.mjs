@@ -309,6 +309,25 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         mcpProposals.set(action.id, proposal);
         return json(response, 201, { proposal: publicMcpProposal(proposal) });
       }
+      const mcpToggle = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/(enable|disable)$/);
+      if (request.method === 'POST' && mcpToggle) {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new McpRegistryError('MCP_SESSION_REQUIRED', 'sessionId is required');
+        if (typeof input.configHash !== 'string' || !input.configHash) throw new McpRegistryError('MCP_CONFLICT', 'configHash is required');
+        if (mcpProposals.size + mcpReservations.size >= MAX_MCP_PROPOSALS) throw new McpRegistryError('MCP_PROPOSAL_LIMIT', 'too many pending MCP proposals');
+        const serverConfig = mcpRegistry.get(mcpToggle[1]);
+        if (!serverConfig) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+        const enabled = mcpToggle[2] === 'enable';
+        const preview = { serverId: serverConfig.id, expectedConfigHash: input.configHash, enabled };
+        const action = transition(transition(createAction({ type: 'mcp.set_enabled', sessionId: input.sessionId, workspaceRevision: serverConfig.configHash, target: serverConfig.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, server: serverConfig, operation: 'set_enabled', expectedConfigHash: input.configHash, enabled });
+        mcpReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, serverId: serverConfig.id, operation: 'set_enabled', enabled }); }
+        catch (error) { mcpReservations.delete(action.id); throw error; }
+        mcpReservations.delete(action.id);
+        mcpProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicMcpProposal(proposal) });
+      }
       const mcpApproval = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/approve$/);
       if (request.method === 'POST' && mcpApproval) {
         if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
@@ -318,7 +337,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         if (input.actionHash !== proposal.action.actionHash) throw new McpRegistryError('MCP_ACTION_HASH_MISMATCH', 'approval must bind the current MCP action hash');
         const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
         try {
-          const server = proposal.operation === 'register' ? mcpRegistry.register(proposal.server) : mcpRegistry.authorizeTools(proposal.server.id, proposal.tools, proposal.expectedConfigHash);
+          const server = proposal.operation === 'register' ? mcpRegistry.register(proposal.server) : proposal.operation === 'authorize_tools' ? mcpRegistry.authorizeTools(proposal.server.id, proposal.tools, proposal.expectedConfigHash) : mcpRegistry.setEnabled(proposal.server.id, proposal.enabled, proposal.expectedConfigHash);
           const verified = transition(transition(approved, 'executing'), 'verified');
           mcpProposals.delete(proposal.action.id);
           if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, serverId: server.id, operation: proposal.operation });

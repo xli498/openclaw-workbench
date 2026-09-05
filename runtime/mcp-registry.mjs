@@ -111,8 +111,10 @@ export function normalizeMcpServer(input = {}) {
 
 function restoreServer(value) {
   const normalized = normalizeMcpServer(value);
-  if (value.enabled !== false || value.configHash !== normalized.configHash || !value.health || typeof value.health.status !== 'string' || !['unknown', 'ready', 'unavailable', 'error'].includes(value.health.status)) fail('MCP_REGISTRY_INVALID', 'registry snapshot contains invalid server state');
-  return publicServer(withHash({ ...normalized, enabled: false, health: { status: value.health.status, checkedAt: value.health.checkedAt ?? null } }));
+  if (typeof value.enabled !== 'boolean' || !value.health || typeof value.health.status !== 'string' || !['unknown', 'ready', 'unavailable', 'error'].includes(value.health.status)) fail('MCP_REGISTRY_INVALID', 'registry snapshot contains invalid server state');
+  const restored = withHash({ ...normalized, enabled: value.enabled, health: { status: value.health.status, checkedAt: value.health.checkedAt ?? null } });
+  if (value.configHash !== restored.configHash) fail('MCP_REGISTRY_INVALID', 'registry snapshot contains invalid server hash');
+  return publicServer(restored);
 }
 
 export function createMcpRegistry({ root, storePath = join(root ?? '', '.openclaw-workbench', 'mcp-registry.json') } = {}) {
@@ -166,5 +168,15 @@ export function createMcpRegistry({ root, storePath = join(root ?? '', '.opencla
     try { persist(); } catch (error) { records.set(id, current); throw error; }
     return next;
   }
-  return Object.freeze({ validate, register, authorizeTools, updateHealth, get: (id) => records.has(id) ? publicServer(records.get(id)) : null, list: () => Object.freeze([...records.values()].map(publicServer)), snapshotPath: storePath });
+  function setEnabled(id, enabled, expectedConfigHash) {
+    const current = records.get(id);
+    if (!current) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+    if (current.configHash !== expectedConfigHash) throw new McpRegistryError('MCP_CONFLICT', 'MCP server changed before enable state update');
+    if (typeof enabled !== 'boolean') throw new McpRegistryError('MCP_ENABLED_INVALID', 'enabled must be boolean');
+    const next = publicServer(withHash({ ...current, enabled }));
+    records.set(id, next);
+    try { persist(); } catch (error) { records.set(id, current); throw error; }
+    return next;
+  }
+  return Object.freeze({ validate, register, authorizeTools, updateHealth, setEnabled, get: (id) => records.has(id) ? publicServer(records.get(id)) : null, list: () => Object.freeze([...records.values()].map(publicServer)), snapshotPath: storePath });
 }

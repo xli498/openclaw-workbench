@@ -4,6 +4,8 @@
 
 ## 已验证事实
 
+MCP `enabled` 状态通过独立审批切换；启用/停用提案绑定当前配置哈希，不能用控制 token 或旧 hash 绕过。
+
 | 能力 | 当前证据 | 产品处理方式 |
 |---|---|---|
 | Agent 单轮调用 | `openclaw agent` 文档，支持 Gateway 或 `--local`、会话、模型、思考级别、超时、JSON | 通过 Adapter 调用，禁止桌面端直接依赖 CLI 文本格式 |
