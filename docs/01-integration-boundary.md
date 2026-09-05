@@ -6,6 +6,8 @@
 
 MCP `enabled` 状态通过独立审批切换；启用/停用提案绑定当前配置哈希，不能用控制 token 或旧 hash 绕过。
 
+MCP runtime 控制面通过 `GET /v1/mcp/runtimes` 提供只读实例状态；`POST /v1/mcp/servers/<serverId>/start|stop|call` 只创建审批提案，审批执行时再次绑定当前 `configHash`。工具调用输入不会出现在公开提案或审计事件中，Server 未启用或工具不在 allowlist 时不会触达 transport。
+
 | 能力 | 当前证据 | 产品处理方式 |
 |---|---|---|
 | Agent 单轮调用 | `openclaw agent` 文档，支持 Gateway 或 `--local`、会话、模型、思考级别、超时、JSON | 通过 Adapter 调用，禁止桌面端直接依赖 CLI 文本格式 |
