@@ -10,7 +10,7 @@
 | Gateway 控制 | Control UI 文档，浏览器通过 WebSocket 与 Gateway 通信，支持 token/password、设备配对和 scope 升级审批 | 优先复用正式 Gateway 协议；协议版本必须锁定并做兼容测试 |
 | Chat | Control UI 已支持 `chat.history`、`chat.send`、`chat.abort`、`chat.inject` 与工具事件 | 产品 Runtime 封装为会话事件流；所有事件做 schema 校验 |
 | Exec 审批 | Control UI 文档列出 `exec.approvals.*`，存在审批策略与 allowlist | 产品默认不放宽现有策略；高风险动作保留二次审批 |
-| MCP | `openclaw mcp` 支持 server/client registry、status/doctor/probe、Control UI `/mcp`；`serve` 为 stdio MCP server | 当前只接入固定参数的只读 `mcp status --json` 健康探针；工具调用和注册表写入仍未实现 |
+| MCP | `openclaw mcp` 支持 server/client registry、status/doctor/probe、Control UI `/mcp`；`serve` 为 stdio MCP server | 已有审批门禁注册骨架和显式 `shell:false` stdio JSON-RPC transport；不读取 SecretRef、不自动重启、不执行工具；SSE/streamable HTTP 与 OpenClaw 私有协议仍未接入 |
 | 插件/Skill | 文档提供插件、Skill 管理和权限请求能力 | 不自动安装；安装、启用、升级均需审计和审批 |
 | 配置写入 | Control UI 文档描述 config get/set/apply/patch、base-hash guard、SecretRef 预检和校验 | 产品配置层必须保留 hash guard、备份、迁移和回滚 |
 | 诊断 | Control UI 支持 status、health、models、logs.tail 等诊断入口 | 统一收集脱敏诊断，不采集密钥和完整敏感内容 |
