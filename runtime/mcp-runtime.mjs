@@ -93,7 +93,13 @@ export function createMcpServerRuntime({ registry, transportFactory, stdioOption
     if (server.enabled !== true) throw new McpRuntimeError('MCP_SERVER_DISABLED', 'MCP server is disabled');
     if (typeof tool !== 'string' || !tool || !server.tools.includes(tool)) throw new McpRuntimeError('MCP_TOOL_NOT_AUTHORIZED', 'MCP tool is not authorized');
     validateToolInput(input);
-    return instance.client.request('tools/call', { name: tool, arguments: input });
+    try {
+      return await instance.client.request('tools/call', { name: tool, arguments: input });
+    } catch (error) {
+      const code = typeof error?.code === 'string' && error.code.startsWith('MCP_') ? error.code : 'MCP_REQUEST_FAILED';
+      const message = code === 'MCP_REQUEST_TIMEOUT' ? 'MCP request timed out' : code === 'MCP_REQUEST_ABORTED' ? 'MCP request was cancelled' : 'MCP request failed';
+      throw new McpRuntimeError(code, message);
+    }
   }
 
   async function close() {

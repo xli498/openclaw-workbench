@@ -132,6 +132,8 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 `POST /v1/mcp/servers/<serverId>/authorize` 以当前 `configHash` 创建工具授权提案，审批时再次校验哈希，防止并发修改覆盖授权。`GET /v1/mcp/servers/<serverId>/health` 只调用调用方显式注入的只读探针；默认返回 `NOT_CONFIGURED`。所有新 Server 默认 `enabled:false`，必须由后续显式启用流程打开；`createMcpServerRuntime` 还会在每次 start/call 校验 `enabled:true`、当前 `configHash` 和独立审批标记，配置漂移会使旧实例失效。`createMcpStdioTransport` 提供显式启动的 `shell:false` stdio JSON-RPC 传输边界，command/args 同样拒绝 shell 元字符、凭据标签和 URL userinfo，支持请求关联、超时、取消、关闭清理和帧大小门禁。`createMcpHttpTransport` 目前只提供受限的一次性 POST JSON-RPC 响应边界，可解析单个 JSON 或有限 SSE 响应，并具备 endpoint 校验、header 控制字符注入防护、超时、取消和流式帧大小门禁；调用方传入的认证 header 不会被 Workbench 持久化或记录。它们不读取 SecretRef、不自动重连、不替代审批、allowlist 或工具编排。标准 SSE 双通道、完整 streamable HTTP 会话语义、OpenClaw 私有协议和 HTTP 工具执行路由仍未开放。
 
+控制面现在提供 `GET /v1/mcp/runtimes` 查看已启动实例，以及 `POST /v1/mcp/servers/<serverId>/start|stop|call` 创建 runtime 操作提案。每个操作都必须使用独立 approval token 审批，并在执行时重新校验当前 `configHash`；Server 必须先启用，工具调用必须命中 allowlist。call 提案只返回工具名、输入字节数和输入哈希，不返回输入内容；runtime 关闭时会清理所有活动传输。
+
 ## 模型档案与连接测试
 
 `GET /v1/models` 查看 Workbench 的本地模型档案；`POST /v1/models` 创建档案提案，使用独立 `x-approval-token` 调用 `/v1/models/<actionId>/approve` 才会登记。档案只保存 provider、protocol、model、能力列表、无密钥的 `env:`/`keychain:` SecretRef 引用和健康摘要；新档案默认 `enabled:false`，不会保存 API key 或 SecretRef 解析值。

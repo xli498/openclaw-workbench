@@ -20,6 +20,7 @@ import { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId
 import { snapshotDigest } from './snapshot-store.mjs';
 import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
 import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
+import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
@@ -118,7 +119,8 @@ function errorResponse(error) {
   if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
   if (error instanceof RecoveryError) return { status: ['SCAN_FAILED', 'MANIFEST_INVALID'].includes(error.code) ? 500 : 400, body: safe(error.code, error.message) };
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
-  if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
+  if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
+  if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
@@ -162,6 +164,9 @@ function publicConfigProposal(proposal) {
 }
 
 function publicMcpProposal(proposal) {
+  if (typeof proposal.operation === 'string' && proposal.operation.startsWith('runtime_')) {
+    return { action: proposal.action, operation: proposal.operation, server: { id: proposal.server.id, name: proposal.server.name }, ...(proposal.tool ? { tool: proposal.tool } : {}), ...(Number.isSafeInteger(proposal.inputBytes) ? { inputBytes: proposal.inputBytes } : {}) };
+  }
   return { action: proposal.action, server: proposal.server, ...(proposal.operation ? { operation: proposal.operation } : {}) };
 }
 
@@ -190,7 +195,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, eventBus, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, eventBus, mcpRuntime, mcpTransportFactory, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -201,11 +206,13 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const configReservations = new Map();
   const mcpProposals = new Map();
   const mcpReservations = new Set();
+  const mcpClaims = new Set();
   const modelProposals = new Map();
   const modelReservations = new Set();
   const MAX_MODEL_PROPOSALS = 64;
   const modelRegistry = createModelRegistry({ root });
   const mcpRegistry = createMcpRegistry({ root });
+  const runtime = mcpRuntime ?? createMcpServerRuntime({ registry: mcpRegistry, transportFactory: mcpTransportFactory });
   const effectiveAudit = audit ?? createLazyAuditLog(root);
   const proposalStore = createProposalStore({ root });
   const adapterConfig = adapter ? { ...adapter, command: adapter.command ?? 'openclaw' } : null;
@@ -233,6 +240,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/mcp/servers') return json(response, 200, { servers: mcpRegistry.list() });
+      if (request.method === 'GET' && url.pathname === '/v1/mcp/runtimes') return json(response, 200, { runtimes: runtime.status() });
       if (request.method === 'GET' && url.pathname === '/v1/models') return json(response, 200, { models: modelRegistry.list() });
       const modelHealth = url.pathname.match(/^\/v1\/models\/([^/]+)\/health$/);
       if (request.method === 'GET' && modelHealth) {
@@ -328,6 +336,40 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         mcpProposals.set(action.id, proposal);
         return json(response, 201, { proposal: publicMcpProposal(proposal) });
       }
+      const mcpRuntimeAction = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/(start|stop|call)$/);
+      if (request.method === 'POST' && mcpRuntimeAction) {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new McpRegistryError('MCP_SESSION_REQUIRED', 'sessionId is required');
+        if (typeof input.configHash !== 'string' || !input.configHash) throw new McpRegistryError('MCP_CONFLICT', 'configHash is required');
+        if (mcpProposals.size + mcpReservations.size >= MAX_MCP_PROPOSALS) throw new McpRegistryError('MCP_PROPOSAL_LIMIT', 'too many pending MCP proposals');
+        const serverConfig = mcpRegistry.get(mcpRuntimeAction[1]);
+        if (!serverConfig) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+        const operation = `runtime_${mcpRuntimeAction[2]}`;
+        let tool;
+        let callInput;
+        let inputBytes;
+        let inputHash;
+        if (mcpRuntimeAction[2] === 'call') {
+          if (typeof input.tool !== 'string' || !input.tool || input.tool.length > 128) throw new McpRuntimeError('MCP_TOOL_INPUT_INVALID', 'tool is required');
+          if (!input.input || typeof input.input !== 'object' || Array.isArray(input.input)) throw new McpRuntimeError('MCP_TOOL_INPUT_INVALID', 'input must be an object');
+          let encoded;
+          try { encoded = JSON.stringify(input.input); } catch { throw new McpRuntimeError('MCP_TOOL_INPUT_INVALID', 'input must be JSON serializable'); }
+          inputBytes = Buffer.byteLength(encoded, 'utf8');
+          if (inputBytes > MAX_BODY_BYTES) throw new McpRuntimeError('MCP_TOOL_INPUT_INVALID', 'input is too large');
+          tool = input.tool;
+          callInput = input.input;
+          inputHash = snapshotDigest(encoded);
+        }
+        const preview = { serverId: serverConfig.id, expectedConfigHash: input.configHash, operation, ...(tool ? { tool } : {}), ...(Number.isSafeInteger(inputBytes) ? { inputBytes, inputHash } : {}) };
+        const action = transition(transition(createAction({ type: 'mcp.runtime', sessionId: input.sessionId, workspaceRevision: serverConfig.configHash, target: serverConfig.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, server: serverConfig, operation, expectedConfigHash: input.configHash, ...(tool ? { tool, input: callInput, inputBytes } : {}) });
+        mcpReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, serverId: serverConfig.id, operation, ...(tool ? { tool, inputBytes } : {}) }); }
+        catch (error) { mcpReservations.delete(action.id); throw error; }
+        mcpReservations.delete(action.id);
+        mcpProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicMcpProposal(proposal) });
+      }
       const mcpApproval = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/approve$/);
       if (request.method === 'POST' && mcpApproval) {
         if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
@@ -336,16 +378,32 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         const input = await bodyOf(request);
         if (input.actionHash !== proposal.action.actionHash) throw new McpRegistryError('MCP_ACTION_HASH_MISMATCH', 'approval must bind the current MCP action hash');
         const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
+        if (mcpClaims.has(proposal.action.id)) throw new McpRegistryError('MCP_PROPOSAL_BUSY', 'MCP proposal is already executing');
+        mcpClaims.add(proposal.action.id);
         try {
-          const server = proposal.operation === 'register' ? mcpRegistry.register(proposal.server) : proposal.operation === 'authorize_tools' ? mcpRegistry.authorizeTools(proposal.server.id, proposal.tools, proposal.expectedConfigHash) : mcpRegistry.setEnabled(proposal.server.id, proposal.enabled, proposal.expectedConfigHash);
+          let server = proposal.server;
+          let runtimeResult;
+          let toolResult;
+          if (proposal.operation === 'register') server = mcpRegistry.register(proposal.server);
+          else if (proposal.operation === 'authorize_tools') server = mcpRegistry.authorizeTools(proposal.server.id, proposal.tools, proposal.expectedConfigHash);
+          else if (proposal.operation === 'set_enabled') server = mcpRegistry.setEnabled(proposal.server.id, proposal.enabled, proposal.expectedConfigHash);
+          else if (proposal.operation === 'runtime_start') runtimeResult = await runtime.start(proposal.server.id, { expectedConfigHash: proposal.expectedConfigHash, approved: true });
+          else if (proposal.operation === 'runtime_stop') {
+            const current = mcpRegistry.get(proposal.server.id);
+            if (!current || current.configHash !== proposal.expectedConfigHash) throw new McpRuntimeError('MCP_CONFLICT', 'MCP server configuration changed');
+            runtimeResult = await runtime.stop(proposal.server.id);
+          } else if (proposal.operation === 'runtime_call') toolResult = await runtime.callTool(proposal.server.id, proposal.tool, proposal.input, { expectedConfigHash: proposal.expectedConfigHash, approved: true });
+          else throw new McpRuntimeError('MCP_RUNTIME_OPERATION_INVALID', 'MCP runtime operation is invalid');
           const verified = transition(transition(approved, 'executing'), 'verified');
           mcpProposals.delete(proposal.action.id);
           if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, serverId: server.id, operation: proposal.operation });
-          return json(response, 200, { action: verified, server });
+          return json(response, 200, { action: verified, ...(proposal.operation.startsWith('runtime_') ? { ...(runtimeResult ? { runtime: runtimeResult } : {}), ...(toolResult !== undefined ? { result: toolResult } : {}) } : { server }) });
         } catch (error) {
           mcpProposals.delete(proposal.action.id);
           if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.failed', actor: 'system', actionId: proposal.action.id, sessionId: proposal.action.sessionId, actionHash: proposal.action.actionHash, serverId: proposal.server.id, operation: proposal.operation, code: error.code ?? 'MCP_FAILED' });
           throw error;
+        } finally {
+          mcpClaims.delete(proposal.action.id);
         }
       }
       if (request.method === 'GET' && url.pathname === '/v1/config') return json(response, 200, { config: await readConfig({ root }) });
@@ -611,6 +669,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (closing) return;
       closing = true;
       sessions.cancelAllTurns();
+      await runtime.close();
       for (const stream of liveStreams) stream.end();
       liveStreams.clear();
       if (!server.listening) return;
