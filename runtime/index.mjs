@@ -16,6 +16,7 @@ export { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-r
 export { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 export { GatewayAdapterError, createGatewayAdapter } from './gateway-adapter.mjs';
 export { McpTransportError, createMcpStdioTransport } from './mcp-transport.mjs';
+export { McpHttpTransportError, createMcpHttpTransport } from './mcp-http-transport.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {
   if (!root) throw new Error('root is required');

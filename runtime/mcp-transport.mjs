@@ -55,6 +55,7 @@ export function createMcpStdioTransport({
   let child = null;
   let state = 'disconnected';
   let startPromise = null;
+  let lifecycleGeneration = 0;
   let inputBuffer = '';
   let stdoutDecoder = new StringDecoder('utf8');
   const pending = new Map();
@@ -111,8 +112,10 @@ export function createMcpStdioTransport({
   async function start() {
     if (state === 'ready') return Object.freeze({ status: 'ready' });
     if (startPromise) return startPromise;
+    const generation = ++lifecycleGeneration;
     state = 'starting';
     startPromise = Promise.resolve().then(() => {
+      if (generation !== lifecycleGeneration || state !== 'starting') throw new McpTransportError('MCP_TRANSPORT_CLOSED', 'MCP transport was closed');
       inputBuffer = '';
       stdoutDecoder = new StringDecoder('utf8');
       try {
@@ -126,6 +129,12 @@ export function createMcpStdioTransport({
         if (child === processRef && state !== 'disconnected') terminate(new McpTransportError(state === 'starting' ? 'MCP_START_FAILED' : 'MCP_PROCESS_ERROR', 'MCP server process failed'));
       });
       child.on?.('close', () => handleClose(processRef));
+      if (generation !== lifecycleGeneration || state !== 'starting') {
+        child = null;
+        try { processRef.stdin?.end?.(); } catch { /* stdin may already be closed */ }
+        try { processRef.kill?.(); } catch { /* process may already be gone */ }
+        throw new McpTransportError('MCP_TRANSPORT_CLOSED', 'MCP transport was closed');
+      }
       state = 'ready';
       return Object.freeze({ status: 'ready' });
     }).finally(() => { startPromise = null; });
@@ -159,6 +168,7 @@ export function createMcpStdioTransport({
   }
 
   async function close() {
+    lifecycleGeneration += 1;
     const current = child;
     child = null;
     state = 'disconnected';

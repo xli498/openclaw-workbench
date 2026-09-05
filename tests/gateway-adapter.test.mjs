@@ -64,6 +64,16 @@ test('Gateway adapter connects with an explicit lifecycle and correlates JSON re
   await adapter.close();
 });
 
+test('Gateway adapter close invalidates an in-flight connection', async () => {
+  const adapter = createGatewayAdapter({ url: 'ws://127.0.0.1:18789', WebSocketImpl: FakeSocket });
+  const connecting = adapter.connect();
+  const socket = FakeSocket.instances.at(-1);
+  await adapter.close();
+  socket.open();
+  await assert.rejects(connecting, (error) => error.code === 'GATEWAY_CLOSED');
+  assert.equal(adapter.getState(), 'disconnected');
+});
+
 test('Gateway adapter bounds connection and request timeouts without exposing token data', async () => {
   const adapter = createGatewayAdapter({ url: 'ws://localhost:18789', token: 'PRIVATE-TOKEN', WebSocketImpl: FakeSocket, connectTimeoutMs: 5 });
   await assert.rejects(adapter.connect(), (error) => error.code === 'GATEWAY_CONNECT_TIMEOUT' && !error.message.includes('PRIVATE-TOKEN'));
