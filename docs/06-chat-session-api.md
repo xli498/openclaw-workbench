@@ -102,7 +102,7 @@ Content-Type: application/json
 
 ## 当前实现边界
 
-本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Plan 四阶段只读博弈、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复；事件已支持 HTTP 轮询和 SSE 流。`createGatewayAdapter` 提供仅回环地址的显式 WebSocket transport，可处理连接状态、JSON 请求关联、超时、取消和帧大小门禁；它不猜 OpenClaw 私有协议，不自动启动 Gateway，不读取 SecretRef，不执行 MCP 工具，也不是 WebSocket 控制面。OpenClaw channel 生命周期、MCP transport、桌面 UI 和公网 Bridge 仍未实现。
+本版已完成会话管理、消息调用、忙状态、防半轮残留、三模式校验、Plan 多模型分歧标记、Plan 四阶段只读博弈、Code 结构化工具提案编排，以及会话/提案/本地事件的保守持久化恢复；事件已支持 HTTP 轮询和 SSE 流。`createGatewayAdapter` 提供仅回环地址的显式 WebSocket transport；`createMcpStdioTransport` 提供显式启动的 stdio JSON-RPC transport。两者都只负责受限传输生命周期，不猜 OpenClaw 私有协议、不自动启动业务服务、不读取 SecretRef、不执行 MCP 工具，也不是公网控制面。OpenClaw channel 生命周期、SSE/streamable HTTP、桌面 UI 和公网 Bridge 仍未实现。
 
 ## 请求关联 ID
 
