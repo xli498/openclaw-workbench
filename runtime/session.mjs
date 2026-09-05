@@ -55,7 +55,7 @@ function attachPersistenceError(primary, persistenceError) {
   if (!primary.cause) primary.cause = persistenceError;
 }
 
-export function createChatSessionManager({ root, runAgentFn = runAgent, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
+export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayRequestFn, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
   if (!root) throw new SessionError('ROOT_REQUIRED', 'root is required');
   const sessions = new Map();
   const controllers = new Map();
@@ -148,7 +148,8 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, clock = 
     try { persist(); } catch (error) { session.messages.pop(); session.running = false; throw error; }
     let primaryError;
     try {
-      const response = await runAgentFn({ message, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal: controller.signal });
+      const requestFn = gatewayRequestFn ?? runAgentFn;
+      const response = await requestFn({ message, sessionId: session.id, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal: controller.signal });
       const assistantMessage = Object.freeze({ role: 'assistant', content: response, createdAt: clock().toISOString() });
       session.messages.push(assistantMessage);
       persist();

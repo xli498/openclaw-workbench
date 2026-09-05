@@ -62,15 +62,16 @@ async function readAuditRecords(filePath) {
   } finally { await handle?.close().catch(() => {}); }
 }
 
-export async function createFileAuditLog({ root, filePath, clock = () => new Date() } = {}) {
+export async function createFileAuditLog({ root, filePath, clock = () => new Date(), __testHooks } = {}) {
   const safePath = await safeAuditPath(root, filePath);
   const lockPath = `${safePath}.lock`;
+  const createLockDirectory = __testHooks?.mkdirLock ?? ((target) => mkdir(target));
   async function withLock(operation) {
     let acquired = false;
     let token;
     for (let attempt = 0; attempt < 200; attempt += 1) {
       try {
-        await mkdir(lockPath);
+        await createLockDirectory(lockPath);
         token = randomUUID();
         try {
           await writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), { flag: 'wx', mode: 0o600 });
@@ -82,7 +83,8 @@ export async function createFileAuditLog({ root, filePath, clock = () => new Dat
         break;
       }
       catch (error) {
-        if (error.code !== 'EEXIST') throw error;
+        const lockContended = error.code === 'EEXIST' || (process.platform === 'win32' && error.code === 'EPERM');
+        if (!lockContended) throw error;
         try {
           const owner = JSON.parse(await readFile(path.join(lockPath, 'owner.json'), 'utf8'));
           const expired = Number.isFinite(owner.createdAt) && Date.now() - owner.createdAt >= 60_000;

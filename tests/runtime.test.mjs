@@ -128,6 +128,30 @@ test('文件审计日志并发追加保持单一哈希链', async () => {
   assert.equal(verifyAuditChain(records), true);
 });
 
+test('Windows 锁目录创建返回 EPERM 时按锁竞争重试', async () => {
+  if (process.platform !== 'win32') return;
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-audit-eperm-lock-'));
+  let attempts = 0;
+  const log = await createFileAuditLog({
+    root,
+    filePath: 'audit.jsonl',
+    __testHooks: {
+      async mkdirLock(lockPath) {
+        attempts += 1;
+        if (attempts === 1) {
+          const error = new Error('simulated concurrent mkdir');
+          error.code = 'EPERM';
+          throw error;
+        }
+        return mkdir(lockPath);
+      },
+    },
+  });
+  await log.append({ type: 'eperm-lock.retry', actor: 'test' });
+  assert.equal(attempts, 2);
+  assert.equal((await log.list()).length, 1);
+});
+
 test('文件审计日志可接管已过期且进程不存在的锁', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-audit-stale-lock-'));
   const lockPath = path.join(root, 'audit.jsonl.lock');
