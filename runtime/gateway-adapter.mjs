@@ -56,6 +56,8 @@ export function createGatewayAdapter({
   let socket = null;
   let state = 'disconnected';
   let connectPromise = null;
+  let cancelConnect = null;
+  let lifecycleGeneration = 0;
   const pending = new Map();
 
   function failPending(error) {
@@ -92,7 +94,8 @@ export function createGatewayAdapter({
     else entry.resolve(frame.result);
   }
 
-  function handleClose() {
+  function handleClose(processRef) {
+    if (socket !== processRef) return;
     socket = null;
     state = 'disconnected';
     failPending(new GatewayAdapterError('GATEWAY_CLOSED', 'Gateway connection closed'));
@@ -102,6 +105,7 @@ export function createGatewayAdapter({
     if (state === 'ready') return Object.freeze({ status: 'ready' });
     if (connectPromise) return connectPromise;
     if (typeof WebSocketImpl !== 'function') throw new GatewayAdapterError('GATEWAY_WS_UNAVAILABLE', 'WebSocket implementation is unavailable');
+    const generation = ++lifecycleGeneration;
     state = 'connecting';
     connectPromise = new Promise((resolve, reject) => {
       let timer;
@@ -111,15 +115,30 @@ export function createGatewayAdapter({
         settled = true;
         clearTimeout(timer);
         connectPromise = null;
+        cancelConnect = null;
         fn(value);
       };
       try { socket = new WebSocketImpl(gatewayUrl.toString()); }
       catch { state = 'failed'; finish(reject, new GatewayAdapterError('GATEWAY_CONNECT_FAILED', 'Gateway connection could not be opened')); return; }
-      attach('open', () => { state = 'ready'; finish(resolve, Object.freeze({ status: 'ready' })); });
+      const processRef = socket;
+      cancelConnect = (error) => finish(reject, error);
+      attach('open', () => {
+        if (generation !== lifecycleGeneration || socket !== processRef) return;
+        state = 'ready';
+        finish(resolve, Object.freeze({ status: 'ready' }));
+      });
       attach('message', handleMessage);
-      attach('close', () => { handleClose(); finish(reject, new GatewayAdapterError('GATEWAY_CONNECT_FAILED', 'Gateway connection closed before ready')); });
-      attach('error', () => { if (state === 'connecting') { state = 'failed'; finish(reject, new GatewayAdapterError('GATEWAY_CONNECT_FAILED', 'Gateway connection failed')); } });
+      attach('close', () => {
+        if (generation !== lifecycleGeneration || socket !== processRef) return;
+        handleClose(processRef);
+        finish(reject, new GatewayAdapterError('GATEWAY_CONNECT_FAILED', 'Gateway connection closed before ready'));
+      });
+      attach('error', () => {
+        if (generation !== lifecycleGeneration || socket !== processRef) return;
+        if (state === 'connecting') { state = 'failed'; finish(reject, new GatewayAdapterError('GATEWAY_CONNECT_FAILED', 'Gateway connection failed')); }
+      });
       timer = setTimeout(() => {
+        if (generation !== lifecycleGeneration || socket !== processRef) return;
         state = 'failed';
         finish(reject, new GatewayAdapterError('GATEWAY_CONNECT_TIMEOUT', 'Gateway connection timed out'));
         socket?.close?.();
@@ -154,6 +173,8 @@ export function createGatewayAdapter({
   }
 
   async function close() {
+    lifecycleGeneration += 1;
+    cancelConnect?.(new GatewayAdapterError('GATEWAY_CLOSED', 'Gateway connection closed'));
     const current = socket;
     socket = null;
     state = 'disconnected';

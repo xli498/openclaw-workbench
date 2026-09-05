@@ -56,6 +56,16 @@ test('MCP stdio transport rejects shell-danger characters in command and args', 
   assert.doesNotThrow(() => createMcpStdioTransport({ command: process.execPath, args: ['server.mjs'] }));
 });
 
+test('MCP stdio transport close invalidates an in-flight start', async () => {
+  let spawned = 0;
+  const transport = createMcpStdioTransport({ command: 'node', spawnImpl: () => { spawned += 1; return new FakeChild(); } });
+  const starting = transport.start();
+  transport.close();
+  await assert.rejects(starting, (error) => error.code === 'MCP_TRANSPORT_CLOSED');
+  assert.equal(spawned, 0);
+  assert.equal(transport.getState(), 'disconnected');
+});
+
 test('MCP stdio transport correlates JSON-RPC responses by id', async () => {
   const { child, transport } = harness();
   await transport.start();
