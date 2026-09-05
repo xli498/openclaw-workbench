@@ -10,7 +10,7 @@
 | Gateway 控制 | Control UI 文档，浏览器通过 WebSocket 与 Gateway 通信，支持 token/password、设备配对和 scope 升级审批 | 优先复用正式 Gateway 协议；协议版本必须锁定并做兼容测试 |
 | Chat | Control UI 已支持 `chat.history`、`chat.send`、`chat.abort`、`chat.inject` 与工具事件 | 产品 Runtime 封装为会话事件流；所有事件做 schema 校验 |
 | Exec 审批 | Control UI 文档列出 `exec.approvals.*`，存在审批策略与 allowlist | 产品默认不放宽现有策略；高风险动作保留二次审批 |
-| MCP | `openclaw mcp` 支持 server/client registry、status/doctor/probe、Control UI `/mcp`；`serve` 为 stdio MCP server | 已有审批门禁注册骨架、显式 `shell:false` stdio JSON-RPC transport，以及受限的一次性 HTTP POST JSON/SSE 响应 transport；command/args 和 endpoint 拒绝注入与凭据材料，header 拒绝控制字符注入且允许调用方显式传入认证 header；不读取 SecretRef、不自动重连、不执行工具；标准 SSE 双通道、完整 streamable HTTP 会话语义与 OpenClaw 私有协议仍未接入 |
+| MCP | `openclaw mcp` 支持 server/client registry、status/doctor/probe、Control UI `/mcp`；`serve` 为 stdio MCP server | 已有审批门禁注册骨架、`enabled` 配置门禁、显式 `shell:false` stdio JSON-RPC transport、受限的一次性 HTTP POST JSON/SSE 响应 transport，以及内部 runtime 的 start/stop/allowlist call 边界；command/args 和 endpoint 拒绝注入与凭据材料，header 拒绝控制字符注入且允许调用方显式传入认证 header；不读取 SecretRef、不自动重连；标准 SSE 双通道、完整 streamable HTTP 会话语义、HTTP 工具执行路由与 OpenClaw 私有协议仍未接入 |
 | 插件/Skill | 文档提供插件、Skill 管理和权限请求能力 | 不自动安装；安装、启用、升级均需审计和审批 |
 | 配置写入 | Control UI 文档描述 config get/set/apply/patch、base-hash guard、SecretRef 预检和校验 | 产品配置层必须保留 hash guard、备份、迁移和回滚 |
 | 诊断 | Control UI 支持 status、health、models、logs.tail 等诊断入口 | 统一收集脱敏诊断，不采集密钥和完整敏感内容 |
