@@ -23,6 +23,7 @@ import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from '
 import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 import { SecretResolverError, createSecretResolver } from './secret-resolver.mjs';
 import { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
+import { ModelRunnerError, createModelRunner } from './model-runner.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
@@ -125,6 +126,7 @@ function errorResponse(error) {
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
   if (error instanceof SecretResolverError) return { status: 400, body: safe(error.code, error.message) };
+  if (error instanceof ModelRunnerError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
@@ -206,7 +208,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -232,8 +234,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const inspectMcp = inspectOpenClawMcpFn ?? ((options) => inspectOpenClawMcp(options));
   const inspectMcpServer = inspectMcpServerFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
   const inspectModelProfile = inspectModelProfileFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
-  const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: secretResolver ?? createSecretResolver() });
-  const sessions = createChatSessionManager({ root, runAgentFn: agentRunner });
+  const effectiveSecretResolver = secretResolver ?? createSecretResolver();
+  const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: effectiveSecretResolver });
+  const liveModelRunner = modelRunner ?? createModelRunner({ profileResolver: modelRegistry, secretResolver: effectiveSecretResolver });
+  const sessions = createChatSessionManager({ root, runAgentFn: agentRunner, modelRunner: liveModelRunner, modelResolver: modelRegistry, modelFallbackFn: agentRunner });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
   const liveStreams = new Set();
@@ -290,13 +294,32 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         modelReservations.delete(action.id); modelProposals.set(action.id, proposal);
         return json(response, 201, { proposal: publicModelProposal(proposal) });
       }
+      const modelToggle = url.pathname.match(/^\/v1\/models\/([^/]+)\/(enable|disable)$/);
+      if (request.method === 'POST' && modelToggle) {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new ModelRegistryError('MODEL_SESSION_REQUIRED', 'sessionId is required');
+        if (typeof input.configHash !== 'string' || !input.configHash) throw new ModelRegistryError('MODEL_CONFLICT', 'configHash is required');
+        if (modelProposals.size + modelReservations.size >= MAX_MODEL_PROPOSALS) throw new ModelRegistryError('MODEL_PROPOSAL_LIMIT', 'too many pending model proposals');
+        const current = modelRegistry.get(modelToggle[1]);
+        if (!current) throw new ModelRegistryError('MODEL_NOT_FOUND', 'model profile not found');
+        if (input.configHash !== current.configHash) throw new ModelRegistryError('MODEL_CONFLICT', 'model configuration changed; refresh before proposing');
+        const enabled = modelToggle[2] === 'enable';
+        const preview = { profileId: current.id, expectedConfigHash: input.configHash, enabled };
+        const action = transition(transition(createAction({ type: 'model.set_enabled', sessionId: input.sessionId, workspaceRevision: current.configHash, target: current.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, profile: current, operation: 'set_enabled', expectedConfigHash: input.configHash, enabled });
+        modelReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: current.id, operation: 'set_enabled', enabled }); }
+        catch (error) { modelReservations.delete(action.id); throw error; }
+        modelReservations.delete(action.id); modelProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicModelProposal(proposal) });
+      }
       const modelApproval = url.pathname.match(/^\/v1\/models\/([^/]+)\/approve$/);
       if (request.method === 'POST' && modelApproval) {
         if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
         const proposal = modelProposals.get(modelApproval[1]); if (!proposal) return json(response, 404, { error: 'MODEL_PROPOSAL_NOT_FOUND', message: 'model proposal not found' });
         const input = await bodyOf(request); if (input.actionHash !== proposal.action.actionHash) throw new ModelRegistryError('MODEL_ACTION_HASH_MISMATCH', 'approval must bind the current model action hash');
         const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
-        try { const profile = modelRegistry.register(proposal.profile); const verified = transition(transition(approved, 'executing'), 'verified'); modelProposals.delete(proposal.action.id); if (effectiveAudit) await effectiveAudit.append({ type: 'model.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, profileId: profile.id }); return json(response, 200, { action: verified, profile }); }
+        try { const profile = proposal.operation === 'set_enabled' ? modelRegistry.setEnabled(proposal.profile.id, proposal.enabled, proposal.expectedConfigHash) : modelRegistry.register(proposal.profile); const verified = transition(transition(approved, 'executing'), 'verified'); modelProposals.delete(proposal.action.id); if (effectiveAudit) await effectiveAudit.append({ type: 'model.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, profileId: profile.id, operation: proposal.operation ?? 'register', enabled: profile.enabled }); return json(response, 200, { action: verified, profile }); }
         catch (error) { modelProposals.delete(proposal.action.id); if (effectiveAudit) await effectiveAudit.append({ type: 'model.failed', actor: 'system', actionId: proposal.action.id, sessionId: proposal.action.sessionId, actionHash: proposal.action.actionHash, profileId: proposal.profile.id, code: error.code ?? 'MODEL_FAILED' }); throw error; }
       }
       const mcpHealth = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/health$/);
@@ -562,7 +585,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'POST' && url.pathname === '/v1/sessions') { const session = sessions.createSession(await bodyOf(request)); eventBus.publish({ type: 'session.created', sessionId: session.id, requestId, data: { mode: session.mode } }); return json(response, 201, { session }); }
       const sessionMessages = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/messages$/);
       if (request.method === 'GET' && sessionMessages) return json(response, 200, { messages: sessions.listMessages(sessionMessages[1]) });
-      if (request.method === 'POST' && sessionMessages) { const input = await bodyOf(request); const lifecycle = requestAbortSignal(request, response); try { const result = await sessions.sendMessage({ sessionId: sessionMessages[1], ...input, signal: lifecycle.signal }); eventBus.publish({ type: 'chat.completed', sessionId: sessionMessages[1], requestId, data: { messageCount: result.session.messageCount } }); return json(response, 200, result); } finally { lifecycle.cleanup(); } }
+      if (request.method === 'POST' && sessionMessages) { const input = await bodyOf(request); const lifecycle = requestAbortSignal(request, response); try { const result = await sessions.sendMessage({ sessionId: sessionMessages[1], ...input, model: input.model ?? input.modelId, signal: lifecycle.signal }); eventBus.publish({ type: 'chat.completed', sessionId: sessionMessages[1], requestId, data: { messageCount: result.session.messageCount } }); return json(response, 200, result); } finally { lifecycle.cleanup(); } }
       const sessionCancel = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/cancel$/);
       if (request.method === 'POST' && sessionCancel) { const result = sessions.cancelTurn(sessionCancel[1]); eventBus.publish({ type: 'turn.cancel.requested', sessionId: sessionCancel[1], requestId, data: { cancelled: true } }); return json(response, 202, result); }
       const sessionPlan = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/plan$/);

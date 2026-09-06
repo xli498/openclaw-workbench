@@ -6,6 +6,8 @@ import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
 
 export const CHAT_MODES = Object.freeze(['Ask', 'Plan', 'Code']);
 const MAX_MESSAGE_LENGTH = 32 * 1024;
+const MODEL_ID_MAX_LENGTH = 128;
+const SENSITIVE_VALUE = /((?:bearer|token|password|passwd|secret|api[_ -]?key|apikey|accesskey|clientsecret|key)[=: -]+)[^\s,;\]}]+/gi;
 
 export class SessionError extends Error {
   constructor(code, message, details = {}) { super(message); this.name = 'SessionError'; this.code = code; this.details = details; }
@@ -55,7 +57,35 @@ function attachPersistenceError(primary, persistenceError) {
   if (!primary.cause) primary.cause = persistenceError;
 }
 
-export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayRequestFn, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
+function redactString(value) {
+  return value.replace(SENSITIVE_VALUE, '$1[redacted]');
+}
+
+function safeResponse(response) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) throw new SessionError('MODEL_RESPONSE_INVALID', 'model response is invalid');
+  const text = typeof response.text === 'string' ? redactString(response.text) : '';
+  const toolCalls = Array.isArray(response.toolCalls) ? response.toolCalls.slice(0, 64).map((call) => ({
+    id: typeof call?.id === 'string' ? redactString(call.id).slice(0, 256) : '',
+    name: typeof call?.name === 'string' ? redactString(call.name).slice(0, 256) : '',
+    arguments: call?.arguments && typeof call.arguments === 'object' && !Array.isArray(call.arguments) ? redactValue(call.arguments) : {},
+  })) : [];
+  const normalized = { text, toolCalls, finishReason: typeof response.finishReason === 'string' ? redactString(response.finishReason).slice(0, 128) : null, model: typeof response.model === 'string' ? redactString(response.model).slice(0, 256) : null, protocol: typeof response.protocol === 'string' ? response.protocol.slice(0, 64) : null };
+  if (response.usage && typeof response.usage === 'object' && !Array.isArray(response.usage)) {
+    normalized.usage = Object.fromEntries(Object.entries(response.usage).filter(([key, value]) => /^[A-Za-z0-9_.-]{1,64}$/.test(key) && (Number.isFinite(value) || typeof value === 'string')).map(([key, value]) => [key, typeof value === 'string' ? redactString(value).slice(0, 128) : value]));
+  }
+  return normalized;
+}
+
+function redactValue(value, depth = 0) {
+  if (depth > 8) return '[redacted]';
+  if (typeof value === 'string') return redactString(value).slice(0, 4096);
+  if (Array.isArray(value)) return value.slice(0, 64).map((item) => redactValue(item, depth + 1));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).slice(0, 128).map(([key, item]) => [redactString(key).slice(0, 128), redactValue(item, depth + 1)]));
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
+  return '[redacted]';
+}
+
+export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayRequestFn, modelRunner, modelResolver, modelFallbackFn, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
   if (!root) throw new SessionError('ROOT_REQUIRED', 'root is required');
   const sessions = new Map();
   const controllers = new Map();
@@ -137,6 +167,19 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayR
     if (session.status !== 'active') throw new SessionError('SESSION_NOT_ACTIVE', 'session is not active');
     if (typeof message !== 'string' || !message.trim() || message.length > MAX_MESSAGE_LENGTH) throw new SessionError('INVALID_MESSAGE', `message must be non-empty and at most ${MAX_MESSAGE_LENGTH} characters`);
     if (session.running) throw new SessionError('SESSION_BUSY', 'session already has a running turn');
+    let selectedProfile;
+    const useModelRunner = Boolean(modelRunner && (model !== undefined && model !== null));
+    if (modelRunner && !useModelRunner && !modelFallbackFn) {
+      throw new SessionError('MODEL_REQUIRED', 'an enabled model profile is required');
+    }
+    if (useModelRunner) {
+      if (typeof model !== 'string' || !model.trim() || model.length > MODEL_ID_MAX_LENGTH) throw new SessionError('MODEL_REQUIRED', 'an enabled model profile is required');
+      const resolver = typeof modelResolver === 'function' ? modelResolver : modelResolver?.get?.bind(modelResolver);
+      if (!resolver) throw new SessionError('MODEL_NOT_FOUND', 'model profile not found');
+      selectedProfile = await resolver(model);
+      if (!selectedProfile) throw new SessionError('MODEL_NOT_FOUND', 'model profile not found');
+      if (selectedProfile.enabled !== true) throw new SessionError('MODEL_DISABLED', 'model profile is disabled');
+    }
     session.running = true;
     const controller = new AbortController();
     const relayAbort = () => controller.abort();
@@ -148,9 +191,12 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayR
     try { persist(); } catch (error) { session.messages.pop(); session.running = false; throw error; }
     let primaryError;
     try {
-      const requestFn = gatewayRequestFn ?? runAgentFn;
-      const response = await requestFn({ message, sessionId: session.id, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal: controller.signal });
-      const assistantMessage = Object.freeze({ role: 'assistant', content: response, createdAt: clock().toISOString() });
+      const requestFn = useModelRunner ? modelRunner : modelFallbackFn ?? gatewayRequestFn ?? runAgentFn;
+      const response = useModelRunner
+        ? await requestFn({ profile: selectedProfile, profileId: selectedProfile.id ?? model, messages: session.messages.map(({ role, content }) => ({ role, content })), message, sessionId: session.id, sessionKey: session.id, mode: session.mode, model: selectedProfile.model, thinking, timeoutSeconds, local, signal: controller.signal })
+        : await requestFn({ message, sessionId: session.id, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal: controller.signal });
+      const content = modelRunner ? safeResponse(response) : response;
+      const assistantMessage = Object.freeze({ role: 'assistant', content, createdAt: clock().toISOString() });
       session.messages.push(assistantMessage);
       persist();
       return Object.freeze({ session: publicSession(session), message: assistantMessage });

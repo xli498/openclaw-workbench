@@ -42,3 +42,19 @@ test('模型档案拒绝重复 ID、未知能力和重复能力', async () => {
     assert.throws(() => registry.validate(profile({ capabilities: ['text', 'text'] })), { code: 'MODEL_CAPABILITIES_INVALID' });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('模型启用状态必须绑定当前 configHash，并在重启后保持', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-model-toggle-'));
+  try {
+    const registry = createModelRegistry({ root });
+    const created = registry.register(profile());
+    assert.throws(() => registry.setEnabled('primary', true, 'wrong-hash'), { code: 'MODEL_CONFLICT' });
+    const enabled = registry.setEnabled('primary', true, created.configHash);
+    assert.equal(enabled.enabled, true);
+    assert.notEqual(enabled.configHash, created.configHash);
+    assert.deepEqual(createModelRegistry({ root }).get('primary'), enabled);
+    assert.throws(() => registry.setEnabled('primary', false, created.configHash), { code: 'MODEL_CONFLICT' });
+    const disabled = registry.setEnabled('primary', false, enabled.configHash);
+    assert.equal(disabled.enabled, false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
