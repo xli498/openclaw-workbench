@@ -16,6 +16,7 @@ export { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-r
 export { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 export { SecretResolverError, createSecretResolver, parseSecretRef } from './secret-resolver.mjs';
 export { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
+export { ModelRunnerError, createModelRunner } from './model-runner.mjs';
 export { GatewayAdapterError, createGatewayAdapter } from './gateway-adapter.mjs';
 export { McpTransportError, createMcpStdioTransport } from './mcp-transport.mjs';
 export { McpHttpTransportError, createMcpHttpTransport } from './mcp-http-transport.mjs';

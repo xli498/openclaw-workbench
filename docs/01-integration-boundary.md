@@ -48,3 +48,7 @@ MCP runtime 控制面通过 `GET /v1/mcp/runtimes` 提供只读实例状态；`P
 ## 当前结论
 
 OpenClaw 已具备足够多的底层能力，可以作为产品基础；但 Workbench 必须增加产品 Runtime、权限策略、schema、诊断和恢复层。当前不能把 OpenClaw CLI、Control UI 或 MCP registry 直接拼成产品。
+
+## 产品核心验收边界
+
+核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用和会话关闭；公网隧道未内置。LSP 未实现，持久 PTY 未实现，不能把 CLI 诊断或一次性命令执行称作这两项能力。

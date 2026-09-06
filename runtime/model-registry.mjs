@@ -45,8 +45,10 @@ export function normalizeModelProfile(input = {}) {
 
 function restore(value) {
   const normalized = normalizeModelProfile(value);
-  if (value.enabled !== false || value.configHash !== normalized.configHash || !value.health || !['unknown', 'ready', 'unavailable', 'error'].includes(value.health.status)) fail('MODEL_REGISTRY_INVALID', 'model registry snapshot is invalid');
-  return publicProfile({ ...normalized, health: { status: value.health.status, checkedAt: value.health.checkedAt ?? null } });
+  if (typeof value.enabled !== 'boolean' || !value.health || !['unknown', 'ready', 'unavailable', 'error'].includes(value.health.status)) fail('MODEL_REGISTRY_INVALID', 'model registry snapshot is invalid');
+  const restored = { ...normalized, enabled: value.enabled, health: { status: value.health.status, checkedAt: value.health.checkedAt ?? null } };
+  if (value.configHash !== profileHash(restored)) fail('MODEL_REGISTRY_INVALID', 'model registry snapshot is invalid');
+  return publicProfile({ ...restored, configHash: profileHash(restored) });
 }
 
 export function createModelRegistry({ root, storePath = join(root ?? '', '.openclaw-workbench', 'model-registry.json') } = {}) {
@@ -63,6 +65,16 @@ export function createModelRegistry({ root, storePath = join(root ?? '', '.openc
   } catch (error) { if (error instanceof ModelRegistryError) throw error; throw new ModelRegistryError('MODEL_REGISTRY_INVALID', 'model registry snapshot is invalid'); }
   function persist() { persistedDigest = writeSnapshotAtomically({ root, storePath, payload: JSON.stringify({ version: VERSION, models: [...records.values()] }), expectedDigest: persistedDigest, ErrorType: ModelRegistryError, code: 'MODEL_REGISTRY_INVALID', message: 'model registry snapshot is invalid', busyCode: 'MODEL_REGISTRY_BUSY', busyMessage: 'model registry is busy', conflictCode: 'MODEL_REGISTRY_CONFLICT', conflictMessage: 'model registry changed outside this process', temporaryName: 'model-registry' }); }
   function register(input) { const profile = normalizeModelProfile(input); if (records.has(profile.id)) throw new ModelRegistryError('MODEL_DUPLICATE', 'model profile ID already exists'); records.set(profile.id, profile); try { persist(); } catch (error) { records.delete(profile.id); throw error; } return profile; }
+  function setEnabled(id, enabled, expectedConfigHash) {
+    const current = records.get(id);
+    if (!current) throw new ModelRegistryError('MODEL_NOT_FOUND', 'model profile not found');
+    if (typeof enabled !== 'boolean' || typeof expectedConfigHash !== 'string' || expectedConfigHash !== current.configHash) throw new ModelRegistryError('MODEL_CONFLICT', 'model configuration changed; refresh before approving');
+    const nextBase = { ...current, enabled, configHash: undefined };
+    const next = publicProfile({ ...nextBase, configHash: profileHash(nextBase) });
+    records.set(id, next);
+    try { persist(); } catch (error) { records.set(id, current); throw error; }
+    return next;
+  }
   function updateHealth(id, health) { const current = records.get(id); if (!current) throw new ModelRegistryError('MODEL_NOT_FOUND', 'model profile not found'); if (!['unknown', 'ready', 'unavailable', 'error'].includes(health?.status)) throw new ModelRegistryError('MODEL_HEALTH_INVALID', 'health status is invalid'); const next = publicProfile({ ...current, health: { status: health.status, checkedAt: typeof health.checkedAt === 'string' ? health.checkedAt : new Date().toISOString() } }); records.set(id, next); try { persist(); } catch (error) { records.set(id, current); throw error; } return next; }
-  return Object.freeze({ validate: normalizeModelProfile, register, updateHealth, get: (id) => records.has(id) ? publicProfile(records.get(id)) : null, list: () => Object.freeze([...records.values()].map(publicProfile)), snapshotPath: storePath });
+  return Object.freeze({ validate: normalizeModelProfile, register, setEnabled, updateHealth, get: (id) => records.has(id) ? publicProfile(records.get(id)) : null, list: () => Object.freeze([...records.values()].map(publicProfile)), snapshotPath: storePath });
 }

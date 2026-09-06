@@ -43,6 +43,26 @@ test('模型连接测试默认不联网，注入探针只收到安全 profile', 
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('模型启用和停用使用独立 configHash 审批，并拒绝旧 hash、token 互换和 replay', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-model-toggle-http-')); const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL }); const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/models', { method: 'POST', body: JSON.stringify(input({ id: 'toggle' })) });
+    const approved = await request(address, `/v1/models/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    const disabled = approved.body.profile;
+    const enable = await request(address, '/v1/models/toggle/enable', { method: 'POST', body: JSON.stringify({ sessionId: 'toggle-session', configHash: disabled.configHash }) });
+    assert.equal(enable.status, 201);
+    const wrongToken = await request(address, `/v1/models/${enable.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': TOKEN }, body: JSON.stringify({ actionHash: enable.body.proposal.action.actionHash }) });
+    assert.equal(wrongToken.status, 403);
+    const enabled = await request(address, `/v1/models/${enable.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: enable.body.proposal.action.actionHash }) });
+    assert.equal(enabled.status, 200);
+    const replay = await request(address, `/v1/models/${enable.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: enable.body.proposal.action.actionHash }) });
+    assert.equal(replay.status, 404);
+    const stale = await request(address, '/v1/models/toggle/disable', { method: 'POST', body: JSON.stringify({ sessionId: 'toggle-session', configHash: disabled.configHash }) });
+    assert.equal(stale.status, 409);
+    assert.equal((await request(address, '/v1/models')).body.models.find((model) => model.id === 'toggle').enabled, true);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('模型连接探针返回恶意 code 时，响应、审计和快照不回显原文', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-model-health-red-'));
   const secret = 'secret-value-must-not-leak';

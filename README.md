@@ -4,6 +4,8 @@
 
 > 这是独立的、非官方 OpenClaw 项目，不会自动修改 OpenClaw 配置。当前版本是可测试的 Runtime 产品基线，不是已经接管生产环境的完整控制面。
 
+产品核心的可验收闭环是：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具 → 审批提案 → 验证与脱敏审计。`Streamable HTTP MCP Bridge` 属于独立里程碑；公网隧道未内置，LSP 未实现，持久 PTY 未实现，不能用诊断或一次性命令执行冒充这些能力。
+
 ## 当前可运行入口
 
 包入口：`import { startWorkbench, createPatchProposal, approveAndApplyPatch, readConfig, importConfig, rollbackConfig } from 'openclaw-workbench'`。运行时提供本地工作区启动扫描、恢复编排、Patch 审批应用闭环、配置备份/回滚和独立的受控命令执行器；不会自动接管 OpenClaw Gateway。
