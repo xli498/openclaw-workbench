@@ -242,6 +242,54 @@ test('控制面暴露已鉴权的只读 MCP 诊断摘要', async () => {
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('模型 GET 健康检查保持非联网，POST 连接测试必须绑定审批令牌和当前 configHash', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-model-live-'));
+  let liveCalls = 0;
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    inspectModelProfileFn: async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }),
+    modelHealthProbe: async () => { liveCalls += 1; return { status: 'ready', code: 'PROBE_OK' }; },
+  });
+  const address = await app.listen();
+  try {
+    const profile = { id: 'live-primary', provider: 'openai', protocol: 'openai-compatible', model: 'gpt-test', endpoint: 'https://provider.example/v1', capabilities: ['text'], secretRef: 'env:OPENAI_KEY' };
+    const created = await request(address, '/v1/models', { method: 'POST', body: JSON.stringify({ sessionId: 'model-live', ...profile }) });
+    const approved = await request(address, `/v1/models/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    const readOnly = await request(address, '/v1/models/live-primary/health');
+    assert.deepEqual(readOnly.body.health, { status: 'unavailable', code: 'NOT_CONFIGURED' });
+    assert.equal(liveCalls, 0);
+    const missingApproval = await request(address, '/v1/models/live-primary/health', { method: 'POST', body: JSON.stringify({ actionHash: approved.body.profile.configHash }) });
+    assert.equal(missingApproval.status, 403);
+    const stale = await request(address, '/v1/models/live-primary/health', { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: 'stale-hash' }) });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.error, 'MODEL_ACTION_HASH_MISMATCH');
+    const live = await request(address, '/v1/models/live-primary/health', { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: approved.body.profile.configHash }) });
+    assert.equal(live.status, 200, JSON.stringify(live.body));
+    assert.deepEqual(live.body.health, { status: 'ready', code: 'PROBE_OK' });
+    assert.equal(liveCalls, 1);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('模型连接测试的响应、审计和快照不包含 SecretRef 解析值', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-model-secret-'));
+  const secret = 'secret-value-must-not-leak';
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', modelHealthProbe: async () => ({ status: 'error', code: 'MODEL_REQUEST_FAILED' }) });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/models', { method: 'POST', body: JSON.stringify({ sessionId: 'model-secret', id: 'secret-primary', provider: 'openai', protocol: 'openai-compatible', model: 'gpt-test', endpoint: 'https://provider.example/v1', capabilities: ['text'], secretRef: 'env:OPENAI_KEY' }) });
+    const approved = await request(address, `/v1/models/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    const live = await request(address, '/v1/models/secret-primary/health', { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: approved.body.profile.configHash }) });
+    assert.equal(live.status, 200);
+    const audit = await request(address, '/v1/audit');
+    assert.equal(JSON.stringify(live.body).includes(secret), false);
+    assert.equal(JSON.stringify(audit.body).includes(secret), false);
+    assert.equal((await readFile(path.join(root, '.openclaw-workbench', 'model-registry.json'), 'utf8')).includes(secret), false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('OpenClaw 诊断与 Agent adapter 使用同一个配置命令', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-diagnostics-command-'));
   let seen;

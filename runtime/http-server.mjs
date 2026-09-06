@@ -21,6 +21,8 @@ import { snapshotDigest } from './snapshot-store.mjs';
 import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
 import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
+import { SecretResolverError, createSecretResolver } from './secret-resolver.mjs';
+import { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
@@ -28,6 +30,7 @@ const MAX_CONFIG_PROPOSAL_BYTES = 8 * 1024 * 1024;
 const MAX_MCP_PROPOSALS = 64;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DECIMAL_INTEGER_PATTERN = /^(?:0|[1-9][0-9]*)$/;
+const MODEL_HEALTH_CODES = new Set(['NOT_CONFIGURED', 'PROBE_OK', 'MODEL_HEALTH_FAILED', 'MODEL_PROTOCOL_UNSUPPORTED', 'MODEL_HTTP_STATUS', 'MODEL_RESPONSE_LIMIT', 'MODEL_RESPONSE_INVALID', 'MODEL_TIMEOUT', 'MODEL_ABORTED', 'MODEL_REQUEST_FAILED', 'SECRET_REF_INVALID', 'SECRET_NOT_FOUND', 'SECRET_PROVIDER_UNAVAILABLE', 'SECRET_PROVIDER_FAILED', 'SECRET_VALUE_INVALID']);
 
 function requestIdOf(value) {
   return typeof value === 'string' && REQUEST_ID_PATTERN.test(value) ? value : randomUUID();
@@ -121,6 +124,8 @@ function errorResponse(error) {
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
+  if (error instanceof SecretResolverError) return { status: 400, body: safe(error.code, error.message) };
+  if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
@@ -174,6 +179,12 @@ function publicModelProposal(proposal) {
   return { action: proposal.action, profile: proposal.profile };
 }
 
+function modelHealthSummary(result) {
+  const health = { status: ['ready', 'unavailable', 'error', 'unknown'].includes(result?.status) ? result.status : 'error' };
+  if (MODEL_HEALTH_CODES.has(result?.code)) health.code = result.code;
+  return health;
+}
+
 function publicAuditEvent(event) {
   const safe = {};
   for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'profileId', 'operation', 'status', 'code', 'state']) {
@@ -195,7 +206,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, eventBus, mcpRuntime, mcpTransportFactory, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -221,6 +232,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const inspectMcp = inspectOpenClawMcpFn ?? ((options) => inspectOpenClawMcp(options));
   const inspectMcpServer = inspectMcpServerFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
   const inspectModelProfile = inspectModelProfileFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
+  const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: secretResolver ?? createSecretResolver() });
   const sessions = createChatSessionManager({ root, runAgentFn: agentRunner });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
@@ -247,10 +259,25 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         const profile = modelRegistry.get(modelHealth[1]);
         if (!profile) return json(response, 404, { error: 'MODEL_NOT_FOUND', message: 'model profile not found' });
         let result; try { result = await inspectModelProfile({ profile }); } catch (error) { result = { status: 'error', code: error.code ?? 'MODEL_HEALTH_FAILED' }; }
-        const health = { status: ['ready', 'unavailable', 'error', 'unknown'].includes(result?.status) ? result.status : 'error', ...(typeof result?.code === 'string' && result.code.length <= 128 ? { code: result.code } : {}) };
+        const health = modelHealthSummary(result);
         const updated = modelRegistry.updateHealth(profile.id, health);
         if (effectiveAudit) await effectiveAudit.append({ type: 'model.health.checked', actor: 'system', profileId: updated.id, status: health.status, code: health.code ?? null });
         return json(response, 200, { profile: { id: updated.id, provider: updated.provider, model: updated.model, enabled: updated.enabled }, health });
+      }
+      if (request.method === 'POST' && modelHealth) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const profile = modelRegistry.get(modelHealth[1]);
+        if (!profile) return json(response, 404, { error: 'MODEL_NOT_FOUND', message: 'model profile not found' });
+        const input = await bodyOf(request);
+        if (input.actionHash !== profile.configHash) throw new ModelRegistryError('MODEL_ACTION_HASH_MISMATCH', 'approval must bind the current model configuration hash');
+        const abort = requestAbortSignal(request, response);
+        try {
+          const result = await liveModelProbe(profile, { signal: abort.signal });
+          const health = modelHealthSummary(result);
+          const updated = modelRegistry.updateHealth(profile.id, health);
+          if (effectiveAudit) await effectiveAudit.append({ type: 'model.health.live_checked', actor: 'system', profileId: updated.id, status: health.status, code: health.code ?? null });
+          return json(response, 200, { profile: { id: updated.id, provider: updated.provider, model: updated.model, enabled: updated.enabled }, health });
+        } finally { abort.cleanup(); }
       }
       if (request.method === 'POST' && url.pathname === '/v1/models') {
         const input = await bodyOf(request);

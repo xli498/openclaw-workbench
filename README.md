@@ -92,7 +92,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 命令终态持久化与启动扫描 | 已实现；未完成动作只进入人工复核 |
 | 审计哈希链与并发追加锁 | 已实现 |
 | 配置导入、备份、哈希冲突和回滚 | 已实现；仅限工作区 JSON，需独立审批 |
-| 模型档案、SecretRef 引用和连接测试 | 已实现受控元数据骨架；默认禁用，不解析密钥或联网 |
+| 模型档案、SecretRef 引用和连接测试 | 已实现受控元数据、`env:`/抽象 `keychain:` 解析和审批触发的 OpenAI-compatible 健康探针；不持久化密钥 |
 | Gateway WebSocket 传输边界 | 已实现回环连接/请求关联/超时取消；未实现 OpenClaw 协议和生命周期 |
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
 | MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具 |
@@ -138,7 +138,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 `GET /v1/models` 查看 Workbench 的本地模型档案；`POST /v1/models` 创建档案提案，使用独立 `x-approval-token` 调用 `/v1/models/<actionId>/approve` 才会登记。档案只保存 provider、protocol、model、能力列表、无密钥的 `env:`/`keychain:` SecretRef 引用和健康摘要；新档案默认 `enabled:false`，不会保存 API key 或 SecretRef 解析值。
 
-`GET /v1/models/<profileId>/health` 只调用显式注入的连接探针；默认返回 `NOT_CONFIGURED`，不联网、不读取 SecretRef、不调用真实模型。真实供应商 SDK、密钥环解析、模型调用和 Gateway 生命周期仍未开放。
+`GET /v1/models/<profileId>/health` 是只读、非联网健康摘要，默认返回 `NOT_CONFIGURED`。需要真实连接测试时，调用 `POST /v1/models/<profileId>/health`，请求必须带独立 `x-approval-token`，并在 JSON body 中提交当前 `configHash`；服务只执行一次有超时、取消和响应大小上限的 OpenAI-compatible `GET <endpoint>/models`，固定拒绝 HTTP、回环/私网/metadata endpoint 且不跟随重定向。SecretRef 仅在内存中解析为请求头，解析值不会进入模型档案、审计、响应或快照。当前不执行聊天补全、不支持真实 Anthropic/Responses 调用，也不提供密钥环的系统实现；`keychain:` 需要宿主注入受控 provider。
 
 本地快照仅允许工作区内的普通文件，发现快照或快照目录为符号链接即拒绝恢复/写入；快照写入后固定为 `0600`，创建目录为 `0700`。这不是宿主机隔离的替代品。
 
