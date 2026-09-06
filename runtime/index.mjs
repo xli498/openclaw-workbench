@@ -14,6 +14,8 @@ export { inspectOpenClaw } from './openclaw-adapter.mjs';
 export { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId } from './config-store.mjs';
 export { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
 export { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
+export { SecretResolverError, createSecretResolver, parseSecretRef } from './secret-resolver.mjs';
+export { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 export { GatewayAdapterError, createGatewayAdapter } from './gateway-adapter.mjs';
 export { McpTransportError, createMcpStdioTransport } from './mcp-transport.mjs';
 export { McpHttpTransportError, createMcpHttpTransport } from './mcp-http-transport.mjs';

@@ -411,3 +411,11 @@
 - 新增审批 API 和非联网连接探针；审批绑定 session、actionHash 和独立 approval token，探针不接触 SecretRef 解析值。
 - 红队覆盖 SecretRef 值、凭据 endpoint、敏感 query、协议注入、token 互换、actionHash 重放和自动联网；模型定向与红队共 14 项全部通过。
 - 产品边界：真实 provider SDK、密钥环解析、模型调用和 Gateway WebSocket 仍未开放。
+
+## 2026-09-06：SecretRef 解析与真实模型健康探针红蓝复审
+
+- 新增受控 `SecretResolver`：仅接受 `env:` 或抽象 `keychain:` 引用，阻断错误变量名、控制字符、空值和超长值；解析值只在内存请求头中短暂存在。
+- 新增 OpenAI-compatible 单次 `GET <endpoint>/models` 探针：无重试，具备超时、调用方取消、响应大小上限和非回显错误映射；不支持协议返回明确错误。
+- `GET /v1/models/<id>/health` 继续保持非联网；新增 `POST` 连接测试，必须同时通过独立 approval token 和当前 `configHash`，配置漂移会阻断。
+- 红队覆盖错误 SecretRef、解析/读取超时与取消竞态、恶意 probe code、AbortSignal 被底层忽略、HTTP 错误、响应洪泛、回环/私网/metadata endpoint、重定向、快照/审计/响应泄露和旧 hash；修复后全量回归为 338 项测试中 318 pass、0 fail、20 个 Windows symlink 权限 skip。
+- 产品边界：当前只做连接健康探针，不执行聊天补全；Anthropic/Responses、系统密钥环实现、正式 OpenClaw Gateway/channel 和公网 Bridge 仍未开放。
