@@ -57,5 +57,5 @@
 
 - [x] Re-run attacks for secret leakage in errors, JSON responses, audit, snapshots, action previews, malformed refs, oversized responses, timeout races, endpoint policy, and stale config hashes.
 - [x] Run `npm test`, `npm pack --dry-run`, `node --check` on changed modules, and `git diff --check`.
-- [ ] Perform an independent review of the diff, fix all Critical/Important findings, commit the verified slice, push a PR, wait for Node 22/24/Windows CI, and merge only after all required checks are green.
-- [ ] Save the durable result and append its path to the shared results index without storing credentials.
+- [x] Perform an independent review of the diff, fix all Critical/Important findings, commit the verified slice, push a PR, wait for Node 22/24/Windows CI, and merge only after all required checks are green.
+- [x] Save the durable result and append its path to the shared results index without storing credentials.
