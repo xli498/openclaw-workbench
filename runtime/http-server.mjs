@@ -24,6 +24,9 @@ import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 import { SecretResolverError, createSecretResolver } from './secret-resolver.mjs';
 import { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 import { ModelRunnerError, createModelRunner } from './model-runner.mjs';
+import { createWorkspaceToolRegistry } from './workspace-tool-registry.mjs';
+import { ToolRegistryError, createToolRegistry } from './tool-registry.mjs';
+import { AgentLoopError } from './agent-loop.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
@@ -120,7 +123,9 @@ function errorResponse(error) {
   }
   if (error instanceof EventBusError) return { status: 400, body: safe(error.code, 'event request failed') };
   if (error instanceof ProposalStoreError) return { status: error.code === 'PROPOSAL_NOT_FOUND' ? 404 : ['PROPOSAL_BUSY', 'PROPOSAL_MANUAL_REVIEW', 'ACTION_HASH_MISMATCH', 'CLAIM_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, 'proposal request failed') };
-  if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
+  if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'INTERNAL_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'READ_RACE', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
+  if (error instanceof ToolRegistryError) return { status: ['TOOL_BATCH_LIMIT', 'TOOL_OUTPUT_LIMIT', 'TOOL_ARGUMENT_LIMIT'].includes(error.code) ? 413 : ['TOOL_NOT_ALLOWED', 'TOOL_MODE_DENIED'].includes(error.code) ? 403 : error.code === 'TOOL_EXECUTION_FAILED' ? 502 : 400, body: safe(error.code, error.message) };
+  if (error instanceof AgentLoopError) return { status: ['AGENT_LOOP_ABORTED'].includes(error.code) ? 409 : ['TOOL_OUTPUT_LIMIT', 'TOOL_ARGUMENT_LIMIT'].includes(error.code) ? 413 : ['TOOL_NOT_ALLOWED', 'TOOL_MODE_DENIED'].includes(error.code) ? 403 : 400, body: safe(error.code, error.message) };
   if (error instanceof RecoveryError) return { status: ['SCAN_FAILED', 'MANIFEST_INVALID'].includes(error.code) ? 500 : 400, body: safe(error.code, error.message) };
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
@@ -208,7 +213,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -227,7 +232,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const mcpRegistry = createMcpRegistry({ root });
   const runtime = mcpRuntime ?? createMcpServerRuntime({ registry: mcpRegistry, transportFactory: mcpTransportFactory });
   const effectiveAudit = audit ?? createLazyAuditLog(root);
-  const proposalStore = createProposalStore({ root });
+  const proposalStore = proposalStoreOverride ?? createProposalStore({ root });
   const adapterConfig = adapter ? { ...adapter, command: adapter.command ?? 'openclaw' } : null;
   const agentRunner = runAgentFn ?? (adapterConfig ? createOpenClawAgentRunner(adapterConfig) : undefined);
   const inspect = inspectOpenClawFn ?? ((options) => inspectOpenClaw(options));
@@ -237,7 +242,11 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const effectiveSecretResolver = secretResolver ?? createSecretResolver();
   const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: effectiveSecretResolver });
   const liveModelRunner = modelRunner ?? createModelRunner({ profileResolver: modelRegistry, secretResolver: effectiveSecretResolver });
-  const sessions = createChatSessionManager({ root, runAgentFn: agentRunner, modelRunner: liveModelRunner, modelResolver: modelRegistry, modelFallbackFn: agentRunner });
+  const workspaceTools = createToolRegistry({ root, audit: effectiveAudit, onProposal: async (proposal) => {
+    proposalStore.put(proposal);
+    proposals.set(proposal.action.id, proposal);
+  } });
+  const sessions = createChatSessionManager({ root, runAgentFn: agentRunner, modelRunner: liveModelRunner, modelResolver: modelRegistry, modelFallbackFn: agentRunner, toolRegistry: workspaceTools });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
   const liveStreams = new Set();
@@ -596,8 +605,8 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         const session = sessions.getSession(sessionTool[1]);
         const input = await bodyOf(request);
         const proposal = await createCodeToolProposal({ mode: session.mode, tool: input.tool, input: { ...input.input, sessionId: session.id }, root, audit: effectiveAudit });
-        proposals.set(proposal.action.id, proposal);
         proposalStore.put(proposal);
+        proposals.set(proposal.action.id, proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: session.id, actionId: proposal.action.id, requestId, data: { tool: input.tool, actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
@@ -612,16 +621,16 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'POST' && url.pathname === '/v1/proposals/patch') {
         const input = await bodyOf(request);
         const proposal = await createPatchProposal({ ...input, root, audit: effectiveAudit, currentRevision: await currentWorkspaceRevision() });
-        proposals.set(proposal.action.id, proposal);
         proposalStore.put(proposal);
+        proposals.set(proposal.action.id, proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }
       if (request.method === 'POST' && url.pathname === '/v1/proposals/command') {
         const input = await bodyOf(request);
         const proposal = await createCommandProposal({ ...input, root, audit: effectiveAudit, currentRevision: await currentWorkspaceRevision() });
-        proposals.set(proposal.action.id, proposal);
         proposalStore.put(proposal);
+        proposals.set(proposal.action.id, proposal);
         eventBus.publish({ type: 'proposal.created', sessionId: proposal.action.sessionId, actionId: proposal.action.id, requestId, data: { actionType: proposal.action.type, status: proposal.action.status } });
         return json(response, 201, { proposal: publicProposal(proposal) });
       }

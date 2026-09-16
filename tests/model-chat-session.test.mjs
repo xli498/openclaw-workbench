@@ -47,3 +47,24 @@ test('模型 Chat 拒绝未选择、未知和 disabled profile，不回退到其
     assert.equal(calls.length, 0);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('模型 Chat 跨用户回合向 provider 发送字符串 assistant content', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-model-chat-history-'));
+  const seen = [];
+  const selected = profile({ id: 'history' });
+  const manager = createChatSessionManager({
+    root,
+    modelRunner: async (input) => {
+      seen.push(input.messages);
+      return { text: `reply-${seen.length}`, toolCalls: [], finishReason: 'stop', model: selected.model, protocol: selected.protocol };
+    },
+    modelResolver: { get: (id) => id === selected.id ? selected : null },
+  });
+  const session = manager.createSession({ mode: 'Ask' });
+  try {
+    await manager.sendMessage({ sessionId: session.id, model: selected.id, message: 'one' });
+    await manager.sendMessage({ sessionId: session.id, model: selected.id, message: 'two' });
+    assert.equal(typeof seen[1].find((message) => message.role === 'assistant').content, 'string');
+    assert.equal(seen[1].find((message) => message.role === 'assistant').content, 'reply-1');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

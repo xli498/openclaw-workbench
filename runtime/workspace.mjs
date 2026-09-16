@@ -1,4 +1,4 @@
-import { lstat, open, readFile, readlink, readdir, realpath, stat } from 'node:fs/promises';
+import { lstat, open, readlink, readdir, realpath, stat } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -24,9 +24,11 @@ export function isSensitiveWorkspacePath(relativePath, patterns = DEFAULT_SENSIT
   return patterns.some((pattern) => pattern.test(normalized));
 }
 
-function isInternalStatePath(relativePath) {
-  const normalized = relativePath.replaceAll('\\', '/');
-  return normalized === INTERNAL_STATE_DIRECTORY || normalized.startsWith(`${INTERNAL_STATE_DIRECTORY}/`);
+export function isInternalWorkspacePath(relativePath) {
+  if (typeof relativePath !== 'string') return false;
+  const normalized = relativePath.replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase();
+  const internal = INTERNAL_STATE_DIRECTORY.toLowerCase();
+  return normalized === internal || normalized.startsWith(`${internal}/`);
 }
 
 export class WorkspaceError extends Error {
@@ -39,8 +41,13 @@ export class WorkspaceError extends Error {
 }
 
 function assertRelative(relativePath) {
-  if (typeof relativePath !== 'string' || !relativePath || path.isAbsolute(relativePath)) {
+  if (typeof relativePath !== 'string' || !relativePath || path.isAbsolute(relativePath) || /[\0\r\n]/.test(relativePath)) {
     throw new WorkspaceError('INVALID_PATH', 'path must be a non-empty relative path');
+  }
+  // A colon denotes an NTFS alternate data stream or a Win32 device/drive
+  // path. It must never be accepted as a workspace-relative file name.
+  if (process.platform === 'win32' && relativePath.includes(':')) {
+    throw new WorkspaceError('INVALID_PATH', 'path contains a forbidden Windows stream or device prefix');
   }
   const normalized = path.normalize(relativePath);
   if (normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
@@ -56,6 +63,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
   const isSensitive = (relativePath) => isSensitiveWorkspacePath(relativePath, sensitivePatterns);
   const resolveSafe = async (relativePath, { allowMissing = false } = {}) => {
     const normalized = assertRelative(relativePath);
+    if (isInternalWorkspacePath(normalized)) throw new WorkspaceError('INTERNAL_PATH', 'access to internal workbench state is denied', { path: normalized });
     if (isSensitive(normalized)) throw new WorkspaceError('SENSITIVE_PATH', 'access to sensitive path is denied', { path: normalized });
     const candidate = path.resolve(rootReal, normalized);
     if (candidate !== rootReal && !candidate.startsWith(`${rootReal}${path.sep}`)) {
@@ -63,9 +71,12 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
     }
     try {
       const targetReal = await realpath(candidate);
+      const targetRelative = path.relative(rootReal, targetReal);
       if (targetReal !== rootReal && !targetReal.startsWith(`${rootReal}${path.sep}`)) {
         throw new WorkspaceError('SYMLINK_ESCAPE', 'symbolic link escapes workspace root', { path: normalized });
       }
+      if (isInternalWorkspacePath(targetRelative)) throw new WorkspaceError('INTERNAL_PATH', 'access to internal workbench state is denied', { path: normalized });
+      if (isSensitive(targetRelative)) throw new WorkspaceError('SENSITIVE_PATH', 'access to sensitive path is denied', { path: normalized });
       return { normalized, candidate, targetReal };
     } catch (error) {
       if (allowMissing && error.code === 'ENOENT') return { normalized, candidate, targetReal: candidate };
@@ -81,7 +92,30 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
       const info = await stat(resolved.targetReal);
       if (!info.isFile()) throw new WorkspaceError('NOT_A_FILE', 'target is not a regular file', { path: resolved.normalized });
       if (info.size > maxBytes) throw new WorkspaceError('READ_LIMIT', `file exceeds ${maxBytes} bytes`, { path: resolved.normalized, size: info.size });
-      return readFile(resolved.targetReal, { encoding });
+      let handle;
+      try {
+        handle = await open(resolved.targetReal, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+        const opened = await handle.stat();
+        if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino || opened.size !== info.size) {
+          throw new WorkspaceError('READ_RACE', 'workspace file changed during read', { path: resolved.normalized });
+        }
+        const buffer = Buffer.allocUnsafe(opened.size);
+        let position = 0;
+        while (position < opened.size) {
+          const { bytesRead } = await handle.read(buffer, position, opened.size - position, position);
+          if (bytesRead === 0) throw new WorkspaceError('READ_RACE', 'workspace file changed during read', { path: resolved.normalized });
+          position += bytesRead;
+        }
+        const after = await handle.stat();
+        if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+          throw new WorkspaceError('READ_RACE', 'workspace file changed during read', { path: resolved.normalized });
+        }
+        return encoding === 'buffer' || encoding === null ? buffer : buffer.toString(encoding);
+      } catch (error) {
+        if (error instanceof WorkspaceError) throw error;
+        if (['ELOOP', 'ENOTDIR', 'ESTALE', 'ENOENT'].includes(error?.code)) throw new WorkspaceError('READ_RACE', 'workspace file changed during read', { path: resolved.normalized });
+        throw new WorkspaceError('READ_FAILED', 'workspace file could not be read', { path: resolved.normalized });
+      } finally { await handle?.close(); }
     },
     async inspect(relativePath) {
       const resolved = await resolveSafe(relativePath);
@@ -97,7 +131,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         const nodes = [];
         for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
           const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
-          if (isInternalStatePath(relativePath) || isSensitive(relativePath)) continue;
+          if (isInternalWorkspacePath(relativePath) || isSensitive(relativePath)) continue;
           count += 1;
           if (count > maxEntries) throw new WorkspaceError('TREE_LIMIT', 'workspace tree exceeds entry limit', { maxEntries });
           const absolutePath = path.join(directory, entry.name);
@@ -170,18 +204,24 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         }
       };
       try {
-        const [{ stdout: head }, { stdout: tracked }, { stdout: untracked }] = await Promise.all([
+        // Wait for every probe to settle before falling back. Promise.all would
+        // return on the first non-git error while the other child processes
+        // still hold the workspace open on Windows.
+        const probes = await Promise.allSettled([
           execFileAsync('git', ['-C', rootReal, 'rev-parse', 'HEAD'], { timeout: 5_000, maxBuffer: 64 * 1024 }),
           execFileAsync('git', ['-C', rootReal, 'ls-files', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
           execFileAsync('git', ['-C', rootReal, 'ls-files', '--others', '--exclude-standard', '-z'], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }),
         ]);
+        const failedProbe = probes.find((probe) => probe.status === 'rejected');
+        if (failedProbe) throw failedProbe.reason;
+        const [{ value: { stdout: head } }, { value: { stdout: tracked } }, { value: { stdout: untracked } }] = probes;
         const digest = createHash('sha256').update(head).update('\0');
         for (const relativePath of [...new Set([...tracked.split('\0'), ...untracked.split('\0')].filter(Boolean))].sort()) {
-          if (isSensitive(relativePath) || isInternalStatePath(relativePath)) continue;
+          if (isSensitive(relativePath) || isInternalWorkspacePath(relativePath)) continue;
           accountEntry();
           const resolved = await resolveSafe(relativePath, { allowMissing: true });
           const targetRelative = path.relative(rootReal, resolved.targetReal);
-          if (isInternalStatePath(targetRelative) || isSensitive(targetRelative)) {
+          if (isInternalWorkspacePath(targetRelative) || isSensitive(targetRelative)) {
             throw new WorkspaceError('SENSITIVE_PATH', 'workspace revision encountered an alias to excluded state', { path: relativePath, target: targetRelative });
           }
           const info = await stat(resolved.targetReal).catch((error) => {
@@ -208,7 +248,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
             const entries = await readdir(directory, { withFileTypes: true });
             for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
               const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
-              if (isInternalStatePath(relativePath) || isSensitive(relativePath)) continue;
+              if (isInternalWorkspacePath(relativePath) || isSensitive(relativePath)) continue;
               accountEntry();
               const absolutePath = path.join(directory, entry.name);
               const info = await lstat(absolutePath);
@@ -217,7 +257,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
                 const targetReal = await realpath(absolutePath);
                 if (targetReal !== rootReal && !targetReal.startsWith(`${rootReal}${path.sep}`)) throw new WorkspaceError('SYMLINK_ESCAPE', 'workspace revision encountered a symlink outside the workspace', { path: relativePath });
                 const targetRelative = path.relative(rootReal, targetReal);
-                if (isInternalStatePath(targetRelative) || isSensitive(targetRelative)) {
+                if (isInternalWorkspacePath(targetRelative) || isSensitive(targetRelative)) {
                   throw new WorkspaceError('SENSITIVE_PATH', 'workspace revision encountered a symlink to excluded state', { path: relativePath, target: targetRelative });
                 }
                 digest.update(relativePath).update('\0symlink\0').update(link).update('\0');
