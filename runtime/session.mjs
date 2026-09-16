@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import { runAgent } from './openclaw-adapter.mjs';
 import { runPlanReview, runPlanDebate, PlanError } from './plan.mjs';
 import { readSnapshot, writeSnapshotAtomically } from './snapshot-store.mjs';
+import { runAgentLoop } from './agent-loop.mjs';
+import { redactText as redactSafeText, redactValue as redactSafeValue } from './redaction.mjs';
 
 export const CHAT_MODES = Object.freeze(['Ask', 'Plan', 'Code']);
 const MAX_MESSAGE_LENGTH = 32 * 1024;
@@ -58,7 +60,7 @@ function attachPersistenceError(primary, persistenceError) {
 }
 
 function redactString(value) {
-  return value.replace(SENSITIVE_VALUE, '$1[redacted]');
+  return redactSafeText(value);
 }
 
 function safeResponse(response) {
@@ -77,15 +79,17 @@ function safeResponse(response) {
 }
 
 function redactValue(value, depth = 0) {
-  if (depth > 8) return '[redacted]';
-  if (typeof value === 'string') return redactString(value).slice(0, 4096);
-  if (Array.isArray(value)) return value.slice(0, 64).map((item) => redactValue(item, depth + 1));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).slice(0, 128).map(([key, item]) => [redactString(key).slice(0, 128), redactValue(item, depth + 1)]));
-  if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
-  return '[redacted]';
+  return redactSafeValue(value, { depth, maxStringLength: 4096 });
 }
 
-export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayRequestFn, modelRunner, modelResolver, modelFallbackFn, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
+function modelHistoryMessage({ role, content }) {
+  if (role === 'assistant' && content && typeof content === 'object' && !Array.isArray(content)) {
+    return { role, content: typeof content.text === 'string' ? redactString(content.text) : '' };
+  }
+  return { role, content: typeof content === 'string' ? redactString(content) : '' };
+}
+
+export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayRequestFn, modelRunner, modelResolver, modelFallbackFn, toolRegistry, clock = () => new Date(), storePath = join(root ?? '', '.openclaw-workbench', 'sessions.json') } = {}) {
   if (!root) throw new SessionError('ROOT_REQUIRED', 'root is required');
   const sessions = new Map();
   const controllers = new Map();
@@ -192,10 +196,43 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayR
     let primaryError;
     try {
       const requestFn = useModelRunner ? modelRunner : modelFallbackFn ?? gatewayRequestFn ?? runAgentFn;
-      const response = useModelRunner
-        ? await requestFn({ profile: selectedProfile, profileId: selectedProfile.id ?? model, messages: session.messages.map(({ role, content }) => ({ role, content })), message, sessionId: session.id, sessionKey: session.id, mode: session.mode, model: selectedProfile.model, thinking, timeoutSeconds, local, signal: controller.signal })
-        : await requestFn({ message, sessionId: session.id, sessionKey: session.id, mode: session.mode, model, thinking, timeoutSeconds, local, signal: controller.signal });
-      const content = modelRunner ? safeResponse(response) : response;
+      let response;
+      const modelMessages = session.messages.map(modelHistoryMessage);
+      // A caller that injects only a model runner (without the unified tool
+      // registry) is using the pre-tool-loop API. Preserve that boundary: the
+      // runner response is still normalized/redacted below, but no assistant
+      // supplied tool call is executed or interpreted here. The HTTP product
+      // path always supplies the registry and therefore takes the bounded
+      // structured tool loop.
+      if (useModelRunner && toolRegistry) {
+        response = await runAgentLoop({
+          mode: session.mode,
+          sessionId: session.id,
+          profile: selectedProfile,
+          messages: modelMessages,
+          registry: toolRegistry,
+          modelRunner: requestFn,
+          model: selectedProfile.model,
+          profileId: selectedProfile.id ?? model,
+          message,
+          sessionKey: session.id,
+          thinking,
+          timeoutSeconds,
+          local,
+          signal: controller.signal,
+        });
+      } else {
+        response = await requestFn({ profile: selectedProfile, profileId: selectedProfile?.id ?? model, messages: modelMessages, message, sessionId: session.id, sessionKey: session.id, mode: session.mode, model: selectedProfile?.model ?? model, thinking, timeoutSeconds, local, signal: controller.signal });
+        // The legacy direct-runner seam has no tool registry and therefore no
+        // authority to interpret assistant tool calls. Do not persist
+        // provider-controlled text or arguments from such a batch: dropping
+        // the unsupported batch keeps the compatibility API read-only and
+        // prevents untrusted tool payloads from entering snapshots.
+        if (useModelRunner && Array.isArray(response?.toolCalls) && response.toolCalls.length > 0) {
+          response = { ...response, text: '', toolCalls: [] };
+        }
+      }
+      const content = useModelRunner ? safeResponse(response) : response;
       const assistantMessage = Object.freeze({ role: 'assistant', content, createdAt: clock().toISOString() });
       session.messages.push(assistantMessage);
       persist();

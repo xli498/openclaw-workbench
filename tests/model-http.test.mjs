@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
@@ -96,5 +96,53 @@ test('HTTP 连接测试通过注入的 SecretResolver 只把密钥放进请求�
     assert.equal(seen.url, 'https://api.example.test/v1/models');
     assert.equal(seen.options.headers.authorization, 'Bearer secret-header-only');
     assert.equal('body' in seen.options, false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('HTTP Chat 端到端执行已启用模型的只读 workspace tool loop', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-model-chat-http-'));
+  await writeFile(path.join(root, 'README.md'), 'HTTP workspace fixture');
+  let calls = 0;
+  const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL, modelRunner: async (input) => {
+    calls += 1;
+    return calls === 1
+      ? { text: '', toolCalls: [{ id: 'read', name: 'workspace.read_file', arguments: { path: 'README.md' } }], finishReason: 'tool_calls', model: input.model, protocol: 'openai-compatible' }
+      : { text: 'HTTP 工具回路完成', toolCalls: [], finishReason: 'stop', model: input.model, protocol: 'openai-compatible' };
+  } });
+  const address = await app.listen();
+  try {
+    const created = await request(address, '/v1/models', { method: 'POST', body: JSON.stringify(input({ id: 'chat-http', model: 'chat-test' })) });
+    const registered = await request(address, `/v1/models/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    const toggle = await request(address, '/v1/models/chat-http/enable', { method: 'POST', body: JSON.stringify({ sessionId: 'chat-http-session', configHash: registered.body.profile.configHash }) });
+    await request(address, `/v1/models/${toggle.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: toggle.body.proposal.action.actionHash }) });
+    const session = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Ask' }) });
+    const result = await request(address, `/v1/sessions/${session.body.session.id}/messages`, { method: 'POST', body: JSON.stringify({ modelId: 'chat-http', message: '读取 README' }) });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.message.content.text, 'HTTP 工具回路完成');
+    assert.equal(calls, 2);
+    assert.equal(result.body.session.messageCount, 2);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('红队攻击：工具提案持久化失败时不留下可审批的内存幽灵', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-tool-proposal-store-fail-'));
+  const failingStore = {
+    put() { throw new Error('simulated proposal persistence failure'); },
+    get() { return null; },
+    list() { return []; },
+    recoverySummary() { return { total: 0, manualReview: 0, executing: 0, terminal: 0 }; },
+  };
+  const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL, proposalStore: failingStore });
+  const address = await app.listen();
+  try {
+    const session = await request(address, '/v1/sessions', { method: 'POST', body: JSON.stringify({ mode: 'Code' }) });
+    const created = await request(address, `/v1/sessions/${session.body.session.id}/tools/proposals`, {
+      method: 'POST',
+      body: JSON.stringify({ tool: 'patch', input: { patch: '--- a.txt\n+++ a.txt\n@@ -0,0 +1 @@\n+new\n', declaredPaths: ['a.txt'] } }),
+    });
+    assert.equal(created.status, 500);
+    assert.equal(created.body.error, 'INTERNAL_ERROR');
+    const proposals = await request(address, '/v1/proposals');
+    assert.deepEqual(proposals.body.proposals, []);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });

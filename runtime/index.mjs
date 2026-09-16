@@ -17,6 +17,9 @@ export { ModelRegistryError, createModelRegistry, normalizeModelProfile } from '
 export { SecretResolverError, createSecretResolver, parseSecretRef } from './secret-resolver.mjs';
 export { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 export { ModelRunnerError, createModelRunner } from './model-runner.mjs';
+export { WorkspaceToolError, createWorkspaceToolRegistry } from './workspace-tool-registry.mjs';
+export { ToolRegistryError, createToolRegistry } from './tool-registry.mjs';
+export { AgentLoopError, runAgentLoop } from './agent-loop.mjs';
 export { GatewayAdapterError, createGatewayAdapter } from './gateway-adapter.mjs';
 export { McpTransportError, createMcpStdioTransport } from './mcp-transport.mjs';
 export { McpHttpTransportError, createMcpHttpTransport } from './mcp-http-transport.mjs';
