@@ -27,6 +27,7 @@ import { ModelRunnerError, createModelRunner } from './model-runner.mjs';
 import { createWorkspaceToolRegistry } from './workspace-tool-registry.mjs';
 import { ToolRegistryError, createToolRegistry } from './tool-registry.mjs';
 import { AgentLoopError } from './agent-loop.mjs';
+import { createMcpBridgeServer } from './mcp-bridge-server.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
@@ -242,14 +243,16 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const effectiveSecretResolver = secretResolver ?? createSecretResolver();
   const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: effectiveSecretResolver });
   const liveModelRunner = modelRunner ?? createModelRunner({ profileResolver: modelRegistry, secretResolver: effectiveSecretResolver });
+  const approvePatch = __testHooks?.approvePatch ?? approveAndApplyPatch;
   const workspaceTools = createToolRegistry({ root, audit: effectiveAudit, onProposal: async (proposal) => {
     proposalStore.put(proposal);
     proposals.set(proposal.action.id, proposal);
   } });
   const sessions = createChatSessionManager({ root, runAgentFn: agentRunner, modelRunner: liveModelRunner, modelResolver: modelRegistry, modelFallbackFn: agentRunner, toolRegistry: workspaceTools });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
-  const currentWorkspaceRevision = async () => (await createWorkspace(root)).workspaceRevision();
+  const currentWorkspaceRevision = async (options) => (await createWorkspace(root)).workspaceRevision(options);
   const liveStreams = new Set();
+  const bridges = new Set();
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
     const requestId = requestIdOf(request.headers['x-request-id']);
@@ -649,13 +652,13 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           await __testHooks?.onProposalClaimed?.(claim);
           const result = proposal.command
             ? await approveAndRunCommand({ proposal: claim.proposal, root, approved: true, audit: effectiveAudit, getCurrentRevision: currentWorkspaceRevision })
-            : await approveAndApplyPatch({ proposal: claim.proposal, root, approved: true, audit: effectiveAudit, getCurrentRevision: currentWorkspaceRevision });
+            : await approvePatch({ proposal: claim.proposal, root, approved: true, audit: effectiveAudit, getCurrentRevision: currentWorkspaceRevision });
           proposalStore.markTerminal(proposal.action.id, result.action, claim.claim.token);
           proposals.delete(proposal.action.id);
           eventBus.publish({ type: 'proposal.verified', sessionId: result.action.sessionId, actionId: result.action.id, requestId, data: { actionType: result.action.type, status: result.action.status } });
           return json(response, 200, result);
         } catch (error) {
-          if (error instanceof WorkflowError && error.details?.action) proposalStore.markTerminal(proposal.action.id, error.details.action, claim.claim.token);
+          if (error instanceof WorkflowError && ['verified', 'failed', 'timed_out', 'cancelled', 'denied'].includes(error.details?.action?.status)) proposalStore.markTerminal(proposal.action.id, error.details.action, claim.claim.token);
           else {
             // Pre-execution checks (revision, ledger, policy or audit) can fail
             // after a durable claim. Never leave an unclaimable executing record.
@@ -719,16 +722,26 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       return json(response, mapped.status, mapped.body);
     }
   });
+  function createMcpBridge(options = {}) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) throw new Error('bridge options are required');
+    const { root: ignoredRoot, registry: ignoredRegistry, ...bridgeOptions } = options;
+    const bridge = createMcpBridgeServer({ ...bridgeOptions, root, registry: workspaceTools });
+    bridges.add(bridge);
+    return bridge;
+  }
   let closing = false;
   return Object.freeze({
     server,
     startup: startupState,
+    createMcpBridge,
     async listen() { await new Promise((resolve) => server.listen(port, host, resolve)); return server.address(); },
     async close() {
       if (closing) return;
       closing = true;
       sessions.cancelAllTurns();
       await runtime.close();
+      for (const bridge of bridges) await bridge.stop();
+      bridges.clear();
       for (const stream of liveStreams) stream.end();
       liveStreams.clear();
       if (!server.listening) return;

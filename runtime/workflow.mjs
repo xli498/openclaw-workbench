@@ -36,10 +36,11 @@ export async function approveAndApplyPatch({ proposal, root, declaredPaths, appr
   if (!proposal?.action || typeof proposal.action.preview !== 'string') throw new WorkflowError('PROPOSAL_INVALID', 'patch proposal is required');
   if (!approved) throw new WorkflowError('APPROVAL_REQUIRED', 'patch application requires explicit approval');
   const action = proposal.action;
+  const approvedPaths = declaredPaths ?? action.target;
   let approvedPatch;
   try {
     approvedPatch = parseUnifiedPatch(action.preview);
-    validatePatchTargets(approvedPatch, declaredPaths);
+    validatePatchTargets(approvedPatch, approvedPaths);
   } catch (error) {
     throw new WorkflowError(error.code ?? 'PATCH_INVALID', error.message, { cause: error });
   }
@@ -53,7 +54,7 @@ export async function approveAndApplyPatch({ proposal, root, declaredPaths, appr
   const executing = transition(approvedAction, 'executing');
   let result;
   try {
-    result = await applyPatchTransaction({ root, parsedPatch: approvedPatch, declaredPaths, expectedRevision: action.workspaceRevision, currentRevision: current, getCurrentRevision, snapshotDir, transactionDir, audit, renameFile });
+    result = await applyPatchTransaction({ root, parsedPatch: approvedPatch, declaredPaths: approvedPaths, expectedRevision: action.workspaceRevision, currentRevision: current, getCurrentRevision, snapshotDir, transactionDir, audit, renameFile });
   } catch (error) {
     if (audit) await audit.append({ type: 'action.failed', actor: 'system', actionId: action.id, code: error.code ?? 'PATCH_APPLY_FAILED' });
     throw new WorkflowError(error.code ?? 'PATCH_APPLY_FAILED', error.message, { cause: error, action: executing });

@@ -34,6 +34,13 @@ test('明确审批后完成 Patch 应用并返回 verified action', async () => 
   assert.deepEqual(events.map((event) => event.type), ['action.proposed', 'action.approved', 'transaction.prepared', 'transaction.committing', 'transaction.committed', 'action.verified']);
 });
 
+test('审批路由可从已签名的 proposal target 恢复 Patch 声明路径', async () => {
+  const root = await fixture();
+  const proposal = await createPatchProposal({ root, patch, sessionId: 'session-target-default', declaredPaths: ['a.txt'], mode: 'Code', currentRevision: 'r1' });
+  await approveAndApplyPatch({ proposal, root, approved: true, currentRevision: 'r1' });
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\nTWO\n');
+});
+
 test('审批后 revision 变化时拒绝应用', async () => {
   const root = await fixture();
   const proposal = await createPatchProposal({ root, patch, sessionId: 'session-3', declaredPaths: ['a.txt'], currentRevision: 'r1' });

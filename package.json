@@ -17,6 +17,7 @@
   "engines": { "node": ">=22.19.0" },
   "scripts": {
     "test": "node --test",
+    "smoke:mcp-bridge": "node --test tests/mcp-bridge-server.test.mjs tests/mcp-bridge-red-team.test.mjs",
     "test:watch": "node --test --watch"
   }
 }

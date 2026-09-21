@@ -10,6 +10,7 @@ import { decideRecovery, executeRecovery, finalizeAlreadyCommitted, inspectPendi
 import { mkdir } from 'node:fs/promises';
 import { scanStartupRecovery } from '../runtime/startup-recovery.mjs';
 import { startWorkbench } from '../runtime/index.mjs';
+import { createWorkspace } from '../runtime/workspace.mjs';
 
 async function fixture() {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-tx-'));
@@ -115,6 +116,42 @@ test('工作区 revision 变化时拒绝事务', async () => {
   const root = await fixture();
   const parsed = parseUnifiedPatch(`--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n`);
   await assert.rejects(() => applyPatchTransaction({ root, parsedPatch: parsed, declaredPaths: ['a.txt'], expectedRevision: 'r1', currentRevision: 'r2' }), (e) => e instanceof TransactionError && e.code === 'REVISION_MISMATCH');
+});
+
+test('事务 revision 预检仅排除本次受控的 staging 文件', async () => {
+  const root = await fixture();
+  const parsed = parseUnifiedPatch(`--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n`);
+  const workspace = await createWorkspace(root);
+  const expectedRevision = await workspace.workspaceRevision();
+  const result = await applyPatchTransaction({
+    root,
+    parsedPatch: parsed,
+    declaredPaths: ['a.txt'],
+    expectedRevision,
+    getCurrentRevision: (options) => workspace.workspaceRevision(options),
+  });
+  assert.equal(result.files[0].relativePath, 'a.txt');
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\nTWO\n');
+});
+
+test('红队攻击：staging 排除不能掩盖其他工作区文件的并发变更', async () => {
+  const root = await fixture();
+  const parsed = parseUnifiedPatch(`--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n`);
+  const workspace = await createWorkspace(root);
+  const expectedRevision = await workspace.workspaceRevision();
+  let revisionChecks = 0;
+  await assert.rejects(() => applyPatchTransaction({
+    root,
+    parsedPatch: parsed,
+    declaredPaths: ['a.txt'],
+    expectedRevision,
+    getCurrentRevision: async (options) => {
+      revisionChecks += 1;
+      if (revisionChecks === 2) await writeFile(path.join(root, 'attacker-change.txt'), 'changed');
+      return workspace.workspaceRevision(options);
+    },
+  }), (error) => error.code === 'REVISION_MISMATCH');
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n');
 });
 
 test('扫描未完成事务并忽略已完成事务', async () => {
