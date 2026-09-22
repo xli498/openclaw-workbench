@@ -117,6 +117,8 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 模型档案、SecretRef 引用和连接测试 | 已实现受控元数据、`env:`/抽象 `keychain:` 解析和审批触发的 OpenAI-compatible 健康探针；不持久化密钥 |
 | Gateway WebSocket 传输边界 | 已实现回环连接/请求关联/超时取消；未实现 OpenClaw 协议和生命周期 |
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
+| 聚合诊断 API | 已实现；只返回状态、哈希、计数和脱敏审计 |
+| Durable terminal session 合同 | 已实现；审批、游标、输出上限、取消/超时和 manual review；默认 `pty:false` |
 | MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具 |
 | 本机 Streamable HTTP MCP Bridge | 已实现；回环绑定、Bearer、会话、SSE、回放保护和审批提案边界 |
 | 公网 Bridge / 隧道 | 未实现、未验证 |
@@ -133,6 +135,14 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 - 这套库不能替代宿主机权限隔离、容器隔离、密钥管理或 OpenClaw 正式审批系统。
 
 `GET /v1/status` 提供不含会话内容、提案内容或 ID 的 `persistedState` 汇总，用于识别重启后的人工复核数量和恢复事件；该接口只读，不会恢复或执行任何中断操作。
+
+`GET /v1/diagnostics` 返回一次性、脱敏的产品诊断摘要：OpenClaw CLI 状态、MCP 状态、模型档案启用状态、工作区 revision 和最近审计摘要。每个组件都有 `ready`、`unavailable` 或 `degraded` 语义；诊断不会读取 SecretRef 解析值、返回命令/endpoint、启动 Gateway、调用模型或修改工作区。
+
+## 持久终端会话
+
+控制面提供 `GET /v1/terminal/sessions`、`POST /v1/terminal/sessions`、`GET /v1/terminal/sessions/:id/output`、`POST /v1/terminal/sessions/:id/input` 和 `POST /v1/terminal/sessions/:id/cancel`。创建、输入和取消都需要独立 `X-Approval-Token`；命令仍经过 argv、cwd 和只读策略门禁。输出按游标增量读取并有硬上限，输入原文不写入快照。
+
+当前默认实现使用受控命令 runner 作为非 PTY fallback，返回 `capabilities: { pty: false, input: false, incrementalOutput: false }`，因此不会把一次性命令冒充交互终端。真正的 PTY provider 需要宿主显式注入并单独完成进程树、权限和秘密环境复审。服务重启后未完成会话只进入 `manual_review`，不会自动重放。
 
 `GET /v1/audit?limit=<n>` 只读返回最近的脱敏审计事件，最多 500 条；控制台可查看并导出这份脱敏 JSON。未显式注入 audit 时，服务会惰性写入工作区 `.openclaw-workbench/audit.jsonl`；命令预览、完整错误文本、环境变量、凭据和绝对路径不会通过该接口返回。
 

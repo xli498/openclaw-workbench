@@ -46,3 +46,17 @@
 - 已完成命令名和参数级策略分类。
 - 已完成提案/审批审计记录策略结果。
 - 已完成策略结果写入 action 不可变 preview，并在执行前复核。
+
+## Durable Terminal 与 Diagnostics 阶段（已完成基线）
+
+- `runtime/terminal-session.mjs` 提供工作区内原子会话清单、增量输出、输入/取消、超时、输出预算和重启 `manual_review` 门禁。
+- 默认使用 `runControlledCommand` 的非 PTY fallback，并显式暴露 `pty:false`；不伪造交互 shell，不自动接管中断进程。
+- 创建前使用进程内 reservation 绑定 session ID 和容量；输出超限会取消 provider，避免进程继续运行。
+- `runtime/diagnostics.mjs` 聚合 OpenClaw CLI、MCP、模型、工作区 revision 和脱敏审计摘要；`GET /v1/diagnostics` 已接入鉴权控制面。
+- 红队覆盖审批绕过、shell/路径逃逸、输出洪泛、超时、重放、环境变量注入、PTY 伪造和诊断泄露；定向测试与控制面回归已通过。
+
+## 下一实现单元
+
+1. 完成产品 parity 的 release gates：Node 22、Node 24、Windows CI 和包内容审查。
+2. 完成独立最终代码审核，修复 Critical/Important 问题后再创建/合并 PR。
+3. 仅在用户明确需要时设计真正 PTY provider；在此之前保持 `pty:false` 产品边界。

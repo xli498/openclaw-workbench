@@ -82,11 +82,11 @@
 - Test: `tests/mcp-bridge-server.test.mjs`
 - Test: `tests/mcp-bridge-red-team.test.mjs`
 
-- [ ] Write failing tests for loopback-only bind, bearer authentication, MCP initialize/session negotiation, `tools/list`, `tools/call`, JSON and bounded SSE responses, `Mcp-Session-Id`, GET stream, DELETE close, invalid protocol versions, request replay, and graceful shutdown.
-- [ ] Implement a standalone local Bridge server with explicit `start/stop/address`, per-session state, a stable tool catalog, and handlers wired to the unified tool registry. Read-only tools execute; patch/command tools return approval-required proposals and never mutate directly.
-- [ ] Add a short-lived path token option plus header bearer authentication, no credentials in URLs/logs, strict CORS off by default, frame/body/time budgets, idle session expiry, and no non-loopback bind.
-- [ ] Run real HTTP red-team attacks for missing/wrong bearer, path token leakage, protocol downgrade, session fixation, oversized JSON/SSE, cross-session replay, path escape, shell injection, and approval bypass; blue-team then replay the identical attack script.
-- [ ] Add a local-only smoke command and document that Cloudflare/ngrok tunnels are not bundled until a provider adapter is independently verified.
+- [x] Write failing tests for loopback-only bind, bearer authentication, MCP initialize/session negotiation, `tools/list`, `tools/call`, JSON and bounded SSE responses, `Mcp-Session-Id`, GET stream, DELETE close, invalid protocol versions, request replay, and graceful shutdown.
+- [x] Implement a standalone local Bridge server with explicit `start/stop/address`, per-session state, a stable tool catalog, and handlers wired to the unified tool registry. Read-only tools execute; patch/command tools return approval-required proposals and never mutate directly.
+- [x] Add a short-lived path token option plus header bearer authentication, no credentials in URLs/logs, strict CORS off by default, frame/body/time budgets, idle session expiry, and no non-loopback bind.
+- [x] Run real HTTP red-team attacks for missing/wrong bearer, path token leakage, protocol downgrade, session fixation, oversized JSON/SSE, cross-session replay, path escape, shell injection, and approval bypass; blue-team then replay the identical attack script.
+- [x] Add a local-only smoke command and document that Cloudflare/ngrok tunnels are not bundled until a provider adapter is independently verified.
 
 ### Task 6: Durable terminal and diagnostics contracts
 
@@ -98,10 +98,10 @@
 - Test: `tests/terminal-session.test.mjs`
 - Test: `tests/diagnostics.test.mjs`
 
-- [ ] Write failing tests for a bounded persistent command session, incremental output reads, input, cancellation, timeout, restart/manual-review semantics, Windows and POSIX command boundaries, and cleanup.
-- [ ] Implement a provider-neutral session interface; use the existing controlled command runner as the non-PTY fallback and report capability `pty:false` rather than pretending interactive support.
-- [ ] Implement diagnostics aggregation for OpenClaw CLI, workspace revision, model health, MCP status, and recent redacted audit events with explicit unavailable states.
-- [ ] Red team output flooding, process-tree escape, inherited secret environment, stale session replay, and diagnostics secret leakage; fix and replay.
+- [x] Write failing tests for a bounded persistent command session, incremental output reads, input, cancellation, timeout, restart/manual-review semantics, Windows and POSIX command boundaries, and cleanup.
+- [x] Implement a provider-neutral session interface; use the existing controlled command runner as the non-PTY fallback and report capability `pty:false` rather than pretending interactive support.
+- [x] Implement diagnostics aggregation for OpenClaw CLI, workspace revision, model health, MCP status, and recent redacted audit events with explicit unavailable states.
+- [x] Red team output flooding, process-tree escape, inherited secret environment, stale session replay, and diagnostics secret leakage; fix and replay.
 
 ### Task 7: Release gates and product handoff
 

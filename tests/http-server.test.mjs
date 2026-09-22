@@ -10,11 +10,84 @@ import { createEventBus } from '../runtime/event-bus.mjs';
 import { createHash } from 'node:crypto';
 import vm from 'node:vm';
 import { symlinkOrSkip } from './test-support.mjs';
+import { createTerminalSessionManager } from '../runtime/terminal-session.mjs';
 
 async function request(address, pathname, options = {}) {
   const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token-012345', ...(options.headers ?? {}) } });
   return { status: response.status, headers: response.headers, body: await response.json() };
 }
+
+test('控制面聚合诊断并提供审批保护的持久终端会话接口', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-terminal-session-'));
+  const manager = createTerminalSessionManager({ root, runCommand: async () => ({ code: 0, stdout: 'diagnostic output\n', stderr: '', cwd: root }) });
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    terminalSessionManager: manager,
+    diagnosticsCollector: async () => ({ status: 'ready', generatedAt: '2026-09-21T00:00:00.000Z', openclaw: { status: 'ready', version: '1.0.0' }, mcp: { status: 'ready', serverCount: 0, servers: [] }, models: { status: 'ready', profiles: [] }, workspace: { status: 'ready', workspaceRevision: 'sha256:test' }, audit: { status: 'ready', events: [] } }),
+  });
+  const address = await app.listen();
+  try {
+    const diagnostics = await request(address, '/v1/diagnostics');
+    assert.equal(diagnostics.status, 200);
+    assert.equal(diagnostics.body.status, 'ready');
+    const denied = await request(address, '/v1/terminal/sessions', { method: 'POST', body: JSON.stringify({ argv: ['pwd'] }) });
+    assert.equal(denied.status, 403);
+    const created = await request(address, '/v1/terminal/sessions', { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ argv: ['pwd'] }) });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.session.capabilities.pty, false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const output = await request(address, `/v1/terminal/sessions/${created.body.session.id}/output?after=0`);
+    assert.equal(output.status, 200);
+    assert.match(output.body.chunks[0].text, /diagnostic output/);
+    const input = await request(address, `/v1/terminal/sessions/${created.body.session.id}/input`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ input: 'ignored' }) });
+    assert.equal(input.status, 409);
+    assert.equal(input.body.error, 'PTY_UNAVAILABLE');
+    const unauthenticated = await fetch(`http://${address.address}:${address.port}/v1/diagnostics`);
+    assert.equal(unauthenticated.status, 401);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面诊断出口会再次归一化注入 collector，并隐藏未知异常原文', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-diagnostics-sanitize-'));
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    diagnosticsCollector: async () => ({
+      status: 'ready',
+      generatedAt: 'not-a-timestamp',
+      openclaw: { status: 'ready', version: '1.0.0', command: 'C:\\private\\openclaw', secretRef: 'env:OPENAI_KEY' },
+      mcp: { status: 'error', code: 'MCP_BAD', servers: [{ name: 'https://user:password@example.test', status: 'error' }] },
+      models: { status: 'ready', profiles: [{ id: 'env:OPENAI_KEY', endpoint: 'https://user:password@example.test', status: 'error' }] },
+      workspace: { status: 'ready', workspaceRevision: `sha256:${'a'.repeat(64)}` },
+      audit: { status: 'ready', events: [{ type: 'model.connected', sessionId: 'C:\\private\\session' }] },
+    }),
+  });
+  const address = await app.listen();
+  try {
+    const result = await request(address, '/v1/diagnostics');
+    assert.equal(result.status, 200);
+    assert.equal(result.body.status, 'degraded');
+    const encoded = JSON.stringify(result.body);
+    assert.equal(encoded.includes('password'), false);
+    assert.equal(encoded.includes('OPENAI_KEY'), false);
+    assert.equal(encoded.includes('C:\\private'), false);
+    assert.equal(encoded.includes('https://'), false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+
+  const failingRoot = await mkdtemp(path.join(tmpdir(), 'ocw-http-diagnostics-error-'));
+  const failingApp = createWorkbenchServer({ root: failingRoot, token: 'test-token-012345', approvalToken: 'approve-token-012345', diagnosticsCollector: async () => { throw new Error('apiKey=secret-value C:\\private'); } });
+  const failingAddress = await failingApp.listen();
+  try {
+    const result = await request(failingAddress, '/v1/diagnostics');
+    assert.equal(result.status, 500);
+    assert.equal(result.body.error, 'INTERNAL_ERROR');
+    assert.equal(JSON.stringify(result.body).includes('secret-value'), false);
+    assert.equal(JSON.stringify(result.body).includes('C:\\private'), false);
+  } finally { await failingApp.close(); await rm(failingRoot, { recursive: true, force: true }); }
+});
 
 test('控制面提供受鉴权的工作区只读文件读取，并拒绝敏感路径', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-workspace-'));

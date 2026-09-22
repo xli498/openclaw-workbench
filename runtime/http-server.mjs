@@ -28,6 +28,8 @@ import { createWorkspaceToolRegistry } from './workspace-tool-registry.mjs';
 import { ToolRegistryError, createToolRegistry } from './tool-registry.mjs';
 import { AgentLoopError } from './agent-loop.mjs';
 import { createMcpBridgeServer } from './mcp-bridge-server.mjs';
+import { createTerminalSessionManager, TerminalSessionError } from './terminal-session.mjs';
+import { collectDiagnostics, normalizeDiagnostics } from './diagnostics.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
@@ -111,7 +113,7 @@ function safePlanFailures(failures) {
 }
 
 function errorResponse(error) {
-  const safe = (code, message) => ({ error: code, message: message && message.length <= 256 ? message : 'request failed' });
+  const safe = (code, message) => ({ error: code, message: message && message.length <= 256 && !/(?:token|password|secret|api[_ -]?key)\s*[:=]|[A-Za-z]:[\\/]|https?:\/\//i.test(message) ? message : 'request failed' });
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
   if (error instanceof AdapterError) return { status: error.code === 'TIMEOUT' ? 504 : error.code === 'ABORTED' ? 409 : 502, body: safe(error.code, error.message) };
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: safe(error.code, error.message) };
@@ -135,6 +137,7 @@ function errorResponse(error) {
   if (error instanceof ModelRunnerError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
+  if (error instanceof TerminalSessionError) return { status: ['SESSION_MANUAL_REVIEW', 'SESSION_NOT_RUNNING', 'PTY_UNAVAILABLE', 'SESSION_STORE_BUSY', 'SESSION_STORE_CONFLICT'].includes(error.code) ? 409 : error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_LIMIT' ? 429 : error.code === 'OUTPUT_LIMIT' ? 413 : error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
   return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
 }
 
@@ -214,7 +217,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, terminalSessionManager, diagnosticsCollector, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -244,6 +247,15 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: effectiveSecretResolver });
   const liveModelRunner = modelRunner ?? createModelRunner({ profileResolver: modelRegistry, secretResolver: effectiveSecretResolver });
   const approvePatch = __testHooks?.approvePatch ?? approveAndApplyPatch;
+  const terminalSessions = terminalSessionManager ?? createTerminalSessionManager({ root });
+  const terminalReady = typeof terminalSessions.restore === 'function' ? Promise.resolve(terminalSessions.restore()) : Promise.resolve();
+  const diagnostics = diagnosticsCollector ?? (() => collectDiagnostics({
+    root,
+    openclaw: () => inspect({ command: adapterConfig?.command ?? 'openclaw' }),
+    mcp: () => inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }),
+    models: () => modelRegistry.list(),
+    audit: effectiveAudit,
+  }));
   const workspaceTools = createToolRegistry({ root, audit: effectiveAudit, onProposal: async (proposal) => {
     proposalStore.put(proposal);
     proposals.set(proposal.action.id, proposal);
@@ -267,6 +279,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
+      if (request.method === 'GET' && url.pathname === '/v1/diagnostics') return json(response, 200, normalizeDiagnostics(await diagnostics()));
       if (request.method === 'GET' && url.pathname === '/v1/mcp/servers') return json(response, 200, { servers: mcpRegistry.list() });
       if (request.method === 'GET' && url.pathname === '/v1/mcp/runtimes') return json(response, 200, { runtimes: runtime.status() });
       if (request.method === 'GET' && url.pathname === '/v1/models') return json(response, 200, { models: modelRegistry.list() });
@@ -521,6 +534,27 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         }
       }
       await startupState;
+      await terminalReady;
+      if (request.method === 'GET' && url.pathname === '/v1/terminal/sessions') return json(response, 200, { sessions: terminalSessions.list() });
+      if (request.method === 'POST' && url.pathname === '/v1/terminal/sessions') {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const input = await bodyOf(request);
+        const session = await terminalSessions.create({ ...input, approved: true });
+        await effectiveAudit?.append?.({ type: 'terminal.session.created', actor: 'user', sessionId: session.id, status: session.status, capabilities: session.capabilities }).catch?.(() => {});
+        return json(response, 201, { session });
+      }
+      const terminalRoute = url.pathname.match(/^\/v1\/terminal\/sessions\/([0-9a-f-]{36})(?:\/(output|input|cancel))?$/i);
+      if (terminalRoute && request.method === 'GET' && !terminalRoute[2]) return json(response, 200, { session: terminalSessions.get(terminalRoute[1]) });
+      if (terminalRoute && terminalRoute[2] === 'output' && request.method === 'GET') {
+        const output = await terminalSessions.read(terminalRoute[1], { after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) });
+        return json(response, 200, output);
+      }
+      if (terminalRoute && (terminalRoute[2] === 'input' || terminalRoute[2] === 'cancel') && request.method === 'POST') {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        if (terminalRoute[2] === 'cancel') return json(response, 200, { session: await terminalSessions.cancel(terminalRoute[1]) });
+        const input = await bodyOf(request);
+        return json(response, 200, await terminalSessions.write(terminalRoute[1], input.input));
+      }
       if (request.method === 'GET' && url.pathname === '/v1/events/stream') {
         const after = singleQueryInteger(url.searchParams, 'after', 0);
         const stream = eventBus.subscribeFrom((event) => { if (!response.destroyed && !response.writableEnded) response.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`); }, { after, limit: Math.min(100, eventBus.retentionLimit ?? 100) });
@@ -742,6 +776,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       await runtime.close();
       for (const bridge of bridges) await bridge.stop();
       bridges.clear();
+      await terminalSessions.close();
       for (const stream of liveStreams) stream.end();
       liveStreams.clear();
       if (!server.listening) return;

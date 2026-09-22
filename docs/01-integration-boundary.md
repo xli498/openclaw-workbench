@@ -18,6 +18,7 @@ MCP runtime 控制面通过 `GET /v1/mcp/runtimes` 提供只读实例状态；`P
 | 插件/Skill | 文档提供插件、Skill 管理和权限请求能力 | 不自动安装；安装、启用、升级均需审计和审批 |
 | 配置写入 | Control UI 文档描述 config get/set/apply/patch、base-hash guard、SecretRef 预检和校验 | 产品配置层必须保留 hash guard、备份、迁移和回滚 |
 | 诊断 | Control UI 支持 status、health、models、logs.tail 等诊断入口 | 统一收集脱敏诊断，不采集密钥和完整敏感内容 |
+| Terminal session | OpenClaw 可提供持久终端/PTY 能力 | Workbench 提供审批保护的持久会话合同；无 PTY provider 时只使用受控一次性命令 fallback，并明确 `pty:false`，不自动接管重启前进程 |
 | 运行环境 | 本机 OpenClaw package version `2026.6.6`，license `MIT`，Node `>=22.19.0` | 产品锁定兼容矩阵；不能据此推断第三方插件许可证 |
 
 ## 不可直接假设的能力
@@ -51,4 +52,4 @@ OpenClaw 已具备足够多的底层能力，可以作为产品基础；但 Work
 
 ## 产品核心验收边界
 
-核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用、会话关闭与空闲过期：它只能绑定 loopback，每次请求仍需 Bearer，path token 仅用于短时路由定位且不得记录，默认拒绝跨域 Origin。Cloudflare Tunnel、ngrok 和其他公网隧道未内置、未验证。LSP 未实现，持久 PTY 未实现，不能把 CLI 诊断或一次性命令执行称作这两项能力。
+核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。Workbench 另提供脱敏 `GET /v1/diagnostics` 与审批保护的 terminal-session 合同；没有 PTY provider 时只报告 `pty:false`，不把一次性命令执行称作持久 PTY。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用、会话关闭与空闲过期：它只能绑定 loopback，每次请求仍需 Bearer，path token 仅用于短时路由定位且不得记录，默认拒绝跨域 Origin。Cloudflare Tunnel、ngrok 和其他公网隧道未内置、未验证。LSP 未实现。
