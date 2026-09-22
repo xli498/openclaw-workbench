@@ -57,6 +57,6 @@
 
 ## 下一实现单元
 
-1. 完成产品 parity 的 release gates：Node 22、Node 24、Windows CI 和包内容审查。
-2. 完成独立最终代码审核，修复 Critical/Important 问题后再创建/合并 PR。
+1. 本地 release gates 已完成：全量测试、MCP smoke、语法检查和包内容审查；仍需在 GitHub 上完成 Node 22、Node 24、Windows CI 的远端检查。
+2. 完成独立最终代码审核，修复 Critical/Important 问题后再创建/合并 PR；当前本地 commit 为 `59fe813`，远端推送等待授权和网络恢复。
 3. 仅在用户明确需要时设计真正 PTY provider；在此之前保持 `pty:false` 产品边界。
