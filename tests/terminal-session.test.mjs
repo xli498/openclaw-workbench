@@ -123,6 +123,22 @@ test('PTY provider 输出超限时会取消运行时，避免进程继续运行'
   }
 });
 
+test('PTY provider 忽略 timeout 时 manager 会取消并收敛会话', async () => {
+  const root = await fixture('ocw-terminal-session-provider-timeout-');
+  let cancelled = 0;
+  const manager = createTerminalSessionManager({
+    root,
+    sessionProvider: () => ({ cancel() { cancelled += 1; } }),
+  });
+  try {
+    const session = await manager.create({ argv: ['pwd'], timeoutMs: 20, approved: true });
+    await wait(50);
+    assert.equal((await manager.get(session.id)).status, 'timed_out');
+    assert.equal((await manager.get(session.id)).error.code, 'TIMEOUT');
+    assert.equal(cancelled, 1);
+  } finally { await manager.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test('终端会话清单只保存脱敏元数据，不写入输入和绝对工作区路径', async () => {
   const root = await fixture();
   const manager = createTerminalSessionManager({ root, runCommand: async () => ({ code: 0, stdout: 'token=secret-value\n', stderr: '', cwd: root }) });
@@ -239,7 +255,8 @@ test('已结束会话不永久占用并发容量，provider 必须显式声明 c
 test('终端输出会隐藏绝对路径，持久化冲突会把会话锁定为 manual_review', async () => {
   const root = await fixture('ocw-terminal-session-store-conflict-');
   let emit;
-  const manager = createTerminalSessionManager({ root, sessionProvider: ({ onOutput }) => { emit = onOutput; return { cancel() {} }; } });
+  let cancelled = 0;
+  const manager = createTerminalSessionManager({ root, sessionProvider: ({ onOutput }) => { emit = onOutput; return { cancel() { cancelled += 1; } }; } });
   try {
     const session = await manager.create({ argv: ['pwd'], approved: true });
     const file = path.join(root, '.openclaw-workbench', 'terminal-sessions', `${session.id}.json`);
@@ -249,6 +266,22 @@ test('终端输出会隐藏绝对路径，持久化冲突会把会话锁定为 m
     const result = await manager.get(session.id);
     assert.equal(result.status, 'manual_review');
     assert.equal(result.error.code, 'SESSION_STORE_FAILURE');
+    assert.equal(cancelled, 1);
     assert.equal((await manager.read(session.id)).chunks[0]?.text.includes(root), false);
   } finally { await manager.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('恢复持久化终端会话时再次脱敏绝对路径输出', async () => {
+  const root = await fixture('ocw-terminal-session-restore-redaction-');
+  const id = '00000000-0000-4000-8000-000000000020';
+  const directory = path.join(root, '.openclaw-workbench', 'terminal-sessions');
+  try {
+    await import('node:fs/promises').then(({ mkdir }) => mkdir(directory, { recursive: true }));
+    await writeFile(path.join(directory, `${id}.json`), JSON.stringify({ version: 1, id, status: 'exited', argv: [`${root}\\private\\command`], cwd: '.', capabilities: { pty: false, input: false, incrementalOutput: false }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), outputBytes: 32, chunks: [{ sequence: 1, stream: 'stdout', text: `${root}\\private\\secret.txt` }] }), 'utf8');
+    const manager = createTerminalSessionManager({ root });
+    await manager.restore();
+    assert.equal((await manager.read(id)).chunks[0].text.includes(root), false);
+    assert.equal((await manager.get(id)).argv[0].includes(root), false);
+    await manager.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

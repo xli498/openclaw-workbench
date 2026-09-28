@@ -43,9 +43,28 @@ function safeError(error, fallback = 'SESSION_FAILED') {
   return Object.freeze({ code });
 }
 
-function redactOutput(value, maxLength) {
-  return redactText(typeof value === 'string' ? value.replace(ABSOLUTE_PATH_PATTERN, '[path redacted]') : value, maxLength);
-}
+  function redactOutput(value, maxLength) {
+    return redactText(typeof value === 'string' ? value.replace(ABSOLUTE_PATH_PATTERN, '[path redacted]') : value, maxLength);
+  }
+
+  function restoreChunks(value, outputLimit) {
+    if (!Array.isArray(value)) return { chunks: [], outputBytes: 0 };
+    const chunks = [];
+    let outputBytes = 0;
+    for (const chunk of value.slice(0, 512)) {
+      const text = redactOutput(String(chunk?.text ?? ''), Math.max(outputLimit + 3, 16 * 1024));
+      if (!text) continue;
+      const bytes = Buffer.byteLength(text, 'utf8');
+      const remaining = outputLimit - outputBytes;
+      if (remaining <= 0) break;
+      const bounded = bytes > remaining ? Buffer.from(text, 'utf8').subarray(0, remaining).toString('utf8') : text;
+      if (!bounded) break;
+      chunks.push({ sequence: chunks.length + 1, stream: chunk?.stream === 'stderr' ? 'stderr' : 'stdout', text: bounded });
+      outputBytes += Buffer.byteLength(bounded, 'utf8');
+      if (bytes > remaining) break;
+    }
+    return { chunks, outputBytes };
+  }
 
 function publicRecord(record) {
   return Object.freeze({
@@ -123,6 +142,8 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
         record.capabilities = { pty: false, input: false, incrementalOutput: false };
         record.error = { code: 'SESSION_STORE_FAILURE' };
         record.updatedAt = new Date(clock()).toISOString();
+        cancelRuntime(record);
+        runtimes.delete(record.id);
       }
       return undefined;
     });
@@ -137,6 +158,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     const runtime = runtimes.get(record.id);
     if (!runtime || runtime.cancelRequested) return;
     runtime.cancelRequested = true;
+    if (runtime.timeout) clearTimeout(runtime.timeout);
     if (typeof runtime.handle?.cancel === 'function') void Promise.resolve(runtime.handle.cancel()).catch(() => {});
     else runtime.controller.abort();
   }
@@ -177,14 +199,21 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
 
   async function start(record) {
     const controller = new AbortController();
-    const runtime = { controller, handle: null };
+    const runtime = { controller, handle: null, timeout: null };
     runtimes.set(record.id, runtime);
     const onOutput = (value) => appendOutput(record, value);
     const onExit = (result = {}) => {
       const status = result.status === 'cancelled' ? 'cancelled' : result.status === 'timed_out' ? 'timed_out' : result.status === 'failed' ? 'failed' : 'exited';
       finish(record, status, result.error ?? (status === 'failed' ? result : null), result);
+      if (runtime.timeout) clearTimeout(runtime.timeout);
       runtimes.delete(record.id);
     };
+    runtime.timeout = setTimeout(() => {
+      if (record.status !== 'running') return;
+      finish(record, 'timed_out', { code: 'TIMEOUT' });
+      cancelRuntime(record);
+      runtimes.delete(record.id);
+    }, record.timeoutMs);
     try {
       if (sessionProvider) {
         runtime.handle = await sessionProvider({ root: rootPath, argv: [...record.argv], cwd: record.cwd, timeoutMs: record.timeoutMs, maxOutputBytes: record.maxOutputBytes, signal: controller.signal, onOutput, onExit });
@@ -216,7 +245,8 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
         if (!snapshot.content) continue;
         const value = JSON.parse(snapshot.content);
         if (value?.version !== 1 || value.id !== id || !Array.isArray(value.argv) || !TERMINAL_STATES.has(value.status)) continue;
-        const record = { id, status: value.status, argv: value.argv.map((item) => redactText(String(item), 1_024)), cwd: safeCwd(value.cwd), timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputBytes, capabilities: { pty: value.capabilities?.pty === true, input: value.capabilities?.input === true, incrementalOutput: value.capabilities?.incrementalOutput === true }, createdAt: value.createdAt, updatedAt: value.updatedAt, outputBytes: Number.isSafeInteger(value.outputBytes) ? value.outputBytes : 0, chunks: Array.isArray(value.chunks) ? value.chunks.slice(0, 512).map((chunk, index) => ({ sequence: Number.isSafeInteger(chunk.sequence) ? chunk.sequence : index + 1, stream: chunk.stream === 'stderr' ? 'stderr' : 'stdout', text: redactText(String(chunk.text ?? ''), maxOutputBytes) })) : [], ...(value.exitCode !== undefined ? { exitCode: value.exitCode } : {}), ...(value.error ? { error: safeError(value.error) } : {}) };
+        const restoredOutput = restoreChunks(value.chunks, maxOutputBytes);
+        const record = { id, status: value.status, argv: value.argv.map((item) => redactText(String(item), 1_024)), cwd: safeCwd(value.cwd), timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputBytes, capabilities: { pty: value.capabilities?.pty === true, input: value.capabilities?.input === true, incrementalOutput: value.capabilities?.incrementalOutput === true }, createdAt: value.createdAt, updatedAt: value.updatedAt, outputBytes: restoredOutput.outputBytes, chunks: restoredOutput.chunks, ...(value.exitCode !== undefined ? { exitCode: value.exitCode } : {}), ...(value.error ? { error: safeError(value.error) } : {}) };
         digests.set(id, snapshot.digest);
         records.set(id, record);
         if (record.status === 'running') { record.status = 'manual_review'; record.capabilities = { pty: false, input: false, incrementalOutput: false }; record.error = { code: 'SESSION_INTERRUPTED' }; record.updatedAt = new Date(clock()).toISOString(); await persist(record); }
@@ -291,7 +321,10 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     const record = records.get(id);
     if (record.status !== 'running') return publicRecord(record);
     const runtime = runtimes.get(id);
-    try { if (typeof runtime?.handle?.cancel === 'function') await runtime.handle.cancel(); else runtime?.controller.abort(); }
+    try {
+      if (runtime?.timeout) clearTimeout(runtime.timeout);
+      if (typeof runtime?.handle?.cancel === 'function') await runtime.handle.cancel(); else runtime?.controller.abort();
+    }
     catch {}
     finish(record, 'cancelled', { code: 'SESSION_CANCELLED' });
     runtimes.delete(id);

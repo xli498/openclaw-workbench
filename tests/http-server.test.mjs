@@ -86,6 +86,15 @@ test('控制面诊断出口会再次归一化注入 collector，并隐藏未知�
     assert.equal(result.body.error, 'INTERNAL_ERROR');
     assert.equal(JSON.stringify(result.body).includes('secret-value'), false);
     assert.equal(JSON.stringify(result.body).includes('C:\\private'), false);
+    const authFailingRoot = await mkdtemp(path.join(tmpdir(), 'ocw-http-diagnostics-auth-error-'));
+    const authFailingApp = createWorkbenchServer({ root: authFailingRoot, token: 'test-token-012345', approvalToken: 'approve-token-012345', diagnosticsCollector: async () => { throw new Error('Authorization: Bearer TOPSECRET123'); } });
+    const authFailingAddress = await authFailingApp.listen();
+    try {
+      const authResult = await request(authFailingAddress, '/v1/diagnostics');
+      assert.equal(authResult.status, 500);
+      assert.equal(authResult.body.message, 'request failed');
+      assert.equal(JSON.stringify(authResult.body).includes('TOPSECRET123'), false);
+    } finally { await authFailingApp.close(); await rm(authFailingRoot, { recursive: true, force: true }); }
   } finally { await failingApp.close(); await rm(failingRoot, { recursive: true, force: true }); }
 });
 

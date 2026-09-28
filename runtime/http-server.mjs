@@ -113,7 +113,7 @@ function safePlanFailures(failures) {
 }
 
 function errorResponse(error) {
-  const safe = (code, message) => ({ error: code, message: message && message.length <= 256 && !/(?:token|password|secret|api[_ -]?key)\s*[:=]|[A-Za-z]:[\\/]|https?:\/\//i.test(message) ? message : 'request failed' });
+  const safe = (code, message) => ({ error: code, message: message && message.length <= 256 && !/(?:authorization\s*:\s*bearer|bearer\s+|cookie\s*[:=]|credential\s*[:=]|token|password|secret|api[_ -]?key)\s*[^\s,;]*|[A-Za-z]:[\\/]|https?:\/\//i.test(message) ? message : 'request failed' });
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
   if (error instanceof AdapterError) return { status: error.code === 'TIMEOUT' ? 504 : error.code === 'ABORTED' ? 409 : 502, body: safe(error.code, error.message) };
   if (error instanceof SessionError) return { status: error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_BUSY' ? 409 : 400, body: safe(error.code, error.message) };
@@ -138,7 +138,8 @@ function errorResponse(error) {
   if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof TerminalSessionError) return { status: ['SESSION_MANUAL_REVIEW', 'SESSION_NOT_RUNNING', 'PTY_UNAVAILABLE', 'SESSION_STORE_BUSY', 'SESSION_STORE_CONFLICT'].includes(error.code) ? 409 : error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_LIMIT' ? 429 : error.code === 'OUTPUT_LIMIT' ? 413 : error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
-  return { status: error.code === 'BODY_TOO_LARGE' ? 413 : error.code === 'INVALID_JSON' || error.code === 'INVALID_BODY' || error.code === 'INVALID_QUERY_INTEGER' || error.code === 'DUPLICATE_QUERY_PARAMETER' ? 400 : 500, body: safe(error.code ?? 'INTERNAL_ERROR', error.message) };
+  const genericCode = ['BODY_TOO_LARGE', 'INVALID_JSON', 'INVALID_BODY', 'INVALID_QUERY_INTEGER', 'DUPLICATE_QUERY_PARAMETER'].includes(error?.code) ? error.code : 'INTERNAL_ERROR';
+  return { status: genericCode === 'BODY_TOO_LARGE' ? 413 : genericCode === 'INTERNAL_ERROR' ? 500 : 400, body: { error: genericCode, message: 'request failed' } };
 }
 
 function requireToken(request, token) {

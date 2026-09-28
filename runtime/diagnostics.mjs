@@ -4,9 +4,12 @@ import { redactText } from './redaction.mjs';
 const STATUS_VALUES = new Set(['ready', 'unavailable', 'degraded', 'error', 'unknown']);
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
 const SAFE_REVISION = /^(?:sha256:[A-Za-z0-9._:-]{1,128}|[a-f0-9]{40})$/i;
-const SENSITIVE_LABEL = /^(?:env|keychain):[A-Za-z_][A-Za-z0-9_]*$/i;
-const ABSOLUTE_PATH = /^(?:[A-Za-z]:[\\/]|[\\/]{1,2})/;
-const URL_VALUE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+const SENSITIVE_LABEL = /(?:env|keychain):[A-Za-z_][A-Za-z0-9_]*/i;
+const ABSOLUTE_PATH = /(?:[A-Za-z]:[\\/]|\\\\|\/(?:Users|home|tmp|private|var)\/)/;
+const URL_VALUE = /[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+const READY_STATES = new Set(['ready', 'healthy', 'connected', 'ok']);
+const UNAVAILABLE_STATES = new Set(['unavailable', 'disabled', 'not_configured']);
+const DEGRADED_STATES = new Set(['error', 'failed', 'degraded']);
 
 function statusOf(value, fallback = 'unavailable') {
   if (!STATUS_VALUES.has(value?.status)) return fallback;
@@ -35,6 +38,15 @@ function safeAuditValue(field, value) {
   return redactText(value, 256);
 }
 
+function normalizeHealthStatus(value) {
+  if (typeof value !== 'string') return 'unknown';
+  const status = value.trim().toLowerCase();
+  if (READY_STATES.has(status)) return 'ready';
+  if (UNAVAILABLE_STATES.has(status)) return 'unavailable';
+  if (DEGRADED_STATES.has(status)) return 'degraded';
+  return 'unknown';
+}
+
 function normalizeOpenClaw(value) {
   if (statusOf(value) === 'ready' && typeof value?.version === 'string' && /^\d+(?:\.\d+){1,3}$/.test(value.version)) {
     return Object.freeze({ status: 'ready', version: value.version });
@@ -48,9 +60,9 @@ function normalizeMcp(value) {
   const servers = Array.isArray(value?.servers) ? value.servers : [];
   const safeServers = servers.slice(0, 256).map((server, index) => Object.freeze({
     name: safeLabel(server?.name ?? server?.id, `server-${index + 1}`),
-    status: safeLabel(server?.status ?? server?.state, 'unknown'),
+    status: normalizeHealthStatus(server?.status ?? server?.state),
   }));
-  const status = safeServers.some((server) => server.status === 'error' || server.status === 'degraded') ? 'degraded' : 'ready';
+  const status = safeServers.every((server) => server.status === 'ready') ? 'ready' : 'degraded';
   return Object.freeze({
     status,
     ...(value?.code && status !== 'ready' ? { code: codeOf(value) } : {}),
@@ -65,10 +77,10 @@ function normalizeMcpServers(value) {
     id: safeLabel(server?.id, `server-${index + 1}`),
     name: safeLabel(server?.name ?? server?.id, `server-${index + 1}`),
     enabled: server?.enabled === true,
-    status: safeLabel(server?.health?.status ?? server?.status, 'unknown'),
+    status: normalizeHealthStatus(server?.health?.status ?? server?.status),
   }));
   return Object.freeze({
-    status: normalized.some((server) => server.status === 'error' || server.status === 'degraded') ? 'degraded' : 'ready',
+    status: normalized.every((server) => server.status === 'ready') ? 'ready' : 'degraded',
     serverCount: servers.length,
     servers: Object.freeze(normalized.map((server) => Object.freeze(server))),
   });
@@ -76,7 +88,7 @@ function normalizeMcpServers(value) {
 
 function normalizeModels(value) {
   const profiles = Array.isArray(value) ? value : Array.isArray(value?.profiles) ? value.profiles : [];
-  const profileDegraded = profiles.some((profile) => ['error', 'degraded'].includes(profile?.health?.status ?? profile?.status));
+  const profileDegraded = profiles.some((profile) => normalizeHealthStatus(profile?.health?.status ?? profile?.status) !== 'ready');
   const status = Array.isArray(value)
     ? (profileDegraded ? 'degraded' : 'ready')
     : (profileDegraded || statusOf(value, 'ready') === 'degraded' ? 'degraded' : statusOf(value, 'ready'));
@@ -86,7 +98,7 @@ function normalizeModels(value) {
     profiles: Object.freeze(profiles.slice(0, 128).map((profile, index) => Object.freeze({
       id: safeLabel(profile?.id, `model-${index + 1}`),
       enabled: profile?.enabled === true,
-      status: safeLabel(profile?.health?.status ?? profile?.status, 'unknown'),
+      status: normalizeHealthStatus(profile?.health?.status ?? profile?.status),
     }))),
   });
 }

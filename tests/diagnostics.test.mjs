@@ -67,10 +67,10 @@ test('MCP server 诊断探针失败时返回 unavailable，而不是伪装为空
 test('诊断聚合保留 MCP/model 异常状态，并拒绝不安全的标签和 revision', async () => {
   const result = await collectDiagnostics({
     openclaw: () => ({ status: 'ready', version: '1.2.3' }),
-    mcpServers: () => ({ status: 'error', code: 'MCP_BAD', servers: [{ id: 'https://user:password@example.test', name: 'C:\\private', status: 'error' }] }),
+    mcpServers: () => ({ status: 'error', code: 'MCP_BAD', servers: [{ id: 'https://user:password@example.test', name: 'server C:\\private', status: 'error' }] }),
     models: () => [{ id: 'env:OPENAI_KEY', enabled: true, health: { status: 'error' } }],
     workspace: () => ({ status: 'ready', workspaceRevision: `sha256:${'a'.repeat(64)}`, gitRevision: 'b'.repeat(40) }),
-    audit: { list: () => [{ type: 'model.connected', sessionId: 'https://user:password@example.test', status: 'error', path: 'C:\\private' }] },
+    audit: { list: () => [{ type: 'model.connected', actor: 'operator C:\\private', sessionId: 'https://user:password@example.test', status: 'error', path: 'C:\\private' }] },
   });
   assert.equal(result.status, 'degraded');
   assert.equal(result.mcp.status, 'degraded');
@@ -81,4 +81,13 @@ test('诊断聚合保留 MCP/model 异常状态，并拒绝不安全的标签和
   assert.equal(encoded.includes('OPENAI_KEY'), false);
   assert.equal(encoded.includes('C:\\private'), false);
   assert.equal(encoded.includes('https://'), false);
+});
+
+test('诊断将任意非 ready 的模型和 MCP 状态聚合为 degraded', async () => {
+  const result = await collectDiagnostics({
+    mcp: () => ({ status: 'ready', servers: [{ name: 'mcp', status: 'failed' }] }),
+    models: () => ({ status: 'ready', profiles: [{ id: 'model', status: 'unavailable' }] }),
+  });
+  assert.equal(result.mcp.status, 'degraded');
+  assert.equal(result.models.status, 'degraded');
 });
