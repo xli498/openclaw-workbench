@@ -1,14 +1,68 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1220" />
     <title>OpenClaw Workbench</title>
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <main>
-      <h1>OpenClaw Workbench</h1>
-      <p>Desktop shell scaffold. Runtime integration is intentionally not enabled.</p>
-    </main>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-mark" aria-hidden="true">OC</div>
+        <div>
+          <p class="eyebrow">LOCAL DEVELOPMENT WORKBENCH</p>
+          <h1>OpenClaw Workbench</h1>
+        </div>
+        <div class="topbar-status" aria-label="桌面状态"><span class="status-dot status-dot--idle" aria-hidden="true"></span><span>桌面壳已启动</span></div>
+      </header>
+
+      <main class="content">
+        <section class="welcome-row" aria-labelledby="welcome-title">
+          <div>
+            <p class="eyebrow">首屏连接</p>
+            <h2 id="welcome-title">先选择一个本地项目</h2>
+            <p class="intro">项目路径只保存在当前用户的桌面配置中。Runtime 接入桌面进程后，状态会在这里自动更新。</p>
+          </div>
+          <div class="mode-chip"><span class="mode-chip__key">MODE</span> 本地</div>
+        </section>
+
+        <section class="workspace-panel panel" aria-labelledby="workspace-title">
+          <div class="panel-heading"><div><p class="section-kicker">01 / WORKSPACE</p><h2 id="workspace-title">工作区</h2></div><span id="workspace-state" class="badge badge--muted">尚未选择</span></div>
+          <label class="field-label" for="project-path">项目文件夹路径</label>
+          <div class="path-entry">
+            <input id="project-path" name="project-path" type="text" inputmode="url" autocomplete="off" placeholder="例如：C:\\Users\\你\\Projects\\my-app" aria-describedby="project-help project-feedback" />
+            <button id="save-project" class="button button--primary" type="button">保存项目</button>
+          </div>
+          <p id="project-help" class="field-help">当前桌面壳还没有目录选择器，先粘贴绝对路径；路径不会被发送到网络。</p>
+          <p id="project-feedback" class="feedback" role="status" aria-live="polite"></p>
+        </section>
+
+        <div class="status-grid">
+          <section class="panel status-panel" aria-labelledby="runtime-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">02 / RUNTIME</p><h2 id="runtime-title">运行时</h2></div><span id="runtime-state" class="badge badge--warning">未接入</span></div>
+            <div class="status-value"><span class="status-dot status-dot--warning" aria-hidden="true"></span><strong>Runtime 尚未接入桌面进程</strong></div>
+            <p class="status-copy">当前页面不会自行启动 Node，也不会调用未注册的 Tauri 命令。</p>
+          </section>
+
+          <section class="panel status-panel" aria-labelledby="connection-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">03 / CONNECTION</p><h2 id="connection-title">控制台连接</h2></div><span id="connection-state" class="badge badge--muted">未配置</span></div>
+            <label class="field-label" for="runtime-address">Runtime 地址</label>
+            <div class="address-entry">
+              <input id="runtime-address" name="runtime-address" type="url" inputmode="url" autocomplete="off" placeholder="http://127.0.0.1:3000" aria-describedby="address-feedback" />
+              <button id="save-address" class="button button--secondary" type="button">保存</button>
+            </div>
+            <p id="address-feedback" class="feedback" role="status" aria-live="polite"></p>
+            <a id="console-link" class="console-link console-link--disabled" href="#" aria-disabled="true" tabindex="-1">打开控制台 <span aria-hidden="true">↗</span></a>
+          </section>
+        </div>
+
+        <section class="next-panel" aria-labelledby="next-title"><div class="next-icon" aria-hidden="true">→</div><div><p class="section-kicker">NEXT</p><h2 id="next-title">接入 Runtime 后的工作流</h2><p>选择项目 → 配置模型 → Ask / Plan / Code → 审批修改 → 测试与审计</p></div><span class="next-note">桌面功能正在接线</span></section>
+      </main>
+
+      <footer class="footer"><span>OpenClaw Workbench 0.1.0</span><span>本地优先 · 审批优先</span></footer>
+    </div>
+    <script type="module" src="app.js"></script>
   </body>
 </html>
