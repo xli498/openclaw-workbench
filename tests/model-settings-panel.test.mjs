@@ -16,6 +16,8 @@ test('控制台包含首次模型配置工作流而不渲染 API key 明文', ()
   assert.match(html, /secretRef/);
   assert.match(html, /modelId/);
   assert.match(html, /\/v1\/secrets/);
+  assert.match(html, /secretStored/);
+  assert.match(html, /method:'DELETE'/);
   assert.match(html, /\/v1\/models\//);
   assert.match(html, /\/v1\/models/);
   assert.match(html, /\/health/);
