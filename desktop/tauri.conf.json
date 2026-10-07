@@ -24,6 +24,11 @@
   "bundle": {
     "active": true,
     "targets": ["msi", "nsis"],
+    "resources": {
+      "../bin": "runtime/bin",
+      "../runtime": "runtime/runtime",
+      "../package.json": "runtime/package.json"
+    },
     "windows": {
       "wix": {
         "language": "en-US"
@@ -31,4 +36,3 @@
     }
   }
 }
-
