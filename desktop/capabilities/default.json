@@ -1,8 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal desktop capability set with no runtime or shell plugins enabled.",
+  "description": "Minimal desktop capability set with only the native folder picker plugin enabled.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }
-

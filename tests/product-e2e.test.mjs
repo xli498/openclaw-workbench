@@ -99,7 +99,7 @@ test('single-model product loop keeps Ask and Plan read-only and gates Code writ
     const denied = await request(context.address, `/v1/proposals/${proposal.action.id}/approve`, { method: 'POST', body: JSON.stringify({ actionHash: proposal.action.actionHash }) });
     assert.equal(denied.status, 403);
     const approved = await request(context.address, `/v1/proposals/${proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: proposal.action.actionHash }) });
-    assert.equal(approved.status, 200);
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
     assert.equal(await readFile(path.join(context.root, 'README.md'), 'utf8'), 'WORKBENCH_FIXTURE\nAPPROVED_CHANGE\n');
 
     const audit = await request(context.address, '/v1/audit');

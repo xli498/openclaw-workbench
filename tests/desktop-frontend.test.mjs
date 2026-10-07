@@ -17,17 +17,58 @@ test('desktop first screen exposes project, runtime, connection, and console con
     'connection-state',
     'console-link',
     'save-project',
-    'runtime-address'
+    'runtime-address',
+    'start-runtime',
+    'stop-runtime'
   ]) {
     assert.match(html, new RegExp(`(?:id|for)="${marker}"`), `missing ${marker}`);
   }
 
   assert.match(html, /app\.js/, 'page should load the frontend behavior module');
   assert.match(app, /localStorage/, 'project selection should survive a page reload');
-  assert.match(html, /Runtime 尚未接入桌面进程/, 'unavailable runtime must be communicated honestly');
+  assert.match(app, /start_runtime/);
+  assert.match(app, /runtime_status/);
 });
 
-test('desktop first screen does not call unregistered Tauri commands', async () => {
+test('desktop first screen uses only the registered runtime command surface', async () => {
   const app = await readFile(path.join(frontendRoot, 'app.js'), 'utf8');
-  assert.doesNotMatch(app, /__TAURI__|invoke\s*\(/, 'frontend must not call commands that Rust does not expose');
+  const host = await readFile(path.join(repoRoot, 'desktop', 'src', 'lib.rs'), 'utf8');
+  assert.match(app, /__TAURI__\?\.core\?\.invoke/);
+  const frontendCommands = ['choose_workspace', 'runtime_status', 'start_runtime', 'stop_runtime'];
+  const hostCommands = [...frontendCommands, 'runtime_request'];
+  for (const command of frontendCommands) {
+    assert.match(app, new RegExp(command));
+  }
+  for (const command of hostCommands) {
+    assert.match(host, new RegExp(`pub fn ${command}\\b`), `Rust command ${command} is missing`);
+  }
+  const handler = host.match(/generate_handler!\[([\s\S]*?)\]/)?.[1] ?? '';
+  for (const command of hostCommands) assert.match(handler, new RegExp(`\\b${command}\\b`), `Rust command ${command} is not registered`);
+  assert.doesNotMatch(app, /localStorage\.setItem\([^)]*token/i);
+});
+
+test('workspace folder picker is wired to the least-privilege Tauri dialog capability', async () => {
+  const html = await readFile(path.join(frontendRoot, 'index.html'), 'utf8');
+  const app = await readFile(path.join(frontendRoot, 'app.js'), 'utf8');
+  const config = JSON.parse(await readFile(path.join(repoRoot, 'desktop', 'tauri.conf.json'), 'utf8'));
+  const capabilities = JSON.parse(await readFile(path.join(repoRoot, 'desktop', 'capabilities', 'default.json'), 'utf8'));
+  const cargo = await readFile(path.join(repoRoot, 'desktop', 'Cargo.toml'), 'utf8');
+  const host = await readFile(path.join(repoRoot, 'desktop', 'src', 'lib.rs'), 'utf8');
+
+  assert.match(html, /id="browse-workspace"/);
+  assert.match(app, /__TAURI__\?\.dialog\?\.open/);
+  assert.equal(config.app.withGlobalTauri, true);
+  assert.match(cargo, /tauri-plugin-dialog/);
+  assert.match(host, /tauri_plugin_dialog::init\(\)/);
+  assert.ok(capabilities.permissions.includes('dialog:allow-open'));
+});
+
+test('console entry never navigates without Bearer authentication or puts a token in the URL', async () => {
+  const html = await readFile(path.join(frontendRoot, 'index.html'), 'utf8');
+  const app = await readFile(path.join(frontendRoot, 'app.js'), 'utf8');
+
+  assert.match(html, /需要桌面认证/);
+  assert.doesNotMatch(app, /consoleLink\.href\s*=\s*hasAddress/);
+  assert.doesNotMatch(app, /window\.open\s*\(/);
+  assert.match(app, /不会把 token 放入 URL/);
 });

@@ -17,6 +17,40 @@ async function request(address, pathname, options = {}) {
   return { status: response.status, headers: response.headers, body: await response.json() };
 }
 
+test('Runtime shutdown 只接受正确凭据并且只触发一次关闭回调', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-shutdown-'));
+  try {
+    const unavailable = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+    const unavailableAddress = await unavailable.listen();
+    try {
+      const response = await request(unavailableAddress, '/v1/shutdown', { method: 'POST' });
+      assert.equal(response.status, 404);
+    } finally { await unavailable.close(); }
+
+    let shutdownCount = 0;
+    let shutdownObserved;
+    const observed = new Promise((resolve) => { shutdownObserved = resolve; });
+    const app = createWorkbenchServer({
+      root,
+      token: 'test-token-012345',
+      approvalToken: 'approve-token-012345',
+      onShutdown: async () => { shutdownCount += 1; shutdownObserved(); },
+    });
+    const address = await app.listen();
+    try {
+      const unauthorized = await fetch(`http://${address.address}:${address.port}/v1/shutdown`, { method: 'POST' });
+      assert.equal(unauthorized.status, 401);
+      const first = await request(address, '/v1/shutdown', { method: 'POST' });
+      const second = await request(address, '/v1/shutdown', { method: 'POST' });
+      assert.equal(first.status, 202);
+      assert.equal(second.status, 202);
+      await observed;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(shutdownCount, 1);
+    } finally { await app.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('控制面聚合诊断并提供审批保护的持久终端会话接口', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-terminal-session-'));
   const manager = createTerminalSessionManager({ root, runCommand: async () => ({ code: 0, stdout: 'diagnostic output\n', stderr: '', cwd: root }) });

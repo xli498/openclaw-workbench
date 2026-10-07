@@ -45,8 +45,11 @@ export async function runCli(argv, { stdout = process.stdout, cwd = process.cwd(
     return { exitCode: result.summary.errors ? 2 : 0, result };
   }
   if (!approvalToken) throw new Error('审批令牌缺失，请设置 OPENCLAW_WORKBENCH_APPROVAL_TOKEN 或 --approval-token-env');
+  delete env[options.tokenEnv ?? 'OPENCLAW_WORKBENCH_TOKEN'];
+  delete env[options.approvalTokenEnv ?? 'OPENCLAW_WORKBENCH_APPROVAL_TOKEN'];
   const command = env[options.openclawCommandEnv ?? 'OPENCLAW_WORKBENCH_COMMAND']?.trim() || 'openclaw';
-  const app = createServer({ root, host: options.host, port: options.port, token, approvalToken, adapter: { command } });
+  let app;
+  app = createServer({ root, host: options.host, port: options.port, token, approvalToken, adapter: { command }, onShutdown: async () => app.close() });
   const result = await app.startup;
   if (result.fatalError) return { exitCode: 2, result };
   const address = await app.listen();

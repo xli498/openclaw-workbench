@@ -35,4 +35,9 @@ jobs:
       - run: npm install --ignore-scripts --package-lock=false
       - name: Windows runtime compatibility
         run: npm test -- --test-name-pattern="CLI|Windows|OpenClaw 诊断|Gateway|MCP|模型|配置|红队|终端执行需要|审批后执行命令|命令失败、超时和取消|控制面提供健康|审批请求不能用 currentRevision|工作区内容 revision|明确审批后完成 Patch"
+      - name: Windows desktop Rust checks
+        run: cargo fmt --manifest-path desktop/Cargo.toml -- --check
+      - run: cargo test --manifest-path desktop/Cargo.toml
+      - name: Desktop contract checks
+        run: node --test tests/desktop-frontend.test.mjs tests/desktop-packaging.test.mjs
       - run: git diff --check

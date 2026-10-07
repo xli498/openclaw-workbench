@@ -219,7 +219,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, secretStore, secretService = 'openclaw-workbench', eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, terminalSessionManager, diagnosticsCollector, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, onShutdown, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, secretStore, secretService = 'openclaw-workbench', eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, terminalSessionManager, diagnosticsCollector, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -269,6 +269,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const currentWorkspaceRevision = async (options) => (await createWorkspace(root)).workspaceRevision(options);
   const liveStreams = new Set();
   const bridges = new Set();
+  let shutdownRequested = false;
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
     const requestId = requestIdOf(request.headers['x-request-id']);
@@ -281,6 +282,15 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         return response.end(controlPanelHtml(nonce));
       }
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
+      if (request.method === 'POST' && url.pathname === '/v1/shutdown') {
+        if (typeof onShutdown !== 'function') return json(response, 404, { error: 'SHUTDOWN_UNAVAILABLE', message: 'shutdown is unavailable' });
+        json(response, 202, { accepted: true });
+        if (!shutdownRequested) {
+          shutdownRequested = true;
+          setImmediate(() => { void Promise.resolve().then(onShutdown).catch(() => {}); });
+        }
+        return;
+      }
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/diagnostics') return json(response, 200, normalizeDiagnostics(await diagnostics()));

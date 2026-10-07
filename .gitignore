@@ -6,6 +6,7 @@ node_modules/
 !.env.example
 .openclaw-workbench/
 outputs/
+desktop/target/
 .DS_Store
 .idea/
 .vscode/
