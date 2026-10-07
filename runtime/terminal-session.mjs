@@ -70,7 +70,7 @@ function publicRecord(record) {
   return Object.freeze({
     id: record.id,
     status: record.status,
-    argv: Object.freeze(record.argv.map((value) => redactText(value, 1_024))),
+    argv: Object.freeze(record.argv.map((value) => redactOutput(value, 1_024))),
     cwd: record.cwd,
     capabilities: Object.freeze({ ...record.capabilities }),
     createdAt: record.createdAt,

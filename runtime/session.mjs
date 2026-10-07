@@ -253,7 +253,7 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayR
     }
   }
 
-  async function planReview({ sessionId, question, models, judgeModel, debate = false, thinking, timeoutSeconds, signal, onStage } = {}) {
+  async function planReview({ sessionId, question, models, model, judgeModel, debate = false, thinking, timeoutSeconds, signal, onStage } = {}) {
     const session = getSession(sessionId);
     if (session.status !== 'active') throw new SessionError('SESSION_NOT_ACTIVE', 'session is not active');
     if (session.mode !== 'Plan') throw new SessionError('MODE_INSUFFICIENT', 'plan review requires a Plan session');
@@ -271,8 +271,24 @@ export function createChatSessionManager({ root, runAgentFn = runAgent, gatewayR
     try { persist(); } catch (error) { session.running = false; throw error; }
     let primaryError;
     try {
-      const runner = debate ? runPlanDebate : runPlanReview;
-      const result = await runner({ question, models, judgeModel, sessionKey: session.id, thinking, timeoutSeconds, signal: controller.signal, onStage, onRunnerStart: registerRunner, runAgentFn: (input) => runAgentFn({ ...input, signal: controller.signal }) });
+      let result;
+      if (typeof model === 'string' && model.trim()) {
+        if (!modelRunner) throw new SessionError('MODEL_REQUIRED', 'an enabled model profile is required');
+        const resolver = typeof modelResolver === 'function' ? modelResolver : modelResolver?.get?.bind(modelResolver);
+        const selectedProfile = await resolver?.(model);
+        if (!selectedProfile) throw new SessionError('MODEL_NOT_FOUND', 'model profile not found');
+        if (selectedProfile.enabled !== true) throw new SessionError('MODEL_DISABLED', 'model profile is disabled');
+        const runnerPromise = runAgentLoop({ mode: 'Plan', sessionId: session.id, profile: selectedProfile, messages: [{ role: 'user', content: question }], registry: toolRegistry, modelRunner, model: selectedProfile.model, profileId: selectedProfile.id, signal: controller.signal, thinking, timeoutSeconds });
+        registerRunner(runnerPromise);
+        const response = await runnerPromise;
+        const text = redactString(typeof response?.text === 'string' ? response.text : '');
+        if (!text.trim()) throw new PlanError('INVALID_ANALYSIS', 'model returned no usable text');
+        const digest = createHash('sha256').update(text).digest('hex').slice(0, 16);
+        result = { question, mode: 'Plan', sessionKey: session.id, analyses: [{ model, text, digest }], failures: [], synthesis: { agreement: 'full', analysisCount: 1, failureCount: 0, distinctAnswers: 1, requiresHumanReview: false } };
+      } else {
+        const runner = debate ? runPlanDebate : runPlanReview;
+        result = await runner({ question, models, judgeModel, sessionKey: session.id, thinking, timeoutSeconds, signal: controller.signal, onStage, onRunnerStart: registerRunner, runAgentFn: (input) => runAgentFn({ ...input, signal: controller.signal }) });
+      }
       const stored = Object.freeze({ id: randomUUID(), ...result, createdAt: clock().toISOString() });
       session.planResults.push(stored);
       persist();

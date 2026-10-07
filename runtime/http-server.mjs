@@ -22,6 +22,7 @@ import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-r
 import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 import { SecretResolverError, createSecretResolver } from './secret-resolver.mjs';
+import { createWindowsCredentialStore } from './secret-store.mjs';
 import { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 import { ModelRunnerError, createModelRunner } from './model-runner.mjs';
 import { createWorkspaceToolRegistry } from './workspace-tool-registry.mjs';
@@ -133,7 +134,7 @@ function errorResponse(error) {
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
-  if (error instanceof SecretResolverError) return { status: 400, body: safe(error.code, error.message) };
+  if (error instanceof SecretResolverError) return { status: error.code === 'SECRET_ALREADY_CONFIGURED' ? 409 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRunnerError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
@@ -218,7 +219,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, terminalSessionManager, diagnosticsCollector, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, secretStore, secretService = 'openclaw-workbench', eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, terminalSessionManager, diagnosticsCollector, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -244,7 +245,9 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const inspectMcp = inspectOpenClawMcpFn ?? ((options) => inspectOpenClawMcp(options));
   const inspectMcpServer = inspectMcpServerFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
   const inspectModelProfile = inspectModelProfileFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
-  const effectiveSecretResolver = secretResolver ?? createSecretResolver();
+  const effectiveSecretStore = secretStore ?? createWindowsCredentialStore({ service: secretService });
+  const hasSecret = async (name) => typeof effectiveSecretStore.has === 'function' ? effectiveSecretStore.has(name) : (await effectiveSecretStore.get(name)) !== null;
+  const effectiveSecretResolver = secretResolver ?? createSecretResolver({ keychainProvider: (name, options) => effectiveSecretStore.get(name, options) });
   const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: effectiveSecretResolver });
   const liveModelRunner = modelRunner ?? createModelRunner({ profileResolver: modelRegistry, secretResolver: effectiveSecretResolver });
   const approvePatch = __testHooks?.approvePatch ?? approveAndApplyPatch;
@@ -281,6 +284,20 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/diagnostics') return json(response, 200, normalizeDiagnostics(await diagnostics()));
+      if (request.method === 'POST' && url.pathname === '/v1/secrets') {
+        const input = await bodyOf(request);
+        if (typeof input.name !== 'string' || typeof input.value !== 'string') throw new SecretResolverError('SECRET_INPUT_INVALID', 'secret input is invalid');
+        if (await hasSecret(input.name) && input.overwrite !== true) throw new SecretResolverError('SECRET_ALREADY_CONFIGURED', 'secret is already configured; rotate it explicitly');
+        await effectiveSecretStore.set(input.name, input.value);
+        return json(response, 200, { name: input.name, configured: true });
+      }
+      const secretPath = url.pathname.match(/^\/v1\/secrets\/([^/]+)$/);
+      if (request.method === 'GET' && secretPath) {
+        return json(response, 200, { name: secretPath[1], configured: await hasSecret(secretPath[1]) });
+      }
+      if (request.method === 'DELETE' && secretPath) {
+        return json(response, 200, { name: secretPath[1], deleted: await effectiveSecretStore.delete(secretPath[1]) });
+      }
       if (request.method === 'GET' && url.pathname === '/v1/mcp/servers') return json(response, 200, { servers: mcpRegistry.list() });
       if (request.method === 'GET' && url.pathname === '/v1/mcp/runtimes') return json(response, 200, { runtimes: runtime.status() });
       if (request.method === 'GET' && url.pathname === '/v1/models') return json(response, 200, { models: modelRegistry.list() });
