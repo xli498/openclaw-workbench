@@ -1,11 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const frontendRoot = path.join(repoRoot, 'desktop', 'frontend');
+
+async function readDesktopRustSources() {
+  const sourceRoot = path.join(repoRoot, 'desktop', 'src');
+  const entries = await readdir(sourceRoot, { withFileTypes: true });
+  const rustFiles = entries.filter((entry) => entry.isFile() && entry.name.endsWith('.rs'));
+  return (await Promise.all(rustFiles.map((entry) => readFile(path.join(sourceRoot, entry.name), 'utf8')))).join('\n');
+}
 
 test('desktop first screen exposes project, runtime, connection, and console controls', async () => {
   const html = await readFile(path.join(frontendRoot, 'index.html'), 'utf8');
@@ -32,7 +39,7 @@ test('desktop first screen exposes project, runtime, connection, and console con
 
 test('desktop first screen uses only the registered runtime command surface', async () => {
   const app = await readFile(path.join(frontendRoot, 'app.js'), 'utf8');
-  const host = await readFile(path.join(repoRoot, 'desktop', 'src', 'lib.rs'), 'utf8');
+  const host = await readDesktopRustSources();
   assert.match(app, /__TAURI__\?\.core\?\.invoke/);
   const frontendCommands = ['choose_workspace', 'runtime_status', 'start_runtime', 'stop_runtime'];
   const hostCommands = [...frontendCommands, 'runtime_request'];
