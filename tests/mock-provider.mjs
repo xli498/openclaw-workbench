@@ -68,6 +68,7 @@ function completion(body, behavior) {
  */
 export async function createMockOpenAIProvider({ secret = SECRET, delayMs = 0, errorStatus, responseText } = {}) {
   const requests = [];
+  let aborts = 0;
   let closed = false;
   const fetch = async (url, options = {}) => {
     if (closed) throw new Error('mock provider is closed');
@@ -78,7 +79,7 @@ export async function createMockOpenAIProvider({ secret = SECRET, delayMs = 0, e
     if (Number.isSafeInteger(errorStatus)) return new Response(responseBody(JSON.stringify({ error: { message: 'mock provider error' } })), { status: errorStatus, headers: { 'content-type': 'application/json' } });
     if (delayMs > 0) await new Promise((resolve, reject) => {
       const timer = setTimeout(resolve, delayMs);
-      const abort = () => { clearTimeout(timer); reject(Object.assign(new Error('mock provider request aborted'), { name: 'AbortError' })); };
+      const abort = () => { clearTimeout(timer); aborts += 1; reject(Object.assign(new Error('mock provider request aborted'), { name: 'AbortError' })); };
       options.signal?.addEventListener('abort', abort, { once: true });
     });
     return completion(body, { responseText });
@@ -86,6 +87,7 @@ export async function createMockOpenAIProvider({ secret = SECRET, delayMs = 0, e
   return Object.freeze({
     fetch,
     requests,
+    get aborts() { return aborts; },
     createAgentRunner() {
       return async ({ message, model }) => ({ text: 'Plan: inspect the workspace, propose the smallest safe change, and verify it after approval.', model, protocol: 'openai-compatible', ...(message ? {} : {}) });
     },
