@@ -74,6 +74,7 @@ export function createBridgeTunnelAdapter({
   let lastError = null;
   let outputBuffer = '';
   let startPromise = null;
+  let urlWaiter = null;
 
   function publicState() {
     return Object.freeze({ provider, state, localPort, routePathConfigured: Boolean(routePath), startedAt, lastError: lastError?.code ?? null });
@@ -98,19 +99,20 @@ export function createBridgeTunnelAdapter({
       outputBuffer = outputBuffer.slice(index + 1);
       try {
         const parsed = parsePublicUrl(line);
-        if (typeof parsed === 'string' && /^https:\/\//.test(parsed) && parsed.length <= 2048) publicUrl = parsed;
+        if (typeof parsed === 'string' && /^https:\/\//.test(parsed) && parsed.length <= 2048) {
+          publicUrl = parsed;
+          urlWaiter?.resolve(parsed);
+          urlWaiter = null;
+        }
       } catch { /* parser input is untrusted */ }
     }
   }
   function waitForUrl(timeoutMs, expectedGeneration) {
-    const started = clock();
     return new Promise((resolve, reject) => {
-      const timer = setInterval(() => {
-        if (expectedGeneration !== generation) { clearInterval(timer); reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset')); return; }
-        if (publicUrl) { clearInterval(timer); resolve(publicUrl); return; }
-        if (clock() - started >= timeoutMs) { clearInterval(timer); reject(new BridgeTunnelError('TUNNEL_URL_TIMEOUT', 'tunnel URL was not reported')); }
-      }, 10);
+      if (publicUrl) return resolve(publicUrl);
+      const timer = setTimeout(() => { urlWaiter = null; reject(new BridgeTunnelError('TUNNEL_URL_TIMEOUT', 'tunnel URL was not reported')); }, timeoutMs);
       timer.unref?.();
+      urlWaiter = { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject: (error) => { clearTimeout(timer); reject(error); }, generation: expectedGeneration };
     });
   }
   async function stopProcess() {
@@ -162,6 +164,8 @@ export function createBridgeTunnelAdapter({
   }
   async function stop() {
     ++generation;
+    urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
+    urlWaiter = null;
     if (state === 'idle') return publicState();
     setState('stopping');
     await stopProcess();
