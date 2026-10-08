@@ -81,6 +81,22 @@ function publicRecord(record) {
   });
 }
 
+function comparablePath(value) {
+  let normalized = path.normalize(value);
+  if (process.platform === 'win32') {
+    normalized = normalized
+      .replace(/^\\\\\?\\UNC\\/i, '\\\\')
+      .replace(/^\\\\\?\\/, '')
+      .toLowerCase();
+  }
+  return normalized;
+}
+
+function isSameOrInsidePath(root, candidate) {
+  const relative = path.relative(comparablePath(root), comparablePath(candidate));
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 export function createTerminalSessionManager({ root, sessionProvider, runCommand = runControlledCommand, maxSessions = 8, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, maxInputBytes = MAX_INPUT_BYTES, clock = () => Date.now(), sessionDirectory = '.openclaw-workbench/terminal-sessions' } = {}) {
   if (!root) throw new TerminalSessionError('ROOT_REQUIRED', 'workspace root is required');
   if (typeof runCommand !== 'function') throw new TerminalSessionError('RUNNER_INVALID', 'terminal command runner is invalid');
@@ -106,7 +122,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const resolvedRoot = await realpath(rootPath).catch((error) => { throw new TerminalSessionError('ROOT_UNAVAILABLE', error.message); });
     const resolvedDirectory = await realpath(directory).catch((error) => { throw new TerminalSessionError('SESSION_STORE_UNAVAILABLE', error.message); });
-    if (resolvedDirectory !== directory || !(resolvedDirectory === resolvedRoot || resolvedDirectory.startsWith(`${resolvedRoot}${path.sep}`))) fail('SESSION_STORE_ESCAPE', 'session store escapes workspace');
+    if (!isSameOrInsidePath(directory, resolvedDirectory) || !isSameOrInsidePath(resolvedRoot, resolvedDirectory)) fail('SESSION_STORE_ESCAPE', 'session store escapes workspace');
     return directory;
   }
 

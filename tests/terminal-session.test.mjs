@@ -11,6 +11,17 @@ async function fixture(prefix = 'ocw-terminal-session-') {
 
 function wait(ms = 10) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
+test('Windows realpath casing differences do not reject an in-workspace session store', { skip: process.platform !== 'win32' }, async () => {
+  const root = await fixture('ocw-terminal-session-path-case-');
+  const manager = createTerminalSessionManager({ root: root.toUpperCase() });
+  try {
+    assert.deepEqual(await manager.restore(), { sessions: 0 });
+  } finally {
+    await manager.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('持久终端会话支持增量输出、输入、取消和 capability 声明', async () => {
   const root = await fixture();
   const provider = ({ onOutput }) => ({
