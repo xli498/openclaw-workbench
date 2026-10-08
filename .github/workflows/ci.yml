@@ -50,8 +50,7 @@ jobs:
             throw "Node runtime archive did not contain node.exe"
           }
           New-Item -ItemType Directory -Path $destination -Force | Out-Null
-          Remove-Item -LiteralPath (Join-Path $destination 'README.md') -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path (Join-Path $archiveRoot '*') -Destination $destination -Recurse -Force
+          Get-ChildItem -LiteralPath $archiveRoot -Force | Where-Object { $_.Name -ne 'README.md' } | Copy-Item -Destination $destination -Recurse -Force
           if (-not (Test-Path (Join-Path $destination 'node.exe'))) {
             throw "Bundled Node runtime was not prepared"
           }
