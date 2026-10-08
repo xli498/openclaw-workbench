@@ -1,4 +1,4 @@
-# Bundled Node runtime staging directory
+# Bundled Node.js v22.19.0 runtime staging directory
 
 The Windows release bundle expects Node.js `v22.19.0` for `win-x64` in this
 directory. CI downloads the official archive and extracts it here immediately
