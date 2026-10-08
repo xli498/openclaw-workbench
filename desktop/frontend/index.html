@@ -101,34 +101,79 @@
         <section class="panel ask-panel" aria-labelledby="ask-title">
           <div class="panel-heading">
             <div><p class="section-kicker">05 / ASK</p><h2 id="ask-title">Ask 工作台</h2></div>
-            <span id="ask-mode-state" class="badge badge--success">只读</span>
+            <div class="mode-switch" role="tablist" aria-label="工作模式">
+              <button id="mode-ask" class="button button--small mode-button mode-button--active" type="button" role="tab" aria-selected="true">Ask</button>
+              <button id="mode-plan" class="button button--small mode-button" type="button" role="tab" aria-selected="false">Plan</button>
+              <button id="mode-code" class="button button--small mode-button" type="button" role="tab" aria-selected="false">Code</button>
+            </div>
           </div>
+          <div class="mode-status-row"><span id="ask-mode-state" class="badge badge--success">Ask · 只读</span><span id="mode-safety-note">当前模式只读取项目，不会修改文件。</span></div>
           <div id="ask-runtime-warning" class="ask-runtime-warning" role="status" aria-live="polite">
             <strong>Runtime 未启动</strong>
             <span>先选择项目并启动 Runtime，才能读取会话和发送 Ask 消息。</span>
           </div>
           <div class="ask-toolbar">
             <div class="ask-session-picker">
-              <label class="field-label" for="ask-session-select">Ask 会话</label>
+              <label class="field-label" for="ask-session-select">当前会话</label>
               <select id="ask-session-select" aria-describedby="ask-session-status" disabled>
                 <option value="">启动 Runtime 后加载</option>
               </select>
             </div>
-            <button id="new-ask-session" class="button button--primary" type="button" disabled>新建 Ask</button>
+            <button id="new-ask-session" class="button button--primary" type="button" disabled>新建会话</button>
             <span id="ask-session-status" class="ask-session-status" role="status" aria-live="polite">Runtime 未启动</span>
           </div>
           <div id="ask-messages" class="ask-messages" aria-live="polite" aria-label="Ask 消息">
             <p class="ask-empty">启动 Runtime 后，这里会显示 Ask 会话消息。</p>
           </div>
           <form id="ask-message-form" class="ask-composer">
-            <label class="field-label" for="ask-message-input">向当前项目提问</label>
+            <label id="message-input-label" class="field-label" for="ask-message-input">向当前项目提问</label>
             <div class="ask-composer-row">
               <textarea id="ask-message-input" rows="3" maxlength="32768" placeholder="例如：请阅读当前项目并总结主要风险" disabled></textarea>
-              <button id="send-ask-message" class="button button--primary" type="submit" disabled>发送 Ask</button>
+              <button id="send-ask-message" class="button button--primary" type="submit" disabled>发送</button>
             </div>
             <p id="ask-feedback" class="feedback" role="status" aria-live="polite"></p>
-            <p class="field-help">Ask 只调用读取能力，不创建 Patch 或命令提案；任何修改都必须切换到后续 Code 流程并单独审批。</p>
+            <p id="mode-help" class="field-help">Ask 只调用读取能力，不创建 Patch 或命令提案；任何修改都必须切换到 Code 流程并单独审批。</p>
           </form>
+          <section id="plan-panel" class="mode-panel" hidden aria-labelledby="plan-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">READ ONLY</p><h3 id="plan-title">规划审查</h3></div><span class="badge badge--success">不会修改文件</span></div>
+            <label class="field-label" for="plan-question">规划问题</label>
+            <textarea id="plan-question" class="mode-textarea" rows="3" maxlength="32768" placeholder="例如：规划将登录流程迁移到 OAuth 需要哪些步骤？" disabled></textarea>
+            <button id="run-plan" class="button button--primary" type="button" disabled>生成 Plan</button>
+            <div id="plan-result" class="plan-result" aria-live="polite"><p class="ask-empty">输入问题后生成只读方案。</p></div>
+          </section>
+          <section id="code-panel" class="mode-panel" hidden aria-labelledby="code-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">APPROVAL REQUIRED</p><h3 id="code-title">Code 提案</h3></div><span class="badge badge--warning">审批后才会修改</span></div>
+            <p class="field-help">Code 可以提出 Patch 或命令，但 Runtime 会在执行前暂停，必须由你明确批准。</p>
+            <div id="code-proposals" class="code-proposals" aria-live="polite"><p class="ask-empty">发送 Code 请求后，待审批提案会显示在这里。</p></div>
+          </section>
+        </section>
+
+        <section class="panel operations-panel" aria-labelledby="operations-title">
+          <div class="panel-heading">
+            <div><p class="section-kicker">06 / OPERATIONS</p><h2 id="operations-title">运行状态与恢复</h2></div>
+            <button id="refresh-operations" class="button button--secondary" type="button" disabled>刷新状态</button>
+          </div>
+          <div class="operations-grid">
+            <section class="operations-card" aria-labelledby="diagnostics-title">
+              <div class="operations-card-heading"><h3 id="diagnostics-title">诊断</h3><span id="diagnostics-state" class="badge badge--muted">未读取</span></div>
+              <p id="diagnostics-summary" class="operations-summary">Runtime 启动后读取组件健康状态。</p>
+              <div id="diagnostics-list" class="operations-list" role="status" aria-live="polite"></div>
+            </section>
+            <section class="operations-card" aria-labelledby="recovery-title">
+              <div class="operations-card-heading"><h3 id="recovery-title">恢复</h3><span id="recovery-state" class="badge badge--muted">未读取</span></div>
+              <p id="recovery-summary" class="operations-summary">没有自动执行恢复；需要人工复核的动作会列在这里。</p>
+              <div id="recovery-list" class="operations-list" role="status" aria-live="polite"></div>
+            </section>
+            <section class="operations-card operations-card--wide" aria-labelledby="audit-title">
+              <div class="operations-card-heading"><h3 id="audit-title">最近审计事件</h3><span id="audit-state" class="badge badge--muted">未读取</span></div>
+              <div id="audit-list" class="operations-list operations-list--events" role="status" aria-live="polite"></div>
+            </section>
+            <section class="operations-card operations-card--wide" aria-labelledby="status-title">
+              <div class="operations-card-heading"><h3 id="status-title">持久化状态</h3><span id="status-state" class="badge badge--muted">未读取</span></div>
+              <div id="status-list" class="operations-list" role="status" aria-live="polite"></div>
+            </section>
+          </div>
+          <p id="operations-feedback" class="feedback" role="status" aria-live="polite"></p>
         </section>
       </main>
 

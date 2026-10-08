@@ -112,6 +112,22 @@ select:disabled { color: var(--faint); }
 .ask-composer textarea:focus { border-color: var(--accent-strong); box-shadow: 0 0 0 2px rgba(45, 152, 229, .18); }
 .ask-composer textarea::placeholder { color: #53657e; }
 .ask-composer-row .button { min-width: 112px; }
+.operations-panel { margin-top: 14px; padding: 24px; }
+.operations-panel > .panel-heading { align-items: center; }
+.operations-panel > .panel-heading .button { min-height: 32px; padding: 0 10px; }
+.operations-grid { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.operations-card { background: #0d1727; border: 1px solid var(--line); border-radius: 5px; min-width: 0; padding: 16px; }
+.operations-card--wide { grid-column: 1 / -1; }
+.operations-card-heading { align-items: center; display: flex; gap: 10px; justify-content: space-between; }
+.operations-card h3 { font-size: 13px; margin: 0; }
+.operations-summary { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 12px 0 0; }
+.operations-list { color: var(--muted); font-size: 12px; line-height: 1.55; margin-top: 12px; min-height: 22px; }
+.operations-list-item { border-top: 1px solid rgba(37, 51, 74, .75); padding: 9px 0; }
+.operations-list-item:first-child { border-top: 0; padding-top: 0; }
+.operations-list-item strong { color: var(--text); font-size: 12px; }
+.operations-list-item small { color: var(--faint); display: block; font-size: 10px; margin-top: 3px; }
+.operations-list--events { max-height: 190px; overflow-y: auto; }
+.operations-list-empty { color: var(--faint); }
 .next-panel { align-items: center; background: #101a2a; border-left: 2px solid var(--accent-strong); display: flex; gap: 16px; margin-top: 14px; padding: 19px 22px; }
 .next-icon { color: var(--accent); font-size: 24px; font-weight: 300; }
 .next-panel h2 { font-size: 14px; margin-bottom: 5px; }
@@ -132,6 +148,8 @@ select:disabled { color: var(--faint); }
   .ask-toolbar { align-items: stretch; display: grid; grid-template-columns: 1fr; }
   .ask-session-status { padding-bottom: 0; }
   .ask-composer-row { display: grid; grid-template-columns: 1fr; }
+  .operations-grid { grid-template-columns: 1fr; }
+  .operations-card--wide { grid-column: auto; }
   .path-entry, .address-entry { display: grid; grid-template-columns: 1fr; }
   .button { width: 100%; }
   .next-panel { align-items: flex-start; }

@@ -43,6 +43,18 @@ const askMessageForm = document.querySelector('#ask-message-form');
 const askMessageInput = document.querySelector('#ask-message-input');
 const sendAskMessage = document.querySelector('#send-ask-message');
 const askFeedback = document.querySelector('#ask-feedback');
+const refreshOperationsButton = document.querySelector('#refresh-operations');
+const diagnosticsState = document.querySelector('#diagnostics-state');
+const diagnosticsSummary = document.querySelector('#diagnostics-summary');
+const diagnosticsList = document.querySelector('#diagnostics-list');
+const recoveryState = document.querySelector('#recovery-state');
+const recoverySummary = document.querySelector('#recovery-summary');
+const recoveryList = document.querySelector('#recovery-list');
+const auditState = document.querySelector('#audit-state');
+const auditList = document.querySelector('#audit-list');
+const statusState = document.querySelector('#status-state');
+const statusList = document.querySelector('#status-list');
+const operationsFeedback = document.querySelector('#operations-feedback');
 const invoke = window.__TAURI__?.core?.invoke;
 const openDialog = window.__TAURI__?.dialog?.open;
 let runtimeReady = false;
@@ -53,6 +65,7 @@ let askSessions = [];
 let selectedAskSessionId = '';
 let askMessagesState = [];
 let askBusy = false;
+let operationsBusy = false;
 
 function getStored(key) {
   try { return window.localStorage.getItem(key) ?? ''; } catch { return ''; }
@@ -103,6 +116,85 @@ async function askRequest(method, path, body = null) {
     // still being handled.
     void refreshRuntime();
     throw error;
+  }
+}
+
+function operationStatus(value) {
+  return value === 'ready' || value === 'healthy' ? '正常' : value === 'degraded' ? '降级' : value === 'unavailable' ? '不可用' : value === 'error' ? '异常' : value || '未知';
+}
+
+function setOperationBadge(element, status) {
+  const kind = status === 'ready' || status === 'healthy' ? 'success' : status === 'degraded' || status === 'error' ? 'warning' : 'muted';
+  element.textContent = operationStatus(status);
+  element.className = `badge badge--${kind}`;
+}
+
+function operationItem(label, value, detail = '') {
+  return `<div class="operations-list-item"><strong>${escapeHtml(label)}</strong><span> · ${escapeHtml(value)}</span>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</div>`;
+}
+
+function renderDiagnostics(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {};
+  setOperationBadge(diagnosticsState, data.status);
+  diagnosticsSummary.textContent = data.generatedAt ? `检查时间：${new Date(data.generatedAt).toLocaleString()}` : '未返回检查时间。';
+  const components = ['workspace', 'models', 'openclaw', 'mcp', 'audit'];
+  diagnosticsList.innerHTML = components.map((key) => {
+    const item = data[key] || {};
+    return operationItem(key === 'workspace' ? '工作区' : key === 'models' ? '模型' : key === 'openclaw' ? 'OpenClaw' : key === 'mcp' ? 'MCP' : '审计', operationStatus(item.status), item.code || '');
+  }).join('') || '<div class="operations-list-empty">暂无诊断结果。</div>';
+}
+
+function renderRecovery(payload) {
+  const transactions = Array.isArray(payload?.transactions) ? payload.transactions : [];
+  const blocked = transactions.filter((item) => item.decision === 'blocked' || item.decision === 'requires_approval').length;
+  recoveryState.textContent = transactions.length ? (blocked ? `${blocked} 项需处理` : '已检查') : '无待处理';
+  recoveryState.className = `badge badge--${blocked ? 'warning' : 'success'}`;
+  recoverySummary.textContent = transactions.length ? '重启后未完成动作不会自动重放，请人工复核。' : '当前没有待恢复事务。';
+  recoveryList.innerHTML = transactions.length ? transactions.slice(0, 20).map((item) => operationItem(item.transactionId || '事务', item.decision || item.state || '未知', item.reason || '')).join('') : '<div class="operations-list-empty">没有检测到待恢复事务。</div>';
+}
+
+function renderAudit(payload) {
+  const events = Array.isArray(payload?.events) ? payload.events : [];
+  setOperationBadge(auditState, events.length ? 'ready' : 'unavailable');
+  auditList.innerHTML = events.length ? events.slice(-20).reverse().map((event) => operationItem(event.type || '事件', event.actor || 'system', event.timestamp ? new Date(event.timestamp).toLocaleString() : '')).join('') : '<div class="operations-list-empty">暂无审计事件。</div>';
+}
+
+function renderStatus(payload) {
+  const persisted = payload?.persistedState || {};
+  setOperationBadge(statusState, payload?.fatalError ? 'error' : 'ready');
+  statusList.innerHTML = [
+    operationItem('启动恢复', payload?.summary ? `扫描 ${payload.summary.scanned ?? 0}，需审批 ${payload.summary.approvalsRequired ?? 0}` : '未返回'),
+    operationItem('会话', `恢复 ${persisted.sessions?.recovered ?? 0}，人工复核 ${persisted.sessions?.manualReview ?? 0}`),
+    operationItem('提案', `恢复 ${persisted.proposals?.recovered ?? 0}，人工复核 ${persisted.proposals?.manualReview ?? 0}`),
+    operationItem('事件', `最新序号 ${persisted.events?.latestSequence ?? 0}`)
+  ].join('');
+}
+
+function clearOperations() {
+  [diagnosticsList, recoveryList, auditList, statusList].forEach((element) => { element.innerHTML = '<div class="operations-list-empty">Runtime 未启动。</div>'; });
+  [diagnosticsState, recoveryState, auditState, statusState].forEach((element) => { element.textContent = '未读取'; element.className = 'badge badge--muted'; });
+  diagnosticsSummary.textContent = 'Runtime 启动后读取组件健康状态。';
+  recoverySummary.textContent = '没有自动执行恢复；需要人工复核的动作会列在这里。';
+}
+
+async function refreshOperations() {
+  if (!runtimeReady || !invoke || operationsBusy) return;
+  operationsBusy = true;
+  refreshOperationsButton.disabled = true;
+  try {
+    const [status, diagnostics, recovery, audit] = await Promise.all([
+      modelRequest('GET', '/v1/status', null, false, { recoverRuntime: false }),
+      modelRequest('GET', '/v1/diagnostics', null, false, { recoverRuntime: false }),
+      modelRequest('GET', '/v1/recovery', null, false, { recoverRuntime: false }),
+      modelRequest('GET', '/v1/audit?limit=50', null, false, { recoverRuntime: false })
+    ]);
+    renderStatus(status); renderDiagnostics(diagnostics); renderRecovery(recovery); renderAudit(audit);
+    setFeedback(operationsFeedback, '状态已刷新。', 'success');
+  } catch (error) {
+    setFeedback(operationsFeedback, error.message || '运行状态读取失败。', 'error');
+  } finally {
+    operationsBusy = false;
+    refreshOperationsButton.disabled = !runtimeReady;
   }
 }
 
@@ -388,6 +480,7 @@ function renderRuntime(status) {
   startRuntime.disabled = !invoke || ready || status?.state === 'starting';
   stopRuntime.disabled = !invoke || !ready;
   modelSettingsForm.disabled = !ready;
+  refreshOperationsButton.disabled = !ready;
   updateModelActionState();
   if (ready && !wasReady) {
     void refreshModels();
@@ -404,12 +497,14 @@ function renderRuntime(status) {
     selectedAskSessionId = '';
     renderAskSessions([]);
     setFeedback(askFeedback, '', '');
+    clearOperations();
   }
   if (status?.address) {
     addressInput.value = status.address;
     setStored(STORAGE_KEYS.runtimeAddress, status.address);
     updateConnectionState(status.address);
   }
+  if (ready) void refreshOperations();
 }
 
 async function refreshRuntime() {
@@ -597,6 +692,8 @@ askMessageForm.addEventListener('submit', (event) => {
   void sendCurrentAskMessage();
 });
 
+refreshOperationsButton.addEventListener('click', () => { void refreshOperations(); });
+
 document.querySelector('#save-address').addEventListener('click', () => {
   const addressValue = addressInput.value.trim().replace(/\/$/, '');
   if (!addressValue || !isHttpUrl(addressValue)) {
@@ -617,3 +714,4 @@ consoleLink.addEventListener('click', (event) => {
 
 void refreshRuntime();
 renderAskSessions([]);
+clearOperations();
