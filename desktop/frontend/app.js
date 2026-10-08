@@ -33,12 +33,26 @@ const testModel = document.querySelector('#test-model');
 const modelProposalPanel = document.querySelector('#model-proposal');
 const modelProposalSummary = document.querySelector('#model-proposal-summary');
 const approveModel = document.querySelector('#approve-model');
+const askRuntimeWarning = document.querySelector('#ask-runtime-warning');
+const askModeState = document.querySelector('#ask-mode-state');
+const askSessionSelect = document.querySelector('#ask-session-select');
+const newAskSession = document.querySelector('#new-ask-session');
+const askSessionStatus = document.querySelector('#ask-session-status');
+const askMessages = document.querySelector('#ask-messages');
+const askMessageForm = document.querySelector('#ask-message-form');
+const askMessageInput = document.querySelector('#ask-message-input');
+const sendAskMessage = document.querySelector('#send-ask-message');
+const askFeedback = document.querySelector('#ask-feedback');
 const invoke = window.__TAURI__?.core?.invoke;
 const openDialog = window.__TAURI__?.dialog?.open;
 let runtimeReady = false;
 let modelProfiles = [];
 let selectedModelId = '';
 let pendingModelProposal = null;
+let askSessions = [];
+let selectedAskSessionId = '';
+let askMessagesState = [];
+let askBusy = false;
 
 function getStored(key) {
   try { return window.localStorage.getItem(key) ?? ''; } catch { return ''; }
@@ -59,13 +73,15 @@ function escapeHtml(value) {
   })[character]);
 }
 
-async function modelRequest(method, path, body = null, approval = false) {
+async function modelRequest(method, path, body = null, approval = false, { recoverRuntime = true } = {}) {
   let response;
   try {
     response = await invoke('runtime_request', { request: { method, path, body, approval } });
   } catch (error) {
-    if (runtimeReady) renderRuntime({ state: 'failed', error: 'Runtime 连接已断开，请重新启动。' });
-    void refreshRuntime();
+    if (recoverRuntime) {
+      if (runtimeReady) renderRuntime({ state: 'failed', error: 'Runtime 连接已断开，请重新启动。' });
+      void refreshRuntime();
+    }
     throw error;
   }
   if (!response || !Number.isInteger(response.status)) throw new Error('桌面 Runtime 返回无效响应。');
@@ -78,8 +94,180 @@ async function modelRequest(method, path, body = null, approval = false) {
   return response.body;
 }
 
+async function askRequest(method, path, body = null) {
+  try {
+    return await modelRequest(method, path, body, false, { recoverRuntime: false });
+  } catch (error) {
+    // A failed Ask bridge call should refresh the desktop status once, but it
+    // must not recursively reload Ask sessions while the failing request is
+    // still being handled.
+    void refreshRuntime();
+    throw error;
+  }
+}
+
 function selectedModel() {
   return modelProfiles.find((profile) => profile.id === selectedModelId) ?? null;
+}
+
+function selectedAskSession() {
+  return askSessions.find((session) => session.id === selectedAskSessionId) ?? null;
+}
+
+function askSessionLabel(session) {
+  const status = session.status === 'active' ? '活跃' : session.status === 'manual_review' ? '人工复核' : session.status === 'closed' ? '已关闭' : session.status ?? '未知状态';
+  const createdAt = session.createdAt ? new Date(session.createdAt).toLocaleString() : session.id?.slice(0, 8);
+  return `${status} · ${createdAt || session.id?.slice(0, 8) || 'Ask'}`;
+}
+
+function askMessageText(message) {
+  if (typeof message?.content === 'string') return message.content;
+  if (message?.content && typeof message.content === 'object') {
+    if (typeof message.content.text === 'string' && message.content.text) return message.content.text;
+    try { return JSON.stringify(message.content, null, 2); } catch { return '[无法显示消息内容]'; }
+  }
+  return '';
+}
+
+function renderAskMessages(messages = []) {
+  askMessagesState = Array.isArray(messages) ? messages : [];
+  if (!askMessagesState.length) {
+    askMessages.innerHTML = '<p class="ask-empty">暂无消息。可以先问我如何阅读当前项目。</p>';
+    return;
+  }
+  askMessages.innerHTML = askMessagesState.map((message) => {
+    const role = message?.role === 'user' ? '你' : 'Workbench';
+    const kind = message?.role === 'user' ? 'ask-message--user' : 'ask-message--assistant';
+    const timestamp = message?.createdAt ? new Date(message.createdAt).toLocaleTimeString() : '';
+    return `<article class="ask-message ${kind}"><div class="ask-message-meta"><strong>${escapeHtml(role)}</strong><span>${escapeHtml(timestamp)}</span></div><div class="ask-message-content">${escapeHtml(askMessageText(message))}</div></article>`;
+  }).join('');
+  askMessages.scrollTop = askMessages.scrollHeight;
+}
+
+function renderAskSessions(sessions = []) {
+  askSessions = Array.isArray(sessions) ? sessions.filter((session) => session?.mode === 'Ask') : [];
+  if (!askSessions.some((session) => session.id === selectedAskSessionId)) selectedAskSessionId = askSessions.at(-1)?.id ?? '';
+  askSessionSelect.innerHTML = '<option value="">选择 Ask 会话…</option>' + askSessions.map((session) =>
+    `<option value="${escapeHtml(session.id)}">${escapeHtml(askSessionLabel(session))}</option>`
+  ).join('');
+  askSessionSelect.value = selectedAskSessionId;
+  const session = selectedAskSession();
+  if (!session) {
+    askSessionStatus.textContent = runtimeReady ? '暂无 Ask 会话' : 'Runtime 未启动';
+    askSessionStatus.dataset.kind = runtimeReady ? '' : 'warning';
+    renderAskMessages([]);
+  } else if (session.status === 'manual_review') {
+    askSessionStatus.textContent = '人工复核：发送已暂停';
+    askSessionStatus.dataset.kind = 'warning';
+  } else if (session.status === 'closed') {
+    askSessionStatus.textContent = '已关闭：请新建 Ask';
+    askSessionStatus.dataset.kind = 'warning';
+  } else {
+    askSessionStatus.textContent = `${session.messageCount ?? askMessagesState.length} 条消息 · 只读`;
+    askSessionStatus.dataset.kind = 'success';
+  }
+  updateAskActionState();
+}
+
+function updateAskActionState() {
+  const session = selectedAskSession();
+  const active = runtimeReady && session?.status === 'active';
+  askSessionSelect.disabled = !runtimeReady || askBusy;
+  newAskSession.disabled = !runtimeReady || askBusy;
+  askMessageInput.disabled = !active || askBusy;
+  sendAskMessage.disabled = !active || askBusy;
+  askModeState.textContent = '只读';
+  askModeState.className = 'badge badge--success';
+  askRuntimeWarning.hidden = runtimeReady;
+}
+
+async function loadAskMessages() {
+  const session = selectedAskSession();
+  if (!runtimeReady || !session) {
+    renderAskMessages([]);
+    updateAskActionState();
+    return;
+  }
+  try {
+    const result = await askRequest('GET', `/v1/sessions/${encodeURIComponent(session.id)}/messages`);
+    renderAskMessages(result.messages);
+    const latest = askSessions.find((item) => item.id === session.id);
+    if (latest) latest.messageCount = askMessagesState.length;
+    renderAskSessions(askSessions);
+  } catch (error) {
+    setFeedback(askFeedback, error.message || '无法读取 Ask 消息。', 'error');
+  }
+}
+
+async function refreshAskSessions({ selectLatest = false } = {}) {
+  if (!runtimeReady || !invoke) return;
+  try {
+    const result = await askRequest('GET', '/v1/sessions');
+    const previous = selectedAskSessionId;
+    const incoming = Array.isArray(result.sessions) ? result.sessions.filter((session) => session?.mode === 'Ask') : [];
+    if (selectLatest || !incoming.some((session) => session.id === previous)) selectedAskSessionId = incoming.at(-1)?.id ?? '';
+    renderAskSessions(incoming);
+    await loadAskMessages();
+  } catch (error) {
+    renderAskSessions([]);
+    setFeedback(askFeedback, error.message || '无法读取 Ask 会话。', 'error');
+  }
+}
+
+async function createAskSession() {
+  if (!runtimeReady || askBusy) return;
+  askBusy = true;
+  updateAskActionState();
+  setFeedback(askFeedback, '正在创建只读 Ask 会话…');
+  try {
+    const result = await askRequest('POST', '/v1/sessions', { mode: 'Ask', actor: 'user' });
+    if (!result?.session?.id) throw new Error('Runtime 未返回有效的 Ask 会话。');
+    selectedAskSessionId = result.session.id;
+    await refreshAskSessions();
+    setFeedback(askFeedback, 'Ask 会话已创建；它不会生成修改提案。', 'success');
+  } catch (error) {
+    setFeedback(askFeedback, error.message || 'Ask 会话创建失败。', 'error');
+  } finally {
+    askBusy = false;
+    updateAskActionState();
+  }
+}
+
+async function sendCurrentAskMessage() {
+  const session = selectedAskSession();
+  const message = askMessageInput.value.trim();
+  if (!runtimeReady) {
+    setFeedback(askFeedback, 'Runtime 未启动，请先启动 Runtime。', 'error');
+    return;
+  }
+  if (!session || session.status !== 'active') {
+    setFeedback(askFeedback, '请选择一个活跃的 Ask 会话，或新建 Ask。', 'error');
+    return;
+  }
+  if (!message) {
+    setFeedback(askFeedback, '请输入问题后再发送。', 'error');
+    askMessageInput.focus();
+    return;
+  }
+  askBusy = true;
+  updateAskActionState();
+  setFeedback(askFeedback, 'Ask 正在读取项目，请稍候…');
+  try {
+    const profile = selectedModel();
+    const body = { message };
+    if (profile?.enabled === true) body.modelId = profile.id;
+    const result = await askRequest('POST', `/v1/sessions/${encodeURIComponent(session.id)}/messages`, body);
+    askMessageInput.value = '';
+    await loadAskMessages();
+    await refreshAskSessions();
+    setFeedback(askFeedback, 'Ask 已完成；未创建修改提案。', 'success');
+    return result;
+  } catch (error) {
+    setFeedback(askFeedback, error.message || 'Ask 请求失败。', 'error');
+  } finally {
+    askBusy = false;
+    updateAskActionState();
+  }
 }
 
 function updateModelActionState() {
@@ -201,7 +389,10 @@ function renderRuntime(status) {
   stopRuntime.disabled = !invoke || !ready;
   modelSettingsForm.disabled = !ready;
   updateModelActionState();
-  if (ready && !wasReady) void refreshModels();
+  if (ready && !wasReady) {
+    void refreshModels();
+    void refreshAskSessions({ selectLatest: true });
+  }
   if (!ready && wasReady) {
     renderModelProfiles([]);
     modelProfilePicker.innerHTML = '<option value="">启动 Runtime 后加载</option>';
@@ -210,6 +401,9 @@ function renderRuntime(status) {
     modelState.className = 'badge badge--muted';
     setFeedback(modelFeedback, '', '');
     renderModelProposal(null);
+    selectedAskSessionId = '';
+    renderAskSessions([]);
+    setFeedback(askFeedback, '', '');
   }
   if (status?.address) {
     addressInput.value = status.address;
@@ -390,6 +584,19 @@ testModel.addEventListener('click', async () => {
 
 refreshModelsButton.addEventListener('click', () => { void refreshModels(); });
 
+askSessionSelect.addEventListener('change', () => {
+  selectedAskSessionId = askSessionSelect.value;
+  renderAskSessions(askSessions);
+  void loadAskMessages();
+});
+
+newAskSession.addEventListener('click', () => { void createAskSession(); });
+
+askMessageForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  void sendCurrentAskMessage();
+});
+
 document.querySelector('#save-address').addEventListener('click', () => {
   const addressValue = addressInput.value.trim().replace(/\/$/, '');
   if (!addressValue || !isHttpUrl(addressValue)) {
@@ -409,3 +616,4 @@ consoleLink.addEventListener('click', (event) => {
 });
 
 void refreshRuntime();
+renderAskSessions([]);

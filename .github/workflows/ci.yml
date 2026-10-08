@@ -32,6 +32,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.19.0'
+      - name: Prepare bundled Node runtime
+        shell: pwsh
+        run: |
+          $version = 'v22.19.0'
+          $archive = Join-Path $env:RUNNER_TEMP "node-$version-win-x64.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "node-$version-win-x64"
+          $destination = Join-Path $env:GITHUB_WORKSPACE 'desktop/node-runtime'
+          $uri = "https://nodejs.org/dist/$version/node-$version-win-x64.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          if (Test-Path $extractRoot) {
+            Remove-Item -LiteralPath $extractRoot -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNNER_TEMP -Force
+          if (-not (Test-Path (Join-Path $extractRoot 'node.exe'))) {
+            throw "Node runtime archive did not contain node.exe"
+          }
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          Copy-Item -Path (Join-Path $extractRoot '*') -Destination $destination -Recurse -Force
+          if (-not (Test-Path (Join-Path $destination 'node.exe'))) {
+            throw "Bundled Node runtime was not prepared"
+          }
       - run: npm install --ignore-scripts --package-lock=false
       - name: Windows runtime compatibility
         run: npm test -- --test-name-pattern="CLI|Windows|OpenClaw 诊断|Gateway|MCP|模型|配置|红队|终端执行需要|审批后执行命令|命令失败、超时和取消|控制面提供健康|审批请求不能用 currentRevision|工作区内容 revision|明确审批后完成 Patch"
@@ -39,7 +60,7 @@ jobs:
         run: cargo fmt --manifest-path desktop/Cargo.toml -- --check
       - run: cargo test --manifest-path desktop/Cargo.toml
       - name: Desktop contract checks
-        run: node --test tests/desktop-frontend.test.mjs tests/desktop-packaging.test.mjs
+        run: node --test tests/desktop-frontend.test.mjs tests/desktop-ask-session.test.mjs tests/desktop-packaging.test.mjs
       - name: Build Windows desktop installers
         run: npx --yes @tauri-apps/cli@2.12.1 build --ci
         working-directory: desktop

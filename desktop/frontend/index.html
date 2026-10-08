@@ -97,6 +97,39 @@
             </div>
           </div>
         </section>
+
+        <section class="panel ask-panel" aria-labelledby="ask-title">
+          <div class="panel-heading">
+            <div><p class="section-kicker">05 / ASK</p><h2 id="ask-title">Ask 工作台</h2></div>
+            <span id="ask-mode-state" class="badge badge--success">只读</span>
+          </div>
+          <div id="ask-runtime-warning" class="ask-runtime-warning" role="status" aria-live="polite">
+            <strong>Runtime 未启动</strong>
+            <span>先选择项目并启动 Runtime，才能读取会话和发送 Ask 消息。</span>
+          </div>
+          <div class="ask-toolbar">
+            <div class="ask-session-picker">
+              <label class="field-label" for="ask-session-select">Ask 会话</label>
+              <select id="ask-session-select" aria-describedby="ask-session-status" disabled>
+                <option value="">启动 Runtime 后加载</option>
+              </select>
+            </div>
+            <button id="new-ask-session" class="button button--primary" type="button" disabled>新建 Ask</button>
+            <span id="ask-session-status" class="ask-session-status" role="status" aria-live="polite">Runtime 未启动</span>
+          </div>
+          <div id="ask-messages" class="ask-messages" aria-live="polite" aria-label="Ask 消息">
+            <p class="ask-empty">启动 Runtime 后，这里会显示 Ask 会话消息。</p>
+          </div>
+          <form id="ask-message-form" class="ask-composer">
+            <label class="field-label" for="ask-message-input">向当前项目提问</label>
+            <div class="ask-composer-row">
+              <textarea id="ask-message-input" rows="3" maxlength="32768" placeholder="例如：请阅读当前项目并总结主要风险" disabled></textarea>
+              <button id="send-ask-message" class="button button--primary" type="submit" disabled>发送 Ask</button>
+            </div>
+            <p id="ask-feedback" class="feedback" role="status" aria-live="polite"></p>
+            <p class="field-help">Ask 只调用读取能力，不创建 Patch 或命令提案；任何修改都必须切换到后续 Code 流程并单独审批。</p>
+          </form>
+        </section>
       </main>
 
       <footer class="footer"><span>OpenClaw Workbench 0.1.0</span><span>本地优先 · 审批优先</span></footer>

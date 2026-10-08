@@ -5,7 +5,7 @@ This directory contains the Tauri 2 Windows desktop shell for OpenClaw Workbench
 ## Prerequisites
 
 - Windows 10/11
-- Node.js `>=22.19.0`
+- Node.js `>=22.19.0` (development fallback only; release installers carry their own Node runtime)
 - Rust toolchain with Cargo
 - Tauri Windows prerequisites (WebView2, Microsoft C++ Build Tools with the MSVC `link.exe`, and a Windows 10/11 SDK)
 
@@ -20,7 +20,7 @@ cargo test
 cargo tauri dev
 ```
 
-`cargo tauri dev` is a development run. If bundle resources are not materialized, a debug build may use the checkout's `bin/` and `runtime/` directories. This fallback is compiled out of release builds.
+`cargo tauri dev` is a development run. If bundle resources are not materialized, a debug build first looks for `desktop/node-runtime/node.exe` and then may use a supported Node.js on `PATH`. The source-checkout fallback is compiled out of release builds.
 
 Before building, run the Tauri environment preflight from `desktop`:
 
@@ -37,6 +37,8 @@ cd desktop
 npx --yes @tauri-apps/cli@2.12.1 build --ci
 ```
 
+Before a Windows release build, prepare the exact Node.js `v22.19.0` win-x64 archive in `desktop/node-runtime/`. CI downloads this archive automatically; the binary is intentionally ignored by Git and is never committed. The release bundle maps that directory to `runtime/node` and starts `runtime/node/node.exe` from the Tauri resource directory.
+
 Installers are emitted below `desktop/target/release/bundle/`.
 
 `cargo tauri build` remains equivalent when the Tauri CLI is already installed. Both commands require the MSVC `link.exe`; `cargo check` and `cargo test` can fail before compiling the application when Visual Studio Build Tools or the Windows SDK is absent.
@@ -46,8 +48,9 @@ The installer includes the runtime resources under the Tauri resource directory:
 - `runtime/bin/workbench.mjs`
 - `runtime/runtime/` (Node runtime modules and Windows helper scripts)
 - `runtime/package.json`
+- `runtime/node/node.exe` and the accompanying Node.js runtime files
 
-The release desktop process resolves the entry point from `AppHandle.path().resource_dir()`. If packaged resources are missing, startup fails instead of falling back to a source checkout. The current installer still requires a supported system Node.js (`>=22.19.0`) on `PATH`; Node.js is not bundled yet.
+The release desktop process resolves the entry point and Node executable from `AppHandle.path().resource_dir()`. If packaged resources are missing, startup fails instead of falling back to a source checkout or a system Node.js installation. This keeps the installer self-contained and makes the runtime version deterministic.
 
 ## Safe runtime launcher contract
 

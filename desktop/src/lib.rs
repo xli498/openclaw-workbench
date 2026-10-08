@@ -110,7 +110,7 @@ fn choose_workspace_path(value: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn node_executable() -> Result<PathBuf, String> {
+fn node_executable_from_path() -> Result<PathBuf, String> {
     let names = if cfg!(windows) {
         ["node.exe", "node"]
     } else {
@@ -126,6 +126,37 @@ fn node_executable() -> Result<PathBuf, String> {
         }
     }
     Err("Node.js was not found on PATH".into())
+}
+
+fn node_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    let resource_root = app
+        .path()
+        .resource_dir()
+        .map_err(|_| "desktop resource directory is unavailable".to_string())?;
+    let bundled = resource_root
+        .join("runtime")
+        .join("node")
+        .join(if cfg!(windows) { "node.exe" } else { "node" });
+    if bundled.is_file() {
+        return Ok(bundled);
+    }
+
+    // `cargo tauri dev` does not always materialize bundle resources. In a
+    // debug build, prefer the downloaded developer runtime and finally the
+    // user's PATH. Release builds must use the bundled runtime so an
+    // installer can never silently depend on a machine-wide Node install.
+    #[cfg(debug_assertions)]
+    {
+        let development = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("node-runtime")
+            .join(if cfg!(windows) { "node.exe" } else { "node" });
+        if development.is_file() {
+            return Ok(development);
+        }
+        return node_executable_from_path();
+    }
+
+    Err("bundled Node.js runtime is unavailable; prepare desktop/node-runtime before building a release".into())
 }
 
 fn runtime_script_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -226,7 +257,7 @@ pub fn start_runtime(
         let approval_token = generate_token().map_err(error_text)?;
         let script = runtime_script_path(&app)?;
         let spec = RuntimeLaunchSpec {
-            node_executable: node_executable()?,
+            node_executable: node_executable(&app)?,
             runtime_script: script,
             working_directory: canonical.clone(),
             args: vec![

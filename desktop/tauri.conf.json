@@ -28,7 +28,8 @@
     "resources": {
       "../bin": "runtime/bin",
       "../runtime": "runtime/runtime",
-      "../package.json": "runtime/package.json"
+      "../package.json": "runtime/package.json",
+      "node-runtime": "runtime/node"
     },
     "windows": {
       "wix": {
