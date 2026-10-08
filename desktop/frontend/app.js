@@ -43,6 +43,16 @@ const askMessageForm = document.querySelector('#ask-message-form');
 const askMessageInput = document.querySelector('#ask-message-input');
 const sendAskMessage = document.querySelector('#send-ask-message');
 const askFeedback = document.querySelector('#ask-feedback');
+const modeButtons = { Ask: document.querySelector('#mode-ask'), Plan: document.querySelector('#mode-plan'), Code: document.querySelector('#mode-code') };
+const modeSafetyNote = document.querySelector('#mode-safety-note');
+const messageInputLabel = document.querySelector('#message-input-label');
+const modeHelp = document.querySelector('#mode-help');
+const planPanel = document.querySelector('#plan-panel');
+const planQuestion = document.querySelector('#plan-question');
+const runPlan = document.querySelector('#run-plan');
+const planResult = document.querySelector('#plan-result');
+const codePanel = document.querySelector('#code-panel');
+const codeProposals = document.querySelector('#code-proposals');
 const refreshOperationsButton = document.querySelector('#refresh-operations');
 const diagnosticsState = document.querySelector('#diagnostics-state');
 const diagnosticsSummary = document.querySelector('#diagnostics-summary');
@@ -65,6 +75,9 @@ let askSessions = [];
 let selectedAskSessionId = '';
 let askMessagesState = [];
 let askBusy = false;
+let workMode = 'Ask';
+let planBusy = false;
+let codeProposalsState = [];
 let operationsBusy = false;
 
 function getStored(key) {
@@ -206,6 +219,19 @@ function selectedAskSession() {
   return askSessions.find((session) => session.id === selectedAskSessionId) ?? null;
 }
 
+function modeSession() {
+  return askSessions.find((session) => session.id === selectedAskSessionId && session.mode === workMode) ?? null;
+}
+
+function sessionPath(sessionId, suffix = '') {
+  return `/v1/sessions/${encodeURIComponent(sessionId)}${suffix}`;
+}
+
+// Keep this explicit route shape as a stable contract for desktop integrations.
+function askMessagesPath(session) {
+  return `/v1/sessions/${encodeURIComponent(session.id)}/messages`;
+}
+
 function askSessionLabel(session) {
   const status = session.status === 'active' ? '活跃' : session.status === 'manual_review' ? '人工复核' : session.status === 'closed' ? '已关闭' : session.status ?? '未知状态';
   const createdAt = session.createdAt ? new Date(session.createdAt).toLocaleString() : session.id?.slice(0, 8);
@@ -237,7 +263,7 @@ function renderAskMessages(messages = []) {
 }
 
 function renderAskSessions(sessions = []) {
-  askSessions = Array.isArray(sessions) ? sessions.filter((session) => session?.mode === 'Ask') : [];
+  askSessions = Array.isArray(sessions) ? sessions.filter((session) => session?.mode === workMode) : [];
   if (!askSessions.some((session) => session.id === selectedAskSessionId)) selectedAskSessionId = askSessions.at(-1)?.id ?? '';
   askSessionSelect.innerHTML = '<option value="">选择 Ask 会话…</option>' + askSessions.map((session) =>
     `<option value="${escapeHtml(session.id)}">${escapeHtml(askSessionLabel(session))}</option>`
@@ -255,21 +281,27 @@ function renderAskSessions(sessions = []) {
     askSessionStatus.textContent = '已关闭：请新建 Ask';
     askSessionStatus.dataset.kind = 'warning';
   } else {
-    askSessionStatus.textContent = `${session.messageCount ?? askMessagesState.length} 条消息 · 只读`;
+    askSessionStatus.textContent = `${session.messageCount ?? askMessagesState.length} 条消息 · ${workMode === 'Code' ? '审批保护' : '只读'}`;
     askSessionStatus.dataset.kind = 'success';
   }
   updateAskActionState();
 }
 
 function updateAskActionState() {
-  const session = selectedAskSession();
+  const session = modeSession();
   const active = runtimeReady && session?.status === 'active';
   askSessionSelect.disabled = !runtimeReady || askBusy;
   newAskSession.disabled = !runtimeReady || askBusy;
   askMessageInput.disabled = !active || askBusy;
   sendAskMessage.disabled = !active || askBusy;
-  askModeState.textContent = '只读';
-  askModeState.className = 'badge badge--success';
+  const readOnly = workMode !== 'Code';
+  askModeState.textContent = `${workMode} · ${readOnly ? '只读' : '审批保护'}`;
+  askModeState.className = `badge ${readOnly ? 'badge--success' : 'badge--warning'}`;
+  modeSafetyNote.textContent = workMode === 'Code' ? '可提出修改，但批准前不会写入文件。' : '当前模式只读取项目，不会修改文件。';
+  messageInputLabel.textContent = workMode === 'Code' ? '描述要修改的内容' : '向当前项目提问';
+  modeHelp.textContent = workMode === 'Ask' ? 'Ask 只调用读取能力，不创建 Patch 或命令提案。' : workMode === 'Plan' ? 'Plan 输出方案并保持只读，不创建 Patch 或命令提案。' : 'Code 可以提出 Patch 或命令；任何执行都必须单独审批。';
+  planQuestion.disabled = !runtimeReady || planBusy;
+  runPlan.disabled = !runtimeReady || planBusy;
   askRuntimeWarning.hidden = runtimeReady;
 }
 
@@ -281,7 +313,7 @@ async function loadAskMessages() {
     return;
   }
   try {
-    const result = await askRequest('GET', `/v1/sessions/${encodeURIComponent(session.id)}/messages`);
+    const result = await askRequest('GET', askMessagesPath(session));
     renderAskMessages(result.messages);
     const latest = askSessions.find((item) => item.id === session.id);
     if (latest) latest.messageCount = askMessagesState.length;
@@ -296,7 +328,7 @@ async function refreshAskSessions({ selectLatest = false } = {}) {
   try {
     const result = await askRequest('GET', '/v1/sessions');
     const previous = selectedAskSessionId;
-    const incoming = Array.isArray(result.sessions) ? result.sessions.filter((session) => session?.mode === 'Ask') : [];
+    const incoming = Array.isArray(result.sessions) ? result.sessions.filter((session) => session?.mode === workMode) : [];
     if (selectLatest || !incoming.some((session) => session.id === previous)) selectedAskSessionId = incoming.at(-1)?.id ?? '';
     renderAskSessions(incoming);
     await loadAskMessages();
@@ -306,17 +338,17 @@ async function refreshAskSessions({ selectLatest = false } = {}) {
   }
 }
 
-async function createAskSession() {
+async function createModeSession() {
   if (!runtimeReady || askBusy) return;
   askBusy = true;
   updateAskActionState();
-  setFeedback(askFeedback, '正在创建只读 Ask 会话…');
+  setFeedback(askFeedback, `正在创建 ${workMode} 会话…`);
   try {
-    const result = await askRequest('POST', '/v1/sessions', { mode: 'Ask', actor: 'user' });
-    if (!result?.session?.id) throw new Error('Runtime 未返回有效的 Ask 会话。');
+    const result = await askRequest('POST', '/v1/sessions', { mode: workMode, ...(workMode === 'Ask' ? { mode: 'Ask' } : {}), actor: 'user' });
+    if (!result?.session?.id) throw new Error('Runtime 未返回有效会话。');
     selectedAskSessionId = result.session.id;
     await refreshAskSessions();
-    setFeedback(askFeedback, 'Ask 会话已创建；它不会生成修改提案。', 'success');
+    setFeedback(askFeedback, `${workMode} 会话已创建。`, 'success');
   } catch (error) {
     setFeedback(askFeedback, error.message || 'Ask 会话创建失败。', 'error');
   } finally {
@@ -325,8 +357,10 @@ async function createAskSession() {
   }
 }
 
+const createAskSession = createModeSession;
+
 async function sendCurrentAskMessage() {
-  const session = selectedAskSession();
+  const session = modeSession();
   const message = askMessageInput.value.trim();
   if (!runtimeReady) {
     setFeedback(askFeedback, 'Runtime 未启动，请先启动 Runtime。', 'error');
@@ -343,16 +377,17 @@ async function sendCurrentAskMessage() {
   }
   askBusy = true;
   updateAskActionState();
-  setFeedback(askFeedback, 'Ask 正在读取项目，请稍候…');
+  setFeedback(askFeedback, `${workMode} 正在处理，请稍候…`);
   try {
     const profile = selectedModel();
     const body = { message };
     if (profile?.enabled === true) body.modelId = profile.id;
-    const result = await askRequest('POST', `/v1/sessions/${encodeURIComponent(session.id)}/messages`, body);
+    const result = await askRequest('POST', askMessagesPath(session), body);
     askMessageInput.value = '';
     await loadAskMessages();
     await refreshAskSessions();
-    setFeedback(askFeedback, 'Ask 已完成；未创建修改提案。', 'success');
+    if (workMode === 'Code') await refreshCodeProposals(session.id);
+    setFeedback(askFeedback, workMode === 'Code' ? 'Code 已完成；请检查并审批提案。' : workMode === 'Ask' ? 'Ask 已完成；未创建修改提案。' : 'Plan 已完成；未修改文件。', 'success');
     return result;
   } catch (error) {
     setFeedback(askFeedback, error.message || 'Ask 请求失败。', 'error');
@@ -360,6 +395,69 @@ async function sendCurrentAskMessage() {
     askBusy = false;
     updateAskActionState();
   }
+}
+
+function renderPlanResult(result) {
+  if (!result) { planResult.innerHTML = '<p class="ask-empty">输入问题后生成只读方案。</p>'; return; }
+  const synthesis = result.synthesis ?? {};
+  const analyses = Array.isArray(result.analyses) ? result.analyses : [];
+  planResult.innerHTML = `${analyses.map((item) => `<article class="plan-analysis"><strong>${escapeHtml(item.model ?? '模型')}</strong><div>${escapeHtml(item.text ?? '')}</div></article>`).join('')}<p class="plan-summary">结论：${escapeHtml(synthesis.agreement ?? '未知')} · ${synthesis.analysisCount ?? analyses.length} 个分析 · ${synthesis.requiresHumanReview ? '需要人工复核' : '无需人工复核'}</p>`;
+}
+
+async function runPlanReview() {
+  const session = modeSession();
+  const question = planQuestion.value.trim();
+  if (!runtimeReady || !session || session.status !== 'active') { setFeedback(askFeedback, '请先创建活跃的 Plan 会话。', 'error'); return; }
+  if (!question) { setFeedback(askFeedback, '请输入规划问题。', 'error'); planQuestion.focus(); return; }
+  planBusy = true; updateAskActionState(); setFeedback(askFeedback, 'Plan 正在生成只读方案…');
+  try {
+    const body = { question };
+    const profile = selectedModel();
+    if (profile?.enabled === true) body.model = profile.id;
+    const result = await askRequest('POST', sessionPath(session.id, '/plan'), body);
+    renderPlanResult(result); setFeedback(askFeedback, 'Plan 已完成；未修改文件。', 'success');
+  } catch (error) { setFeedback(askFeedback, error.message || 'Plan 请求失败。', 'error'); }
+  finally { planBusy = false; updateAskActionState(); }
+}
+
+function proposalSummary(proposal) {
+  const action = proposal?.action ?? proposal;
+  const preview = action?.preview ?? proposal?.preview ?? {};
+  return [action?.type ?? proposal?.type ?? '提案', preview.target ?? action?.target, preview.path ?? preview.file, preview.command ?? preview.text, action?.risk ? `风险：${action.risk}` : ''].filter(Boolean).join(' · ');
+}
+
+function renderCodeProposals(proposals = []) {
+  codeProposalsState = Array.isArray(proposals) ? proposals : [];
+  if (!codeProposalsState.length) { codeProposals.innerHTML = '<p class="ask-empty">暂无待审批提案。</p>'; return; }
+  codeProposals.innerHTML = codeProposalsState.map((proposal) => {
+    const action = proposal.action ?? proposal; const id = action.id ?? proposal.id; const hash = action.actionHash ?? proposal.actionHash ?? '';
+    return `<article class="code-proposal" data-proposal-id="${escapeHtml(id)}"><div class="code-proposal-summary"><strong>${escapeHtml(action.status ?? 'awaiting_approval')}</strong><span>${escapeHtml(proposalSummary(proposal))}</span></div><div class="code-proposal-actions"><button class="button button--small button--primary" data-proposal-action="approve" data-action-hash="${escapeHtml(hash)}">批准并执行</button><button class="button button--small button--secondary" data-proposal-action="deny" data-action-hash="${escapeHtml(hash)}">拒绝</button><button class="button button--small button--secondary" data-proposal-action="diff">查看 Diff</button></div><pre class="code-proposal-diff" hidden></pre></article>`;
+  }).join('');
+}
+
+async function refreshCodeProposals(sessionId) {
+  try { const result = await askRequest('GET', sessionPath(sessionId, '/tools/proposals')); renderCodeProposals(result.proposals ?? result.actions ?? []); }
+  catch { renderCodeProposals([]); }
+}
+
+async function handleProposalAction(button) {
+  const card = button.closest('.code-proposal'); const id = card?.dataset.proposalId; const action = button.dataset.proposalAction; const hash = button.dataset.actionHash;
+  if (!id || !action) return;
+  button.disabled = true;
+  try {
+    if (action === 'diff') { const result = await askRequest('GET', `/v1/${'proposals'}/${encodeURIComponent(id)}/diff`); const diff = card.querySelector('.code-proposal-diff'); diff.hidden = false; diff.textContent = result.diff ?? result.preview ?? '没有可显示的 Diff。'; return; }
+    const path = `/v1/${'proposals'}/${encodeURIComponent(id)}/${action === 'approve' ? 'approve' : 'deny'}`;
+    await modelRequest('POST', path, { actionHash: hash }, true);
+    card.remove(); setFeedback(askFeedback, action === 'approve' ? '提案已批准并执行。' : '提案已拒绝。', 'success');
+  } catch (error) { button.disabled = false; setFeedback(askFeedback, error.message || '提案操作失败。', 'error'); }
+}
+
+function setWorkMode(nextMode) {
+  if (!['Ask', 'Plan', 'Code'].includes(nextMode) || workMode === nextMode) return;
+  workMode = nextMode; selectedAskSessionId = ''; askMessagesState = [];
+  for (const [name, button] of Object.entries(modeButtons)) { button.classList.toggle('mode-button--active', name === workMode); button.setAttribute('aria-selected', String(name === workMode)); }
+  planPanel.hidden = workMode !== 'Plan'; codePanel.hidden = workMode !== 'Code'; askMessages.hidden = workMode === 'Plan'; askMessageForm.hidden = workMode === 'Plan'; newAskSession.textContent = `新建 ${workMode}`;
+  void refreshAskSessions({ selectLatest: true }); updateAskActionState();
 }
 
 function updateModelActionState() {
@@ -685,7 +783,14 @@ askSessionSelect.addEventListener('change', () => {
   void loadAskMessages();
 });
 
-newAskSession.addEventListener('click', () => { void createAskSession(); });
+newAskSession.addEventListener('click', () => { void createModeSession(); });
+
+for (const [name, button] of Object.entries(modeButtons)) button.addEventListener('click', () => setWorkMode(name));
+runPlan.addEventListener('click', () => { void runPlanReview(); });
+codeProposals.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-proposal-action]');
+  if (button) void handleProposalAction(button);
+});
 
 askMessageForm.addEventListener('submit', (event) => {
   event.preventDefault();

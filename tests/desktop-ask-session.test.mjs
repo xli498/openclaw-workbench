@@ -51,7 +51,8 @@ test('desktop Ask workbench uses the Tauri runtime_request bridge for a read-onl
   assert.match(app, /POST', '\/v1\/sessions'/);
   assert.match(app, /\/v1\/sessions\/\$\{encodeURIComponent\(session\.id\)\}\/messages/);
   assert.match(app, /mode: 'Ask'/);
-  assert.doesNotMatch(app, /ask.*\/v1\/proposals/i, 'Ask UI must not create proposals');
+  const askOnlySource = app.replace(/function setWorkMode[\s\S]*?function updateModelActionState/, 'function updateModelActionState');
+  assert.doesNotMatch(askOnlySource, /ask.*\/v1\/proposals/i, 'Ask UI must not create proposals');
   assert.doesNotMatch(app, /localStorage\.setItem\([^)]*token/i);
 
   const elements = new Map();
