@@ -122,7 +122,10 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const resolvedRoot = await realpath(rootPath).catch((error) => { throw new TerminalSessionError('ROOT_UNAVAILABLE', error.message); });
     const resolvedDirectory = await realpath(directory).catch((error) => { throw new TerminalSessionError('SESSION_STORE_UNAVAILABLE', error.message); });
-    if (!isSameOrInsidePath(directory, resolvedDirectory) || !isSameOrInsidePath(resolvedRoot, resolvedDirectory)) fail('SESSION_STORE_ESCAPE', 'session store escapes workspace');
+    // realpath may return a canonical casing or a short-name alias that is not
+    // textually equivalent to the requested path on Windows. Compare the two
+    // canonical paths instead; this still rejects junction/symlink escapes.
+    if (!isSameOrInsidePath(resolvedRoot, resolvedDirectory)) fail('SESSION_STORE_ESCAPE', 'session store escapes workspace');
     return directory;
   }
 

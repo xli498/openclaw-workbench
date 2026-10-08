@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createTerminalSessionManager, TerminalSessionError } from '../runtime/terminal-session.mjs';
@@ -19,6 +19,24 @@ test('Windows realpath casing differences do not reject an in-workspace session 
   } finally {
     await manager.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('terminal session store still rejects a directory junction outside the workspace', { skip: process.platform !== 'win32' }, async () => {
+  const root = await fixture('ocw-terminal-session-junction-root-');
+  const outside = await fixture('ocw-terminal-session-junction-outside-');
+  const parent = path.join(root, '.openclaw-workbench');
+  const directory = path.join(parent, 'terminal-sessions');
+  const manager = createTerminalSessionManager({ root });
+  try {
+    await mkdir(parent, { recursive: true });
+    await symlink(outside, directory, 'junction');
+    await assert.rejects(() => manager.restore(), (error) => error instanceof TerminalSessionError && error.code === 'SESSION_STORE_ESCAPE');
+  } finally {
+    await manager.close();
+    await rm(directory, { force: true });
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
