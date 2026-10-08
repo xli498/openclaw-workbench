@@ -24,6 +24,7 @@
   },
   "bundle": {
     "active": true,
+    "icon": ["icons/icon.ico"],
     "targets": ["msi", "nsis"],
     "resources": {
       "../bin": "runtime/bin",
