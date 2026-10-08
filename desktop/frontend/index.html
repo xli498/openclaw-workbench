@@ -60,7 +60,43 @@
           </section>
         </div>
 
-        <section class="next-panel" aria-labelledby="next-title"><div class="next-icon" aria-hidden="true">→</div><div><p class="section-kicker">NEXT</p><h2 id="next-title">接入 Runtime 后的工作流</h2><p>选择项目 → 配置模型 → Ask / Plan / Code → 审批修改 → 测试与审计</p></div><span class="next-note">桌面功能正在接线</span></section>
+        <section class="panel model-panel" aria-labelledby="model-title">
+          <div class="panel-heading">
+            <div><p class="section-kicker">04 / MODEL</p><h2 id="model-title">模型配置</h2></div>
+            <span id="model-state" class="badge badge--muted">Runtime 未运行</span>
+          </div>
+          <div class="model-layout">
+            <div>
+              <p class="field-help model-intro">配置一个 OpenAI-compatible 模型。API Key 仅发送给本地 Runtime 并保存到 Windows 凭据管理器；模型登记与启用都需要单独批准。</p>
+              <fieldset id="model-settings-form" class="model-settings-form" disabled>
+                <div class="model-fields">
+                  <label><span class="field-label">档案 ID</span><input id="model-id" autocomplete="off" placeholder="primary" /></label>
+                  <label><span class="field-label">Provider</span><input id="model-provider" autocomplete="off" placeholder="OpenAI-compatible" /></label>
+                  <label class="model-field--wide"><span class="field-label">API Endpoint</span><input id="model-endpoint" type="url" inputmode="url" autocomplete="url" placeholder="https://api.example.com/v1" /></label>
+                  <label><span class="field-label">模型名称</span><input id="model-name" autocomplete="off" placeholder="model-name" /></label>
+                  <label><span class="field-label">API Key</span><input id="model-api-key" type="password" autocomplete="new-password" placeholder="输入 API Key" /></label>
+                </div>
+                <div class="model-submit-row"><button id="save-model" class="button button--primary" type="button">保存并提交审批</button></div>
+              </fieldset>
+              <p id="model-feedback" class="feedback" role="status" aria-live="polite"></p>
+            </div>
+            <div class="model-management">
+              <div class="model-picker-heading"><label class="field-label" for="model-profile-picker">已配置模型</label><button id="refresh-models" class="button button--secondary" type="button" disabled>刷新状态</button></div>
+              <select id="model-profile-picker" aria-describedby="model-profile-list">
+                <option value="">启动 Runtime 后加载</option>
+              </select>
+              <div id="model-profile-list" class="model-profile-list" role="status" aria-live="polite">启动 Runtime 后加载模型状态。</div>
+              <div class="model-actions">
+                <button id="enable-model" class="button button--secondary" type="button" disabled>启用模型</button>
+                <button id="test-model" class="button button--secondary" type="button" disabled>测试连接</button>
+              </div>
+              <section id="model-proposal" class="model-proposal" aria-live="polite" hidden>
+                <div><strong>待人工批准</strong><p id="model-proposal-summary"></p></div>
+                <button id="approve-model" class="button button--primary" type="button">批准</button>
+              </section>
+            </div>
+          </div>
+        </section>
       </main>
 
       <footer class="footer"><span>OpenClaw Workbench 0.1.0</span><span>本地优先 · 审批优先</span></footer>

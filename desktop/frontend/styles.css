@@ -16,7 +16,7 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--bg); color: var(--text); }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { cursor: pointer; }
 .app-shell { min-height: 100vh; display: flex; flex-direction: column; }
 .topbar { align-items: center; border-bottom: 1px solid var(--line); display: flex; gap: 14px; min-height: 74px; padding: 0 clamp(20px, 5vw, 64px); }
@@ -46,8 +46,11 @@ h2 { font-size: 18px; letter-spacing: -.01em; margin-bottom: 0; }
 .field-label { color: var(--muted); display: block; font-size: 12px; margin-bottom: 8px; }
 .path-entry, .address-entry { display: flex; gap: 8px; }
 input { background: #0d1727; border: 1px solid var(--line); border-radius: 5px; color: var(--text); min-height: 42px; outline: none; padding: 0 12px; width: 100%; }
+select { background: #0d1727; border: 1px solid var(--line); border-radius: 5px; color: var(--text); min-height: 42px; outline: none; padding: 0 12px; width: 100%; }
 input:focus { border-color: var(--accent-strong); box-shadow: 0 0 0 2px rgba(45, 152, 229, .18); }
+select:focus { border-color: var(--accent-strong); box-shadow: 0 0 0 2px rgba(45, 152, 229, .18); }
 input::placeholder { color: #53657e; }
+select:disabled { color: var(--faint); }
 .button { border: 0; border-radius: 5px; font-size: 12px; font-weight: 700; min-height: 42px; padding: 0 17px; white-space: nowrap; }
 .button--primary { background: var(--accent); color: #081422; }
 .button--primary:hover { background: #a4d9ff; }
@@ -63,6 +66,27 @@ input::placeholder { color: #53657e; }
 .console-link { color: var(--accent); display: inline-flex; font-size: 12px; font-weight: 700; gap: 5px; margin-top: 13px; text-decoration: none; }
 .console-link:hover { color: #b3e1ff; }
 .console-link--disabled { color: var(--faint); cursor: not-allowed; }
+.model-panel { margin-top: 14px; padding: 24px; }
+.model-layout { align-items: start; display: grid; gap: 32px; grid-template-columns: minmax(0, 1.25fr) minmax(260px, .85fr); }
+.model-intro { margin: 0 0 18px; max-width: 620px; }
+.model-settings-form { border: 0; margin: 0; min-width: 0; padding: 0; }
+.model-settings-form:disabled { opacity: .62; }
+.model-fields { display: grid; gap: 13px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.model-fields label { min-width: 0; }
+.model-fields input { min-width: 0; }
+.model-field--wide { grid-column: 1 / -1; }
+.model-submit-row { display: flex; justify-content: flex-end; margin-top: 14px; }
+.model-picker-heading { align-items: center; display: flex; gap: 10px; justify-content: space-between; }
+.model-picker-heading .field-label { margin-bottom: 0; }
+.model-picker-heading .button { min-height: 32px; padding: 0 10px; }
+.model-profile-list { border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 14px; min-height: 70px; padding: 13px 0; white-space: pre-line; }
+.model-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.model-actions .button { flex: 1 1 120px; }
+.model-proposal { align-items: center; border-top: 1px solid var(--line); display: flex; gap: 14px; justify-content: space-between; margin-top: 16px; padding-top: 15px; }
+.model-proposal[hidden] { display: none; }
+.model-proposal strong { color: var(--warning); font-size: 12px; }
+.model-proposal p { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 4px 0 0; }
+.model-proposal .button { min-width: 88px; }
 .next-panel { align-items: center; background: #101a2a; border-left: 2px solid var(--accent-strong); display: flex; gap: 16px; margin-top: 14px; padding: 19px 22px; }
 .next-icon { color: var(--accent); font-size: 24px; font-weight: 300; }
 .next-panel h2 { font-size: 14px; margin-bottom: 5px; }
@@ -73,6 +97,12 @@ input::placeholder { color: #53657e; }
   .welcome-row { display: block; }
   .mode-chip { display: inline-block; margin-top: 18px; }
   .status-grid { grid-template-columns: 1fr; }
+  .model-layout { grid-template-columns: 1fr; }
+  .model-fields { grid-template-columns: 1fr; }
+  .model-field--wide { grid-column: auto; }
+  .model-picker-heading { align-items: stretch; flex-direction: column; }
+  .model-proposal { align-items: stretch; flex-direction: column; }
+  .model-actions { display: grid; grid-template-columns: 1fr; }
   .path-entry, .address-entry { display: grid; grid-template-columns: 1fr; }
   .button { width: 100%; }
   .next-panel { align-items: flex-start; }

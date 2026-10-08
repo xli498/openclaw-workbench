@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createWorkbenchServer } from '../runtime/http-server.mjs';
+import { SecretStoreError } from '../runtime/secret-store.mjs';
 
 async function request(address, pathname, options = {}) {
   const response = await fetch(`http://${address.address}:${address.port}${pathname}`, {
@@ -51,5 +52,43 @@ test('密钥同名写入默认拒绝覆盖，避免旧模型静默换 Key', asyn
     assert.equal(second.status, 409);
     assert.equal(second.body.error, 'SECRET_ALREADY_CONFIGURED');
     assert.equal(values.get('workbench.model.primary'), 'first-secret');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('密钥覆盖和删除必须使用独立审批凭据，并写入脱敏审计', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-model-secret-approval-'));
+  const values = new Map();
+  const auditEvents = [];
+  const secretStore = { async set(name, value) { values.set(name, value); }, async get(name) { return values.get(name) ?? null; }, async has(name) { return values.has(name); }, async delete(name) { return values.delete(name); } };
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore, audit: { async append(event) { auditEvents.push(event); }, async list() { return auditEvents; } } });
+  const address = await app.listen();
+  try {
+    assert.equal((await request(address, '/v1/secrets', { method: 'POST', body: JSON.stringify({ name: 'workbench.model.primary', value: 'first-secret' }) })).status, 200);
+    const overwriteWithoutApproval = await request(address, '/v1/secrets', { method: 'POST', body: JSON.stringify({ name: 'workbench.model.primary', value: 'replacement-secret', overwrite: true }) });
+    assert.equal(overwriteWithoutApproval.status, 403);
+    assert.equal(overwriteWithoutApproval.body.error, 'APPROVAL_AUTH_REQUIRED');
+    const overwrite = await request(address, '/v1/secrets', { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ name: 'workbench.model.primary', value: 'replacement-secret', overwrite: true }) });
+    assert.equal(overwrite.status, 200);
+    assert.equal(values.get('workbench.model.primary'), 'replacement-secret');
+    const deleteWithoutApproval = await request(address, '/v1/secrets/workbench.model.primary', { method: 'DELETE' });
+    assert.equal(deleteWithoutApproval.status, 403);
+    const deleted = await request(address, '/v1/secrets/workbench.model.primary', { method: 'DELETE', headers: { 'x-approval-token': 'approve-token-012345' } });
+    assert.equal(deleted.status, 200);
+    assert.equal(values.has('workbench.model.primary'), false);
+    assert.deepEqual(auditEvents.map((event) => event.type), ['secret.configured', 'secret.configured', 'secret.deleted']);
+    assert.equal(JSON.stringify(auditEvents).includes('replacement-secret'), false);
+    assert.equal(JSON.stringify(auditEvents).includes('first-secret'), false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('secret store validation errors return a structured client error', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-model-secret-validation-'));
+  const secretStore = { async set() { throw new SecretStoreError('SECRET_STORE_INPUT_INVALID', 'store input is invalid'); }, async get() { return null; }, async has() { return false; }, async delete() { return false; } };
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore });
+  const address = await app.listen();
+  try {
+    const result = await request(address, '/v1/secrets', { method: 'POST', body: JSON.stringify({ name: 'workbench.model.primary', value: 'bad-value' }) });
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error, 'SECRET_STORE_INPUT_INVALID');
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });

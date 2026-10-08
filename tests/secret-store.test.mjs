@@ -34,6 +34,13 @@ test('secret store validates service, names, and values without echoing secret m
   assert.throws(() => createWindowsCredentialStore({ service: '' }), { code: 'SECRET_STORE_SERVICE_INVALID' });
 });
 
+test('secret store rejects values that exceed the Windows credential blob limit', async () => {
+  const store = createWindowsCredentialStore({ service: 'openclaw-workbench-test', backend: createMemorySecretBackend() });
+  await store.set('maximum', 'a'.repeat(1280));
+  await assert.rejects(() => store.set('too-large', 'a'.repeat(1281)), { code: 'SECRET_STORE_INPUT_INVALID' });
+  assert.equal(await store.has('too-large'), false);
+});
+
 test('memory backend is injectable and isolated per store', async () => {
   const backend = createMemorySecretBackend();
   const first = createWindowsCredentialStore({ service: 'a', backend });

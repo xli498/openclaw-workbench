@@ -22,7 +22,7 @@ import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-r
 import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 import { SecretResolverError, createSecretResolver } from './secret-resolver.mjs';
-import { createWindowsCredentialStore } from './secret-store.mjs';
+import { SecretStoreError, createWindowsCredentialStore } from './secret-store.mjs';
 import { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 import { ModelRunnerError, createModelRunner } from './model-runner.mjs';
 import { createWorkspaceToolRegistry } from './workspace-tool-registry.mjs';
@@ -135,6 +135,7 @@ function errorResponse(error) {
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
   if (error instanceof SecretResolverError) return { status: error.code === 'SECRET_ALREADY_CONFIGURED' ? 409 : 400, body: safe(error.code, error.message) };
+  if (error instanceof SecretStoreError) return { status: ['SECRET_STORE_BACKEND_FAILED', 'SECRET_STORE_UNAVAILABLE'].includes(error.code) ? 503 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRunnerError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
@@ -200,7 +201,7 @@ function modelHealthSummary(result) {
 
 function publicAuditEvent(event) {
   const safe = {};
-  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'profileId', 'operation', 'status', 'code', 'state']) {
+  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'profileId', 'secretName', 'operation', 'status', 'code', 'state']) {
     if (typeof event?.[field] === 'string' && event[field].length <= 256) safe[field] = event[field];
   }
   if (Array.isArray(event?.files)) {
@@ -297,8 +298,11 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'POST' && url.pathname === '/v1/secrets') {
         const input = await bodyOf(request);
         if (typeof input.name !== 'string' || typeof input.value !== 'string') throw new SecretResolverError('SECRET_INPUT_INVALID', 'secret input is invalid');
-        if (await hasSecret(input.name) && input.overwrite !== true) throw new SecretResolverError('SECRET_ALREADY_CONFIGURED', 'secret is already configured; rotate it explicitly');
+        const overwrite = input.overwrite === true;
+        if (overwrite && !requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        if (await hasSecret(input.name) && !overwrite) throw new SecretResolverError('SECRET_ALREADY_CONFIGURED', 'secret is already configured; rotate it explicitly');
         await effectiveSecretStore.set(input.name, input.value);
+        if (effectiveAudit) await effectiveAudit.append({ type: 'secret.configured', actor: 'user', secretName: input.name, operation: overwrite ? 'overwrite' : 'create' });
         return json(response, 200, { name: input.name, configured: true });
       }
       const secretPath = url.pathname.match(/^\/v1\/secrets\/([^/]+)$/);
@@ -306,7 +310,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         return json(response, 200, { name: secretPath[1], configured: await hasSecret(secretPath[1]) });
       }
       if (request.method === 'DELETE' && secretPath) {
-        return json(response, 200, { name: secretPath[1], deleted: await effectiveSecretStore.delete(secretPath[1]) });
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const deleted = await effectiveSecretStore.delete(secretPath[1]);
+        if (effectiveAudit) await effectiveAudit.append({ type: 'secret.deleted', actor: 'user', secretName: secretPath[1] });
+        return json(response, 200, { name: secretPath[1], deleted });
       }
       if (request.method === 'GET' && url.pathname === '/v1/mcp/servers') return json(response, 200, { servers: mcpRegistry.list() });
       if (request.method === 'GET' && url.pathname === '/v1/mcp/runtimes') return json(response, 200, { runtimes: runtime.status() });
@@ -357,7 +364,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         if (!current) throw new ModelRegistryError('MODEL_NOT_FOUND', 'model profile not found');
         if (input.configHash !== current.configHash) throw new ModelRegistryError('MODEL_CONFLICT', 'model configuration changed; refresh before proposing');
         const enabled = modelToggle[2] === 'enable';
-        const preview = { profileId: current.id, expectedConfigHash: input.configHash, enabled };
+        const preview = { profileId: current.id, provider: current.provider, protocol: current.protocol, model: current.model, endpoint: current.endpoint, capabilities: current.capabilities, secretRef: current.secretRef, expectedConfigHash: input.configHash, enabled };
         const action = transition(transition(createAction({ type: 'model.set_enabled', sessionId: input.sessionId, workspaceRevision: current.configHash, target: current.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
         const proposal = Object.freeze({ action, profile: current, operation: 'set_enabled', expectedConfigHash: input.configHash, enabled });
         modelReservations.add(action.id);

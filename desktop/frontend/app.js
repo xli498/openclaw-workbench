@@ -16,8 +16,29 @@ const runtimeDot = document.querySelector('#runtime-dot');
 const startRuntime = document.querySelector('#start-runtime');
 const stopRuntime = document.querySelector('#stop-runtime');
 const browseWorkspace = document.querySelector('#browse-workspace');
+const modelSettingsForm = document.querySelector('#model-settings-form');
+const modelIdInput = document.querySelector('#model-id');
+const modelProviderInput = document.querySelector('#model-provider');
+const modelEndpointInput = document.querySelector('#model-endpoint');
+const modelNameInput = document.querySelector('#model-name');
+const modelApiKeyInput = document.querySelector('#model-api-key');
+const saveModel = document.querySelector('#save-model');
+const modelState = document.querySelector('#model-state');
+const modelFeedback = document.querySelector('#model-feedback');
+const modelProfilePicker = document.querySelector('#model-profile-picker');
+const modelProfileList = document.querySelector('#model-profile-list');
+const refreshModelsButton = document.querySelector('#refresh-models');
+const enableModel = document.querySelector('#enable-model');
+const testModel = document.querySelector('#test-model');
+const modelProposalPanel = document.querySelector('#model-proposal');
+const modelProposalSummary = document.querySelector('#model-proposal-summary');
+const approveModel = document.querySelector('#approve-model');
 const invoke = window.__TAURI__?.core?.invoke;
 const openDialog = window.__TAURI__?.dialog?.open;
+let runtimeReady = false;
+let modelProfiles = [];
+let selectedModelId = '';
+let pendingModelProposal = null;
 
 function getStored(key) {
   try { return window.localStorage.getItem(key) ?? ''; } catch { return ''; }
@@ -30,6 +51,105 @@ function setStored(key, value) {
 function setFeedback(element, message, kind = '') {
   element.textContent = message;
   element.dataset.kind = kind;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
+}
+
+async function modelRequest(method, path, body = null, approval = false) {
+  let response;
+  try {
+    response = await invoke('runtime_request', { request: { method, path, body, approval } });
+  } catch (error) {
+    if (runtimeReady) renderRuntime({ state: 'failed', error: 'Runtime 连接已断开，请重新启动。' });
+    void refreshRuntime();
+    throw error;
+  }
+  if (!response || !Number.isInteger(response.status)) throw new Error('桌面 Runtime 返回无效响应。');
+  if (response.status < 200 || response.status >= 300) {
+    const code = response.body?.error;
+    throw new Error(typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)
+      ? `Runtime 请求失败：${code}`
+      : `Runtime 请求失败（HTTP ${response.status}）`);
+  }
+  return response.body;
+}
+
+function selectedModel() {
+  return modelProfiles.find((profile) => profile.id === selectedModelId) ?? null;
+}
+
+function updateModelActionState() {
+  const profile = selectedModel();
+  const pending = Boolean(pendingModelProposal?.action);
+  saveModel.disabled = !runtimeReady || pending;
+  enableModel.disabled = !runtimeReady || pending || !profile;
+  testModel.disabled = !runtimeReady || pending || !profile;
+  refreshModelsButton.disabled = !runtimeReady || pending;
+  enableModel.textContent = profile?.enabled ? '申请停用' : '申请启用';
+  approveModel.disabled = !runtimeReady || !pending;
+}
+
+function renderModelProfiles(profiles) {
+  modelProfiles = Array.isArray(profiles) ? profiles : [];
+  if (!modelProfiles.some((profile) => profile.id === selectedModelId)) selectedModelId = modelProfiles[0]?.id ?? '';
+  modelProfilePicker.innerHTML = '<option value="">选择模型…</option>' + modelProfiles.map((profile) =>
+    `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.provider)} / ${escapeHtml(profile.model)}</option>`
+  ).join('');
+  modelProfilePicker.value = selectedModelId;
+  const profile = selectedModel();
+  if (!profile) {
+    modelProfileList.textContent = modelProfiles.length ? '选择一个模型查看状态。' : '尚无模型档案。';
+    modelState.textContent = modelProfiles.length ? `${modelProfiles.length} 个模型` : '未配置';
+    modelState.className = `badge ${modelProfiles.length ? 'badge--warning' : 'badge--muted'}`;
+  } else {
+    const health = profile.health?.status ?? 'unknown';
+    const checkedAt = profile.health?.checkedAt ? `\n最近检查：${profile.health.checkedAt}` : '';
+    modelProfileList.textContent = `${profile.provider} / ${profile.model}\n${profile.enabled ? '已启用' : '未启用'} · ${health}${checkedAt}`;
+    modelState.textContent = profile.enabled ? `已启用 · ${health}` : '待启用';
+    modelState.className = `badge ${profile.enabled && health === 'ready' ? 'badge--success' : 'badge--warning'}`;
+  }
+  updateModelActionState();
+}
+
+function renderModelProposal(proposal) {
+  pendingModelProposal = proposal ?? null;
+  if (!pendingModelProposal?.action) {
+    modelProposalPanel.hidden = true;
+    modelProposalSummary.textContent = '';
+    updateModelActionState();
+    return;
+  }
+  const { action } = pendingModelProposal;
+  const preview = action.preview ?? {};
+  const capabilities = Array.isArray(preview.capabilities) && preview.capabilities.length ? `能力：${preview.capabilities.join('、')}` : '';
+  const summary = action.type === 'model.register'
+    ? [`登记档案：${preview.id ?? action.target}`, `Provider：${preview.provider ?? '未提供'}`, `协议：${preview.protocol ?? '未提供'}`, `模型：${preview.model ?? '未提供'}`, `Endpoint：${preview.endpoint ?? '未提供'}`, capabilities, `密钥引用：${preview.secretRef ?? '未提供'}`, '审批后仍需单独启用。']
+    : [`申请${preview.enabled ? '启用' : '停用'}档案：${preview.profileId ?? action.target}`, `Provider：${preview.provider ?? '未提供'}`, `协议：${preview.protocol ?? '未提供'}`, `模型：${preview.model ?? '未提供'}`, `Endpoint：${preview.endpoint ?? '未提供'}`, capabilities, `密钥引用：${preview.secretRef ?? '未提供'}`];
+  modelProposalSummary.textContent = summary.filter(Boolean).join(' · ');
+  modelProposalPanel.hidden = false;
+  updateModelActionState();
+}
+
+async function refreshModels() {
+  if (!runtimeReady || !invoke) return;
+  modelState.textContent = '读取中';
+  modelState.className = 'badge badge--muted';
+  try {
+    const result = await modelRequest('GET', '/v1/models');
+    renderModelProfiles(result.models);
+    if (!result.models?.length) setFeedback(modelFeedback, '尚未配置模型。', '');
+  } catch (error) {
+    renderModelProfiles([]);
+    modelProfilePicker.innerHTML = '<option value="">模型状态不可用</option>';
+    modelProfileList.textContent = '无法读取模型状态；请检查 Runtime 后重试。';
+    modelState.textContent = '不可用';
+    modelState.className = 'badge badge--warning';
+    setFeedback(modelFeedback, error.message || '无法读取模型状态。', 'error');
+  }
 }
 
 function isLikelyAbsolutePath(value) {
@@ -69,6 +189,8 @@ updateConnectionState(addressInput.value);
 function renderRuntime(status) {
   const ready = status?.state === 'ready';
   const failed = status?.state === 'failed';
+  const wasReady = runtimeReady;
+  runtimeReady = ready;
   projectInput.value = status?.workspace || projectInput.value;
   updateProjectState(projectInput.value);
   runtimeState.textContent = ready ? '已运行' : failed ? '异常' : status?.state === 'starting' ? '启动中' : '已停止';
@@ -77,6 +199,18 @@ function renderRuntime(status) {
   runtimeDot.className = `status-dot ${ready ? 'status-dot--idle' : 'status-dot--warning'}`;
   startRuntime.disabled = !invoke || ready || status?.state === 'starting';
   stopRuntime.disabled = !invoke || !ready;
+  modelSettingsForm.disabled = !ready;
+  updateModelActionState();
+  if (ready && !wasReady) void refreshModels();
+  if (!ready && wasReady) {
+    renderModelProfiles([]);
+    modelProfilePicker.innerHTML = '<option value="">启动 Runtime 后加载</option>';
+    modelProfileList.textContent = '启动 Runtime 后加载模型状态。';
+    modelState.textContent = 'Runtime 未运行';
+    modelState.className = 'badge badge--muted';
+    setFeedback(modelFeedback, '', '');
+    renderModelProposal(null);
+  }
   if (status?.address) {
     addressInput.value = status.address;
     setStored(STORAGE_KEYS.runtimeAddress, status.address);
@@ -151,6 +285,110 @@ stopRuntime.addEventListener('click', async () => {
   try { renderRuntime(await invoke('stop_runtime')); setFeedback(projectFeedback, 'Runtime 已停止。', 'success'); }
   catch (error) { setFeedback(projectFeedback, error.message || 'Runtime 停止失败。', 'error'); await refreshRuntime(); }
 });
+
+saveModel.addEventListener('click', async () => {
+  const id = modelIdInput.value.trim();
+  const provider = modelProviderInput.value.trim();
+  const endpoint = modelEndpointInput.value.trim();
+  const model = modelNameInput.value.trim();
+  const apiKey = modelApiKeyInput.value.trim();
+  if (!id || !provider || !endpoint || !model || !apiKey) {
+    setFeedback(modelFeedback, '请填写完整的模型信息和 API Key。', 'error');
+    return;
+  }
+  if (modelProfiles.some((profile) => profile.id === id)) {
+    modelApiKeyInput.value = '';
+    setFeedback(modelFeedback, '该档案 ID 已存在；当前桌面设置不支持原地修改。', 'error');
+    return;
+  }
+  saveModel.disabled = true;
+  let secretStored = false;
+  let profileProposed = false;
+  const secretName = `workbench.model.${id}`;
+  try {
+    await modelRequest('POST', '/v1/secrets', { name: secretName, value: apiKey });
+    secretStored = true;
+    modelApiKeyInput.value = '';
+    const result = await modelRequest('POST', '/v1/models', {
+      sessionId: 'desktop-settings',
+      id,
+      provider,
+      protocol: 'openai-compatible',
+      model,
+      endpoint,
+      capabilities: ['text', 'tool_calling'],
+      secretRef: `keychain:${secretName}`
+    });
+    profileProposed = true;
+    renderModelProposal(result.proposal);
+    setFeedback(modelFeedback, '密钥已保存到 Windows 凭据管理器；模型档案等待人工批准。', 'success');
+  } catch (error) {
+    if (secretStored && !profileProposed) {
+      try { await modelRequest('DELETE', `/v1/secrets/${encodeURIComponent(secretName)}`, null, true); } catch {}
+    }
+    const message = error.message || '模型配置失败。';
+    setFeedback(modelFeedback, apiKey && message.includes(apiKey) ? '模型配置失败，错误内容已隐藏。' : message, 'error');
+  } finally {
+    modelApiKeyInput.value = '';
+    updateModelActionState();
+  }
+});
+
+approveModel.addEventListener('click', async () => {
+  const action = pendingModelProposal?.action;
+  if (!action || !runtimeReady) return;
+  approveModel.disabled = true;
+  try {
+    await modelRequest('POST', `/v1/models/${encodeURIComponent(action.id)}/approve`, { actionHash: action.actionHash }, true);
+    renderModelProposal(null);
+    await refreshModels();
+    setFeedback(modelFeedback, '模型变更已批准。', 'success');
+  } catch (error) {
+    approveModel.disabled = false;
+    setFeedback(modelFeedback, error.message || '模型审批失败。', 'error');
+  }
+});
+
+modelProfilePicker.addEventListener('change', () => {
+  selectedModelId = modelProfilePicker.value;
+  renderModelProfiles(modelProfiles);
+});
+
+enableModel.addEventListener('click', async () => {
+  const profile = selectedModel();
+  if (!profile || !runtimeReady) return;
+  enableModel.disabled = true;
+  const operation = profile.enabled ? 'disable' : 'enable';
+  try {
+    const result = await modelRequest('POST', `/v1/models/${encodeURIComponent(profile.id)}/${operation}`, {
+      sessionId: 'desktop-settings',
+      configHash: profile.configHash
+    });
+    renderModelProposal(result.proposal);
+    setFeedback(modelFeedback, `模型${profile.enabled ? '停用' : '启用'}等待人工批准。`, '');
+  } catch (error) {
+    setFeedback(modelFeedback, error.message || '无法创建模型状态变更提案。', 'error');
+  } finally {
+    updateModelActionState();
+  }
+});
+
+testModel.addEventListener('click', async () => {
+  const profile = selectedModel();
+  if (!profile || !runtimeReady) return;
+  testModel.disabled = true;
+  try {
+    const result = await modelRequest('POST', `/v1/models/${encodeURIComponent(profile.id)}/health`, { actionHash: profile.configHash }, true);
+    await refreshModels();
+    setFeedback(modelFeedback, `连接测试完成：${result.health?.status ?? 'unknown'}。`, result.health?.status === 'ready' ? 'success' : '');
+  } catch (error) {
+    setFeedback(modelFeedback, error.message || '模型连接测试失败。', 'error');
+  } finally {
+    updateModelActionState();
+  }
+});
+
+refreshModelsButton.addEventListener('click', () => { void refreshModels(); });
 
 document.querySelector('#save-address').addEventListener('click', () => {
   const addressValue = addressInput.value.trim().replace(/\/$/, '');

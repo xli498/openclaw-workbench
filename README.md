@@ -172,7 +172,9 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 `GET /v1/models` 查看 Workbench 的本地模型档案；`POST /v1/models` 创建档案提案，使用独立 `x-approval-token` 调用 `/v1/models/<actionId>/approve` 才会登记。档案只保存 provider、protocol、model、能力列表、无密钥的 `env:`/`keychain:` SecretRef 引用和健康摘要；新档案默认 `enabled:false`，不会保存 API key 或 SecretRef 解析值。
 
-`GET /v1/models/<profileId>/health` 是只读、非联网健康摘要，默认返回 `NOT_CONFIGURED`。需要真实连接测试时，调用 `POST /v1/models/<profileId>/health`，请求必须带独立 `x-approval-token`，并在 JSON body 中提交当前 `configHash`；服务只执行一次有超时、取消和响应大小上限的 OpenAI-compatible `GET <endpoint>/models`，固定拒绝 HTTP、回环/私网/metadata endpoint 且不跟随重定向。SecretRef 仅在内存中解析为请求头，解析值不会进入模型档案、审计、响应或快照。当前不执行聊天补全、不支持真实 Anthropic/Responses 调用，也不提供密钥环的系统实现；`keychain:` 需要宿主注入受控 provider。
+`GET /v1/models/<profileId>/health` 是只读、非联网健康摘要，默认返回 `NOT_CONFIGURED`。需要真实连接测试时，调用 `POST /v1/models/<profileId>/health`，请求必须带独立 `x-approval-token`，并在 JSON body 中提交当前 `configHash`；服务只执行一次有超时、取消和响应大小上限的 OpenAI-compatible `GET <endpoint>/models`，固定拒绝 HTTP、回环/私网/metadata endpoint 且不跟随重定向。SecretRef 仅在内存中解析为请求头，解析值不会进入模型档案、审计、响应或快照。Windows 默认使用 Windows Credential Manager 保存 `keychain:` 密钥，非 Windows 开发环境使用进程内存储且不会持久化；Credential Manager 的单条凭据内容限制为 2560 字节。当前不执行聊天补全，也不支持真实 Anthropic/Responses 调用。
+
+`POST /v1/secrets` 只返回凭据名称和配置状态，不返回密钥值；同名写入默认拒绝覆盖。只有显式 `overwrite:true` 的轮换和 `DELETE /v1/secrets/<name>` 才能使用独立 `x-approval-token`，并写入不含密钥值的 `secret.configured`/`secret.deleted` 审计事件。
 
 本地快照仅允许工作区内的普通文件，发现快照或快照目录为符号链接即拒绝恢复/写入；快照写入后固定为 `0600`，创建目录为 `0700`。这不是宿主机隔离的替代品。
 

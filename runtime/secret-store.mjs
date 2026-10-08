@@ -5,6 +5,7 @@ const execFileAsync = promisify(execFile);
 const SERVICE_PATTERN = /^[A-Za-z0-9._:-]{1,127}$/;
 const NAME_PATTERN = /^[A-Za-z0-9._:-]{1,127}$/;
 const MAX_SECRET_LENGTH = 8192;
+const MAX_CREDENTIAL_BLOB_BYTES = 2560;
 
 export class SecretStoreError extends Error {
   constructor(code, message) {
@@ -29,7 +30,7 @@ function validateName(name) {
 }
 
 function validateSecret(secret) {
-  if (typeof secret !== 'string' || !secret || Buffer.byteLength(secret, 'utf8') > MAX_SECRET_LENGTH || /[\0\r\n]/.test(secret)) fail('SECRET_STORE_INPUT_INVALID', 'store input is invalid');
+  if (typeof secret !== 'string' || !secret || Buffer.byteLength(secret, 'utf8') > MAX_SECRET_LENGTH || Buffer.byteLength(secret, 'utf16le') > MAX_CREDENTIAL_BLOB_BYTES || /[\0\r\n]/.test(secret)) fail('SECRET_STORE_INPUT_INVALID', 'store input is invalid');
   return secret;
 }
 
