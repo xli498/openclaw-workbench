@@ -119,13 +119,13 @@ export function createBridgeTunnelAdapter({
     const current = child;
     child = null;
     if (!current) return;
-    try { current.kill?.(); } catch {}
     await new Promise((resolve) => {
       let settled = false;
       const done = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
       const timer = setTimeout(done, stopTimeoutMs);
       current.once?.('exit', done);
       current.once?.('close', done);
+      try { current.kill?.(); } catch { done(); }
     });
   }
   async function start() {
