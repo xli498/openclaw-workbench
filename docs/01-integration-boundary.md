@@ -27,7 +27,7 @@ MCP runtime 控制面通过 `GET /v1/mcp/runtimes` 提供只读实例状态；`P
 - 任意版本的 WebSocket RPC 是否保持兼容。
 - 任意 MCP Server 的安全性、许可证和数据边界。
 - 现有 OpenClaw 配置是否能直接导入产品配置。
-- 外部 Bridge、隧道或公网反向代理的安全性。
+- 外部 Bridge、隧道或公网反向代理的第三方部署安全性；Workbench 仅提供显式启动、随机路由、Bearer 注入和 reset 失效的受控 CLI 适配器。
 - 所有模型都支持同等的工具调用、流式、视觉和推理能力。
 
 ## Adapter 原则

@@ -78,7 +78,23 @@ console.log({ host: address.address, port: address.port });
 
 Bridge 只允许 `127.0.0.1`、`::1` 或 `localhost` 绑定。每个请求仍必须携带独立的 `Authorization: Bearer <MCP token>`；可选 path token 位于路径中，只作路由定位，不能替代 Bearer，也不能放入查询参数、日志、终端历史或仓库。启用它时不要输出或传播完整 endpoint。默认拒绝带 `Origin` 的跨域请求。只读工作区工具立即执行，`workspace.patch` 与 `workspace.command` 只返回审批提案，必须回到控制面使用独立审批 token 才能生效。
 
-运行 `npm run smoke:mcp-bridge` 可在临时本地工作区验证初始化、工具调用、审批边界、SSE、回放与攻击拦截，不需要真实模型、OpenClaw 登录态或 token。Cloudflare Tunnel、ngrok、反向代理和任何公网暴露均未随本项目提供或验证；不要将 Bridge 直接转发到公网。
+运行 `npm run smoke:mcp-bridge` 可在临时本地工作区验证初始化、工具调用、审批边界、SSE、回放与攻击拦截，不需要真实模型、OpenClaw 登录态或 token。公网 Tunnel 适配器只提供显式启动的受控 CLI 生命周期，不能替代本机 Bridge 的 loopback 绑定、Bearer 认证或审批；未完成实际公网部署验证前，不要把 endpoint 当作生产地址。
+
+### 公网 Tunnel 适配器（实验性、显式启动）
+
+`createBridgeTunnelAdapter` 只提供受控外部 CLI 的生命周期边界，不会自动启动公网隧道，也不会替代本机 Bridge 的 loopback 绑定或审批。当前允许的 provider 标识为 `cloudflare-quick` 和 `ngrok`；调用方必须显式注入 CLI、端口、Bearer token 以及不可信 stdout 的 `parsePublicUrl`。适配器使用 `shell:false`，Bearer 只放在子进程环境变量，不放入参数或 URL；每次 `start()` / `reset()` 生成新的随机路由路径，`reset()` 先停止旧进程，使旧地址失效。`status()`、状态回调和审计不含公网 URL 或 token，公网 URL 只在 `start()` 返回值和进程内 `endpoint()` 中短暂可用。真实 Cloudflare/ngrok 启动、域名绑定、TLS、设备配对和公网部署仍需单独验证。
+
+```js
+import { createBridgeTunnelAdapter } from 'openclaw-workbench';
+const tunnel = createBridgeTunnelAdapter({
+  provider: 'cloudflare-quick', command: 'cloudflared',
+  args: ['tunnel'], localPort: address.port,
+  token: process.env.OPENCLAW_WORKBENCH_MCP_TOKEN,
+  parsePublicUrl: (line) => line.match(/https:\/\/[^\\s]+/)?.[0],
+});
+const { endpoint } = await tunnel.start(); // 不要记录或持久化 endpoint
+// await tunnel.reset(); // 旧路由和旧隧道失效
+```
 
 主路径按 Ask → Plan → Code 理解：
 
@@ -121,7 +137,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | Durable terminal session 合同 | 已实现；审批、游标、输出上限、取消/超时和 manual review；默认 `pty:false` |
 | MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具 |
 | 本机 Streamable HTTP MCP Bridge | 已实现；回环绑定、Bearer、会话、SSE、回放保护和审批提案边界 |
-| 公网 Bridge / 隧道 | 未实现、未验证 |
+| 公网 Bridge / 隧道 | 受控 CLI 适配器已实现；真实公网启动、部署与第三方 CLI 仍未验证 |
 | 生产部署承诺 | 不承诺 |
 
 ## 安全边界
