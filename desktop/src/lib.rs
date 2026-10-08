@@ -222,12 +222,12 @@ fn stop_manager(manager: &mut RuntimeManager) -> Result<(), String> {
     }
 }
 
-#[cfg_attr(not(test), tauri::command)]
+#[tauri::command]
 pub fn choose_workspace(path: String) -> Result<String, String> {
     choose_workspace_path(&path).map(|value| value.display().to_string())
 }
 
-#[cfg_attr(not(test), tauri::command)]
+#[tauri::command]
 pub fn runtime_status(state: State<'_, RuntimeState>) -> Result<RuntimeStatus, String> {
     let mut manager = state
         .0
@@ -236,7 +236,7 @@ pub fn runtime_status(state: State<'_, RuntimeState>) -> Result<RuntimeStatus, S
     Ok(status_of(&mut manager))
 }
 
-#[cfg_attr(not(test), tauri::command)]
+#[tauri::command]
 pub fn start_runtime(
     workspace: String,
     app: AppHandle,
@@ -324,7 +324,7 @@ pub fn start_runtime(
     Ok(status_of(&mut manager))
 }
 
-#[cfg_attr(not(test), tauri::command)]
+#[tauri::command]
 pub fn stop_runtime(state: State<'_, RuntimeState>) -> Result<RuntimeStatus, String> {
     let mut manager = state
         .0
@@ -334,7 +334,7 @@ pub fn stop_runtime(state: State<'_, RuntimeState>) -> Result<RuntimeStatus, Str
     Ok(status_of(&mut manager))
 }
 
-#[cfg_attr(not(test), tauri::command)]
+#[tauri::command]
 pub fn runtime_request(
     request: RuntimeRequest,
     state: State<'_, RuntimeState>,
@@ -414,4 +414,12 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn desktop_library_test_harness_is_available() {
+        assert!(true);
+    }
 }
