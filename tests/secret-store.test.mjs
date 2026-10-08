@@ -52,6 +52,20 @@ test('memory backend is injectable and isolated per store', async () => {
   assert.equal(await second.get('same'), 'two');
 });
 
+test('memory backend keeps service/name namespaces isolated and does not expose its map', async () => {
+  const backend = createMemorySecretBackend();
+  await backend.set('service-a', 'same', 'alpha-secret');
+  await backend.set('service-b', 'same', 'beta-secret');
+  assert.equal(await backend.get('service-a', 'same'), 'alpha-secret');
+  assert.equal(await backend.get('service-b', 'same'), 'beta-secret');
+  assert.equal(await backend.has('service-a', 'missing'), false);
+  assert.equal(await backend.delete('service-a', 'same'), true);
+  assert.equal(await backend.get('service-a', 'same'), null);
+  assert.equal(await backend.get('service-b', 'same'), 'beta-secret');
+  assert.doesNotMatch(String(backend), /alpha-secret|beta-secret/);
+  assert.deepEqual(Object.keys(backend).sort(), ['delete', 'get', 'has', 'set']);
+});
+
 test('PowerShell backend uses fixed helper operations and never places secret in command arguments', async () => {
   const calls = [];
   const backend = createPowerShellCredentialBackend({
@@ -97,6 +111,40 @@ test('PowerShell backend transport supplies JSON through stdin and closes the st
   assert.equal(calls[0].options.windowsHide, true);
   assert.equal(JSON.parse(calls[0].options.input).value, 'hidden-value');
   assert.equal(calls[0].args.includes('hidden-value'), false);
+});
+
+test('PowerShell backend converts helper failures to a safe error without echoing secret material', async () => {
+  const secret = 'windows-helper-secret-marker';
+  const backend = createPowerShellCredentialBackend({
+    platform: 'win32',
+    execFileImpl: async (_file, _args, options) => {
+      assert.equal(JSON.parse(options.input).value, secret);
+      throw Object.assign(new Error(`native helper leaked ${secret}`), {
+        stdout: `stdout ${secret}`,
+        stderr: `stderr ${secret}`,
+      });
+    },
+  });
+  await assert.rejects(() => backend.set('svc', 'provider', secret), (error) => {
+    assert.equal(error.code, 'SECRET_STORE_BACKEND_FAILED');
+    assert.equal(error.message, 'secret store operation failed');
+    assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+    return true;
+  });
+});
+
+test('PowerShell backend rejects malformed helper output without exposing response values', async () => {
+  const secret = 'malformed-output-secret-marker';
+  const backend = createPowerShellCredentialBackend({
+    platform: 'win32',
+    execFileImpl: async () => ({ stdout: `not-json ${secret}`, stderr: `diagnostic ${secret}` }),
+  });
+  await assert.rejects(() => backend.get('svc', 'provider'), (error) => {
+    assert.equal(error.code, 'SECRET_STORE_BACKEND_FAILED');
+    assert.equal(error.message, 'secret store operation failed');
+    assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+    return true;
+  });
 });
 
 test('real Windows Credential Manager roundtrip persists Unicode values and cleans up', { skip: process.platform !== 'win32' }, async (t) => {
