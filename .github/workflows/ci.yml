@@ -74,6 +74,16 @@ jobs:
           if (-not $nsis) { throw "Tauri NSIS installer output was not produced" }
           $msi | Select-Object FullName, Length
           $nsis | Select-Object FullName, Length
+          $config = Get-Content "desktop/tauri.conf.json" -Raw | ConvertFrom-Json
+          $package = Get-Content "package.json" -Raw | ConvertFrom-Json
+          if ($config.version -ne $package.version) { throw "Tauri and repository versions differ" }
+          if ($config.productName -ne "OpenClaw Workbench") { throw "Unexpected product name" }
+          if (-not $config.bundle.active) { throw "Tauri bundle is disabled" }
+          if (@($config.bundle.targets) -notcontains "msi") { throw "MSI target is missing" }
+          if (@($config.bundle.targets) -notcontains "nsis") { throw "NSIS target is missing" }
+          if ($msi.Count -ne 1 -or $nsis.Count -ne 1) { throw "Expected exactly one MSI and one NSIS installer" }
+          if (($msi | Measure-Object -Property Length -Minimum).Minimum -le 0) { throw "MSI is empty" }
+          if (($nsis | Measure-Object -Property Length -Minimum).Minimum -le 0) { throw "NSIS installer is empty" }
       - name: Upload Windows installers
         uses: actions/upload-artifact@v4
         with:

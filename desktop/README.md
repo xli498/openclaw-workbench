@@ -41,6 +41,38 @@ Before a Windows release build, prepare the exact Node.js `v22.19.0` win-x64 arc
 
 Installers are emitted below `desktop/target/release/bundle/`.
 
+## Installer lifecycle contract
+
+Every release must publish both Windows installer formats: an MSI and an NSIS
+`.exe`. The Tauri `version` is kept equal to the repository version so Windows
+Installer can detect an upgrade instead of creating a second product. A clean
+install must start the bundled runtime, and an upgrade must preserve the chosen
+workspace while replacing the application and runtime files.
+
+Uninstall removes the application, bundled runtime, shortcuts, and registered
+runtime process. It must not delete a user's workspace or API keys: model
+secrets are held by Windows Credential Manager and workspace state belongs to
+the selected project. A failed or interrupted uninstall must not be treated as
+proof that cleanup succeeded.
+
+The Windows CI job verifies the MSI and NSIS files exist and that the package
+metadata is internally consistent. This is a contract check, not a GUI
+installation test. Real clean-install, upgrade, and uninstall verification
+must still be run on an isolated Windows machine with a disposable workspace;
+the release checklist is:
+
+1. Install the MSI and confirm the app opens, the bundled `runtime/node/node.exe`
+   starts, and no API key appears in the install directory or logs.
+2. Install a newer version over the same installation and confirm the workspace
+   selection, Credential Manager entry, and runtime health survive the upgrade.
+3. Uninstall from Windows Settings or the NSIS uninstaller, confirm the app and
+   runtime files are gone, then confirm the workspace and Credential Manager
+   entry remain until the user explicitly removes them.
+
+Do not run these GUI lifecycle checks against a developer's real workspace or
+real credentials. Record the Windows version, installer type, package version,
+exit code, and cleanup observations with the release artifact.
+
 `cargo tauri build` remains equivalent when the Tauri CLI is already installed. Both commands require the MSVC `link.exe`; `cargo check` and `cargo test` can fail before compiling the application when Visual Studio Build Tools or the Windows SDK is absent.
 
 The installer includes the runtime resources under the Tauri resource directory:
