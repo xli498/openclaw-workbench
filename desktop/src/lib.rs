@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{Manager, RunEvent};
+use tauri::{AppHandle, Manager, RunEvent};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
