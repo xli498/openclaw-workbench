@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/mcp-streamable-bridge]
   pull_request:
 
 permissions:
@@ -40,4 +40,25 @@ jobs:
       - run: cargo test --manifest-path desktop/Cargo.toml
       - name: Desktop contract checks
         run: node --test tests/desktop-frontend.test.mjs tests/desktop-packaging.test.mjs
+      - name: Build Windows desktop installers
+        run: npx --yes @tauri-apps/cli@2.12.1 build --ci
+        working-directory: desktop
+      - name: Verify Windows installer outputs
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path "desktop/target/release/bundle/msi" -Filter "*.msi" -File -ErrorAction SilentlyContinue
+          $nsis = Get-ChildItem -Path "desktop/target/release/bundle/nsis" -Filter "*.exe" -File -ErrorAction SilentlyContinue
+          if (-not $msi) { throw "Tauri MSI output was not produced" }
+          if (-not $nsis) { throw "Tauri NSIS installer output was not produced" }
+          $msi | Select-Object FullName, Length
+          $nsis | Select-Object FullName, Length
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-workbench-windows-installers
+          path: |
+            desktop/target/release/bundle/msi/*.msi
+            desktop/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
       - run: git diff --check
