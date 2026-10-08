@@ -7,7 +7,7 @@ This directory contains the Tauri 2 Windows desktop shell for OpenClaw Workbench
 - Windows 10/11
 - Node.js `>=22.19.0`
 - Rust toolchain with Cargo
-- Tauri Windows prerequisites (WebView2 and Microsoft C++ Build Tools)
+- Tauri Windows prerequisites (WebView2, Microsoft C++ Build Tools with the MSVC `link.exe`, and a Windows 10/11 SDK)
 
 ## Setup and development
 
@@ -22,20 +22,24 @@ cargo tauri dev
 
 `cargo tauri dev` is a development run. If bundle resources are not materialized, a debug build may use the checkout's `bin/` and `runtime/` directories. This fallback is compiled out of release builds.
 
-If the Tauri CLI is not installed, install it without changing the repository:
+Before building, run the Tauri environment preflight from `desktop`:
 
 ```powershell
-cargo install tauri-cli --version '^2'
+npx --yes @tauri-apps/cli@2.12.1 info
 ```
+
+This uses an ephemeral `npx` download and does not install a global Tauri CLI or modify the repository. The preflight should report WebView2, Rust/Cargo, Visual Studio Build Tools with MSVC, and a Windows SDK. If the output reports `link.exe` not found, install the Microsoft C++ Build Tools workload with a Windows 10/11 SDK, reopen the terminal, and run the preflight again. Do not change the Rust linker configuration to hide this missing Windows toolchain.
 
 ## Windows build
 
 ```powershell
 cd desktop
-cargo tauri build
+npx --yes @tauri-apps/cli@2.12.1 build --ci
 ```
 
 Installers are emitted below `desktop/target/release/bundle/`.
+
+`cargo tauri build` remains equivalent when the Tauri CLI is already installed. Both commands require the MSVC `link.exe`; `cargo check` and `cargo test` can fail before compiling the application when Visual Studio Build Tools or the Windows SDK is absent.
 
 The installer includes the runtime resources under the Tauri resource directory:
 

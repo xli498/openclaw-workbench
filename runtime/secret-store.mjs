@@ -1,11 +1,57 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-
-const execFileAsync = promisify(execFile);
+import { spawn } from 'node:child_process';
 const SERVICE_PATTERN = /^[A-Za-z0-9._:-]{1,127}$/;
 const NAME_PATTERN = /^[A-Za-z0-9._:-]{1,127}$/;
 const MAX_SECRET_LENGTH = 8192;
 const MAX_CREDENTIAL_BLOB_BYTES = 2560;
+
+function spawnPowerShell(executable, args, { input, windowsHide = true, timeout = 10_000, maxBuffer = 64 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timer;
+    let child;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      callback(value);
+    };
+    const failWith = (error) => finish(reject, error);
+    try {
+      child = spawn(executable, args, { windowsHide, stdio: ['pipe', 'pipe', 'pipe'] });
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+        if (Buffer.byteLength(stdout, 'utf8') > maxBuffer) {
+          child.kill();
+          failWith(Object.assign(new Error('secret store helper output exceeded the limit'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }));
+        }
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (Buffer.byteLength(stderr, 'utf8') > maxBuffer) {
+          child.kill();
+          failWith(Object.assign(new Error('secret store helper error output exceeded the limit'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }));
+        }
+      });
+      child.once('error', failWith);
+      child.once('close', (code, signal) => {
+        if (settled) return;
+        if (code === 0) finish(resolve, { stdout, stderr });
+        else finish(reject, Object.assign(new Error('secret store helper failed'), { code: code ?? 'ERR_CHILD_PROCESS', signal, stdout, stderr }));
+      });
+      timer = setTimeout(() => {
+        child.kill();
+        failWith(Object.assign(new Error('secret store helper timed out'), { code: 'ETIMEDOUT' }));
+      }, timeout);
+      child.stdin.end(input ?? '', 'utf8');
+    } catch (error) {
+      failWith(error);
+    }
+  });
+}
 
 export class SecretStoreError extends Error {
   constructor(code, message) {
@@ -37,6 +83,8 @@ function validateSecret(secret) {
 const POWERSHELL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 try {
   $request = [Console]::In.ReadToEnd() | ConvertFrom-Json
   Add-Type -TypeDefinition @'
@@ -108,10 +156,11 @@ function parseBackendResult(stdout) {
   }
 }
 
-export function createPowerShellCredentialBackend({ platform = process.platform, systemRoot = process.env.SystemRoot ?? 'C:\\Windows', execFileImpl, runPowerShell } = {}) {
+export function createPowerShellCredentialBackend({ platform = process.platform, systemRoot = process.env.SystemRoot ?? 'C:\\Windows', execFileImpl, runPowerShell, spawnImpl = spawnPowerShell } = {}) {
   if (platform !== 'win32') fail('SECRET_STORE_UNAVAILABLE', 'Windows Credential Manager is unavailable');
   if (execFileImpl !== undefined && typeof execFileImpl !== 'function') fail('SECRET_STORE_BACKEND_INVALID', 'secret store backend is invalid');
   if (runPowerShell !== undefined && typeof runPowerShell !== 'function') fail('SECRET_STORE_BACKEND_INVALID', 'secret store backend is invalid');
+  if (spawnImpl !== undefined && typeof spawnImpl !== 'function') fail('SECRET_STORE_BACKEND_INVALID', 'secret store backend is invalid');
   const executable = `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
   async function invoke(op, service, name, value) {
     const input = JSON.stringify({ op, service, name, ...(value === undefined ? {} : { value }) });
@@ -119,7 +168,9 @@ export function createPowerShellCredentialBackend({ platform = process.platform,
       const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', POWERSHELL_SCRIPT];
       const result = runPowerShell
         ? await runPowerShell(executable, args, { input, inputEncoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 })
-        : await (execFileImpl ?? execFileAsync)(executable, args, { input, encoding: 'utf8', inputEncoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 });
+        : execFileImpl
+          ? await execFileImpl(executable, args, { input, encoding: 'utf8', inputEncoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 })
+          : await spawnImpl(executable, args, { input, inputEncoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 });
       return parseBackendResult(result.stdout);
     } catch (error) {
       if (error instanceof SecretStoreError) throw error;

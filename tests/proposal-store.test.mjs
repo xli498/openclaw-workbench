@@ -104,6 +104,22 @@ test('执行中的提案重启后进入 manual_review 且不重放', async () =>
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('执行中断后的 manual_review 提案可以被人工取消并释放旧 claim', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-manual-cancel-'));
+  try {
+    const first = createProposalStore({ root });
+    first.put(proposal());
+    first.claim('proposal-1', 'hash');
+    const restored = createProposalStore({ root });
+    const record = restored.get('proposal-1');
+    assert.equal(record.proposal.action.status, 'manual_review');
+    const cancelled = restored.reject('proposal-1', { id: 'proposal-1', status: 'cancelled', actionHash: 'hash' });
+    assert.equal(cancelled.proposal.action.status, 'cancelled');
+    assert.equal(cancelled.claim, undefined);
+    assert.equal(createProposalStore({ root }).get('proposal-1').claim, undefined);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('revision mismatch 和 ledger/audit 前置失败均持久化为不可执行 manual_review', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ocw-proposal-manual-review-'));
   try {

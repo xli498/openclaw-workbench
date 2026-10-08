@@ -46,6 +46,27 @@ test('Windows file helper writes, replaces, and reads regular files', (t) => {
   }
 });
 
+test('Windows file helper accepts a large write payload without using command-line arguments', (t) => {
+  if (process.platform !== 'win32') return t.skip('Windows-specific regression');
+  const root = mkdtempSync(path.join(tmpdir(), 'ocw-file-ops-large-'));
+  try {
+    const target = path.join(root, 'large.json');
+    const content = 'x'.repeat(64 * 1024);
+    runWindowsFileOperationSync({
+      operation: 'write',
+      root,
+      parent: root,
+      target,
+      contentBase64: Buffer.from(content, 'utf8').toString('base64'),
+      expectTargetMissing: true,
+    });
+    const encoded = runWindowsFileOperationSync({ operation: 'read', root, parent: root, target });
+    assert.equal(Buffer.from(encoded, 'base64').toString('utf8'), content);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('Windows file helper rejects a junction parent without following it', (t) => {
   if (process.platform !== 'win32') return t.skip('Windows-specific regression');
   const root = mkdtempSync(path.join(tmpdir(), 'ocw-file-ops-root-'));

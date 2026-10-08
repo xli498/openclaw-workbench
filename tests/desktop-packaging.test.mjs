@@ -24,3 +24,13 @@ test('desktop packaging docs distinguish development fallback from release resou
   assert.match(docs, /runtime\/bin\/workbench\.mjs/);
   assert.match(docs, /instead of falling back to a source checkout/);
 });
+
+test('desktop packaging docs provide a non-global Tauri preflight and explain MSVC linker failures', async () => {
+  const docs = await readFile(path.join(repoRoot, 'desktop', 'README.md'), 'utf8');
+  assert.match(docs, /npx --yes @tauri-apps\/cli@2\.12\.1 info/);
+  assert.match(docs, /npx --yes @tauri-apps\/cli@2\.12\.1 build --ci/);
+  assert.match(docs, /does not install.*global|without.*global.*install/i);
+  assert.match(docs, /link\.exe/);
+  assert.match(docs, /Microsoft C\+\+ Build Tools/);
+  assert.match(docs, /Windows (?:10|11).*SDK|Windows SDK/i);
+});

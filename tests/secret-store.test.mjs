@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { createWindowsCredentialStore, createMemorySecretBackend, createPowerShellCredentialBackend } from '../runtime/secret-store.mjs';
 
 test('secret store exposes set/get/delete/has without exposing values in metadata', async () => {
@@ -78,4 +79,36 @@ test('PowerShell backend uses fixed helper operations and never places secret in
     assert.equal(payload.name, 'provider');
     assert.equal(payload.value, index === 0 ? 'hidden-value' : undefined);
   }
+});
+
+test('PowerShell backend transport supplies JSON through stdin and closes the stream', async () => {
+  const calls = [];
+  const backend = createPowerShellCredentialBackend({
+    platform: 'win32',
+    spawnImpl: async (file, args, options) => {
+      calls.push({ file, args, options });
+      return { stdout: JSON.stringify({ ok: true }), stderr: '' };
+    },
+  });
+  await backend.set('svc', 'provider', 'hidden-value');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file.toLowerCase().endsWith('powershell.exe'), true);
+  assert.equal(calls[0].options.inputEncoding, 'utf8');
+  assert.equal(calls[0].options.windowsHide, true);
+  assert.equal(JSON.parse(calls[0].options.input).value, 'hidden-value');
+  assert.equal(calls[0].args.includes('hidden-value'), false);
+});
+
+test('real Windows Credential Manager roundtrip persists Unicode values and cleans up', { skip: process.platform !== 'win32' }, async (t) => {
+  const service = `openclaw-workbench-it-${randomUUID().slice(0, 12)}`;
+  const name = 'unicode';
+  const secret = `测试-${randomUUID()}-安全值`;
+  const store = createWindowsCredentialStore({ service, platform: 'win32' });
+  t.after(async () => { await store.delete(name); });
+  await store.set(name, secret);
+  assert.equal(await store.has(name), true);
+  assert.equal(await store.get(name), secret);
+  assert.equal(await store.delete(name), true);
+  assert.equal(await store.get(name), null);
+  assert.equal(await store.has(name), false);
 });

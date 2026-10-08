@@ -71,3 +71,22 @@ test('模型 runner 支持调用方取消和硬超时，底层忽略 signal 也�
   controller.abort();
   await assert.rejects(pending, { code: 'MODEL_ABORTED' });
 });
+
+test('模型 runner 把已检查的 DNS 地址固定传给请求传输，避免 Bearer 随二次解析流向私网', async () => {
+  const publicAddress = { address: '93.184.216.34', family: 4 };
+  let seenLookup;
+  const runner = createModelRunner({
+    secretResolver: { resolve: async () => 'runner-secret' },
+    lookupImpl: async () => [publicAddress],
+    fetchImpl: async (_url, options) => {
+      seenLookup = options.lookup;
+      assert.equal(typeof seenLookup, 'function');
+      const pinned = await new Promise((resolve, reject) => seenLookup('provider.example', { all: false }, (error, address, family) => error ? reject(error) : resolve({ address, family })));
+      assert.deepEqual(pinned, publicAddress);
+      assert.equal(options.headers.authorization, 'Bearer runner-secret');
+      return jsonResponse({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] });
+    },
+  });
+  await runner({ profile: profile(), messages: [] });
+  assert.equal(typeof seenLookup, 'function');
+});

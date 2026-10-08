@@ -99,9 +99,16 @@ function fileOpsArgs(options) {
   return ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', FILE_OPS_SCRIPT, '-Payload', fileOpsPayload(options)];
 }
 
+function fileOpsArgsWithPayload() {
+  return ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', FILE_OPS_SCRIPT];
+}
+
 export function runWindowsFileOperationSync(options = {}) {
   if (!WINDOWS) throw new Error('windows file operations are only available on Windows');
-  const result = spawnSync(powershellPath(), fileOpsArgs(options), { shell: false, windowsHide: true, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  const payload = fileOpsPayload(options);
+  const result = payload.length < 24_000
+    ? spawnSync(powershellPath(), fileOpsArgs(options), { shell: false, windowsHide: true, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+    : spawnSync(powershellPath(), fileOpsArgsWithPayload(), { input: payload, shell: false, windowsHide: true, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(String(result.stderr || 'windows file operation failed').trim());
   return String(result.stdout ?? '');
@@ -110,11 +117,13 @@ export function runWindowsFileOperationSync(options = {}) {
 export async function runWindowsFileOperation(options = {}) {
   if (!WINDOWS) throw new Error('windows file operations are only available on Windows');
   return new Promise((resolve, reject) => {
-    const child = spawn(powershellPath(), fileOpsArgs(options), { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const payload = fileOpsPayload(options);
+    const child = spawn(powershellPath(), payload.length < 24_000 ? fileOpsArgs(options) : fileOpsArgsWithPayload(), { shell: false, windowsHide: true, stdio: payload.length < 24_000 ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
     child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
     child.on('error', reject);
     child.on('close', (code) => code === 0 ? resolve(stdout) : reject(new Error(stderr.trim() || 'windows file operation failed')));
+    if (payload.length >= 24_000) child.stdin.end(payload);
   });
 }

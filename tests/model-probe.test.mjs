@@ -86,3 +86,21 @@ test('探针默认阻断回环、私网、metadata 和非 HTTPS endpoint，并�
   const dnsBlocked = createModelHealthProbe({ secretResolver: { resolve: async () => 'x' }, lookupImpl: async () => [{ address: '127.0.0.1', family: 4 }], fetchImpl: async () => response({ data: [] }) });
   await assert.rejects(() => dnsBlocked(profile()), { code: 'MODEL_ENDPOINT_BLOCKED' });
 });
+
+test('探针把已检查的 DNS 地址固定传给请求传输，避免 fetch 二次解析', async () => {
+  const publicAddress = { address: '93.184.216.34', family: 4 };
+  let seenLookup;
+  const probe = createModelHealthProbe({
+    secretResolver: { resolve: async () => 'probe-secret' },
+    lookupImpl: async () => [publicAddress],
+    fetchImpl: async (_url, options) => {
+      seenLookup = options.lookup;
+      assert.equal(typeof seenLookup, 'function');
+      const pinned = await new Promise((resolve, reject) => seenLookup('provider.example', { all: false }, (error, address, family) => error ? reject(error) : resolve({ address, family })));
+      assert.deepEqual(pinned, publicAddress);
+      return response({ data: [] });
+    },
+  });
+  await probe(profile());
+  assert.equal(typeof seenLookup, 'function');
+});
