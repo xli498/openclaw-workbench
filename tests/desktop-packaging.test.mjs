@@ -19,7 +19,7 @@ test('Tauri bundle carries the Node runtime as explicit resources', async () => 
 
 test('desktop source documents the CI-provided Node runtime without checking in binaries', async () => {
   const placeholder = await readFile(path.join(repoRoot, 'desktop', 'node-runtime', 'README.md'), 'utf8');
-  assert.match(placeholder, /v22\.19\.0/);
+  assert.match(placeholder, /v22[.]19[.]0/);
   assert.match(placeholder, /download|CI/i);
   assert.match(placeholder, /not.*commit|binary|out of Git/i);
 });
