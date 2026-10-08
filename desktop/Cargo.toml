@@ -9,7 +9,6 @@ license = "MIT"
 [lib]
 name = "openclaw_workbench_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
-test = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
