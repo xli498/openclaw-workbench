@@ -37,19 +37,20 @@ jobs:
         run: |
           $version = 'v22.19.0'
           $archive = Join-Path $env:RUNNER_TEMP "node-$version-win-x64.zip"
-          $extractRoot = Join-Path $env:RUNNER_TEMP "node-$version-win-x64"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "openclaw-node-$version-win-x64"
           $destination = Join-Path $env:GITHUB_WORKSPACE 'desktop/node-runtime'
           $uri = "https://nodejs.org/dist/$version/node-$version-win-x64.zip"
           Invoke-WebRequest -Uri $uri -OutFile $archive
           if (Test-Path $extractRoot) {
             Remove-Item -LiteralPath $extractRoot -Recurse -Force
           }
-          Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNNER_TEMP -Force
-          if (-not (Test-Path (Join-Path $extractRoot 'node.exe'))) {
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot -Force
+          $archiveRoot = Join-Path $extractRoot "node-$version-win-x64"
+          if (-not (Test-Path (Join-Path $archiveRoot 'node.exe'))) {
             throw "Node runtime archive did not contain node.exe"
           }
           New-Item -ItemType Directory -Path $destination -Force | Out-Null
-          Copy-Item -Path (Join-Path $extractRoot '*') -Destination $destination -Recurse -Force
+          Copy-Item -Path (Join-Path $archiveRoot '*') -Destination $destination -Recurse -Force
           if (-not (Test-Path (Join-Path $destination 'node.exe'))) {
             throw "Bundled Node runtime was not prepared"
           }
