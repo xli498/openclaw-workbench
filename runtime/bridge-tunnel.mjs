@@ -132,7 +132,6 @@ export function createBridgeTunnelAdapter({
     return new Promise((resolve, reject) => {
       if (publicUrl) return resolve(publicUrl);
       const timer = setTimeout(() => { urlWaiter = null; reject(new BridgeTunnelError('TUNNEL_URL_TIMEOUT', 'tunnel URL was not reported')); }, timeoutMs);
-      timer.unref?.();
       urlWaiter = { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject: (error) => { clearTimeout(timer); reject(error); }, generation: expectedGeneration };
     });
   }
