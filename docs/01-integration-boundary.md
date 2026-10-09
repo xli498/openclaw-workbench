@@ -52,4 +52,4 @@ OpenClaw 已具备足够多的底层能力，可以作为产品基础；但 Work
 
 ## 产品核心验收边界
 
-核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。Workbench 另提供脱敏 `GET /v1/diagnostics` 与审批保护的 terminal-session 合同；没有 PTY provider 时只报告 `pty:false`，不把一次性命令执行称作持久 PTY。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用、会话关闭与空闲过期：它只能绑定 loopback，每次请求仍需 Bearer，path token 仅用于短时路由定位且不得记录，默认拒绝跨域 Origin。公网 Tunnel 仅有显式启动的受控 CLI 适配器；Cloudflare/ngrok 实际公网部署、设备配对、TLS 和运维仍未验证。LSP 未实现。
+核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。Workbench 另提供脱敏 `GET /v1/diagnostics` 与审批保护的 terminal-session 合同；没有 PTY provider 时只报告 `pty:false`，不把一次性命令执行称作持久 PTY。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用、会话关闭与空闲过期：它只能绑定 loopback，每次请求仍需 Bearer，path token 仅用于短时路由定位且不得记录，默认拒绝跨域 Origin。公网 Tunnel 仅有显式启动的受控 CLI 适配器，覆盖 Quick、Named 和固定域名命令参数校验；Cloudflare/ngrok 实际公网部署、设备配对、TLS、路径转发和运维仍未验证。LSP 未实现。

@@ -4,9 +4,10 @@ import { spawn } from 'node:child_process';
 const DEFAULT_START_TIMEOUT_MS = 15_000;
 const DEFAULT_STOP_TIMEOUT_MS = 3_000;
 const SECRET_PATH_BYTES = 18;
-const PROVIDERS = new Set(['cloudflare-quick', 'ngrok']);
+const PROVIDERS = new Set(['cloudflare-quick', 'cloudflare-named', 'ngrok', 'ngrok-fixed']);
 const STATES = new Set(['idle', 'starting', 'ready', 'stopping', 'failed']);
 const SAFE_NAME = /^[a-z][a-z0-9-]{1,31}$/;
+const SAFE_HOSTNAME = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 
 export class BridgeTunnelError extends Error {
   constructor(code, message, details = {}) {
@@ -30,6 +31,16 @@ function validArg(value) {
   if (typeof value !== 'string' || value.length > 512 || /[\0\r\n]/.test(value)) fail('TUNNEL_ARGS_INVALID', 'tunnel argument is invalid');
   return value;
 }
+function validTunnelName(value) {
+  if (value === undefined) fail('TUNNEL_NAME_REQUIRED', 'named tunnel name is required');
+  if (typeof value !== 'string' || !SAFE_NAME.test(value)) fail('TUNNEL_NAME_INVALID', 'named tunnel name is invalid');
+  return value;
+}
+function validHostname(value) {
+  if (value === undefined) fail('TUNNEL_HOSTNAME_REQUIRED', 'fixed tunnel hostname is required');
+  if (typeof value !== 'string' || !SAFE_HOSTNAME.test(value)) fail('TUNNEL_HOSTNAME_INVALID', 'fixed tunnel hostname is invalid');
+  return value.toLowerCase();
+}
 function randomSecretPath() { return randomBytes(SECRET_PATH_BYTES).toString('base64url'); }
 function genericError(error) { return error instanceof BridgeTunnelError ? error : new BridgeTunnelError('TUNNEL_PROCESS_FAILED', 'tunnel process failed'); }
 
@@ -44,6 +55,8 @@ export function createBridgeTunnelAdapter({
   provider,
   command,
   args = [],
+  tunnelName,
+  hostname,
   localPort,
   token,
   spawnImpl = spawn,
@@ -54,6 +67,8 @@ export function createBridgeTunnelAdapter({
   onStateChange,
 } = {}) {
   if (!PROVIDERS.has(provider)) fail('TUNNEL_PROVIDER_INVALID', 'unsupported tunnel provider');
+  const namedTunnel = provider === 'cloudflare-named' ? validTunnelName(tunnelName) : undefined;
+  const fixedHostname = provider === 'ngrok-fixed' ? validHostname(hostname) : undefined;
   validCommand(command);
   if (!Array.isArray(args) || args.length > 32) fail('TUNNEL_ARGS_INVALID', 'tunnel arguments are invalid');
   args.forEach(validArg);
@@ -88,7 +103,10 @@ export function createBridgeTunnelAdapter({
   }
   function currentArgs() {
     // The bearer is passed as an environment variable, never in argv or URL.
-    return [...args, '--url', `http://127.0.0.1:${localPort}/${routePath}`];
+    const target = `http://127.0.0.1:${localPort}/${routePath}`;
+    if (provider === 'cloudflare-named') return ['tunnel', 'run', namedTunnel, ...args];
+    if (provider === 'ngrok-fixed') return ['http', '--domain', fixedHostname, `127.0.0.1:${localPort}`, ...args];
+    return [...args, '--url', target];
   }
   function consumeOutput(data) {
     outputBuffer += Buffer.isBuffer(data) ? data.toString('utf8') : String(data ?? '');
@@ -100,8 +118,10 @@ export function createBridgeTunnelAdapter({
       try {
         const parsed = parsePublicUrl(line);
         if (typeof parsed === 'string' && /^https:\/\//.test(parsed) && parsed.length <= 2048) {
-          publicUrl = parsed;
-          urlWaiter?.resolve(parsed);
+          const candidate = new URL(parsed);
+          if (candidate.protocol !== 'https:' || candidate.username || candidate.password || candidate.search || candidate.hash || (fixedHostname && candidate.hostname.toLowerCase() !== fixedHostname)) continue;
+          publicUrl = candidate.origin;
+          urlWaiter?.resolve(publicUrl);
           urlWaiter = null;
         }
       } catch { /* parser input is untrusted */ }

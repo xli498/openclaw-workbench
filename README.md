@@ -82,7 +82,7 @@ Bridge 只允许 `127.0.0.1`、`::1` 或 `localhost` 绑定。每个请求仍必
 
 ### 公网 Tunnel 适配器（实验性、显式启动）
 
-`createBridgeTunnelAdapter` 只提供受控外部 CLI 的生命周期边界，不会自动启动公网隧道，也不会替代本机 Bridge 的 loopback 绑定或审批。当前允许的 provider 标识为 `cloudflare-quick` 和 `ngrok`；调用方必须显式注入 CLI、端口、Bearer token 以及不可信 stdout 的 `parsePublicUrl`。适配器使用 `shell:false`，Bearer 只放在子进程环境变量，不放入参数或 URL；每次 `start()` / `reset()` 生成新的随机路由路径，`reset()` 先停止旧进程，使旧地址失效。`status()`、状态回调和审计不含公网 URL 或 token，公网 URL 只在 `start()` 返回值和进程内 `endpoint()` 中短暂可用。真实 Cloudflare/ngrok 启动、域名绑定、TLS、设备配对和公网部署仍需单独验证。
+`createBridgeTunnelAdapter` 只提供受控外部 CLI 的生命周期边界，不会自动启动公网隧道，也不会替代本机 Bridge 的 loopback 绑定或审批。当前允许的 provider 标识为 `cloudflare-quick`、`cloudflare-named`、`ngrok` 和 `ngrok-fixed`；Named 模式要求安全的 `tunnelName`，固定域名模式要求不带协议或路径的 `hostname`。调用方必须显式注入 CLI、端口、Bearer token 以及不可信 stdout 的 `parsePublicUrl`。适配器使用 `shell:false`，Bearer 只放在子进程环境变量，不放入参数或 URL；每次 `start()` / `reset()` 生成新的随机路由路径，`reset()` 先停止旧进程，使旧地址失效。`status()`、状态回调和审计不含公网 URL 或 token，公网 URL 只在 `start()` 返回值和进程内 `endpoint()` 中短暂可用。真实 Cloudflare/ngrok 启动、域名绑定、TLS、设备配对和公网部署仍需单独验证。
 
 ```js
 import { createBridgeTunnelAdapter } from 'openclaw-workbench';
