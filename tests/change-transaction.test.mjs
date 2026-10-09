@@ -158,12 +158,42 @@ test('扫描未完成事务并忽略已完成事务', async () => {
   const root = await fixture();
   const dir = path.join(root, '.openclaw-workbench', 'transactions');
   await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'pending.json'), JSON.stringify({ transactionId: 'tx-1', state: 'committing', files: [] }));
-  await writeFile(path.join(dir, 'done.json'), JSON.stringify({ transactionId: 'tx-2', state: 'committed', files: [] }));
+  await writeFile(path.join(dir, 'tx-1.json'), JSON.stringify({ transactionId: 'tx-1', state: 'committing', files: [] }));
+  await writeFile(path.join(dir, 'tx-2.json'), JSON.stringify({ transactionId: 'tx-2', state: 'committed', files: [] }));
   const pending = await scanPendingTransactions({ root });
   assert.equal(pending.length, 1);
   assert.equal(pending[0].transactionId, 'tx-1');
-  assert.equal(pending[0].manifestPath, path.join(dir, 'pending.json'));
+  assert.equal(pending[0].manifestPath, path.join(dir, 'tx-1.json'));
+});
+
+test('事务扫描拒绝路径样式和与清单文件名不匹配的 transactionId', async () => {
+  const root = await fixture();
+  const dir = path.join(root, '.openclaw-workbench', 'transactions');
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, 'path-id.json'), JSON.stringify({ transactionId: 'C:\\Users\\private\\data', state: 'committing', files: [] }));
+  await writeFile(path.join(dir, 'mismatch.json'), JSON.stringify({ transactionId: 'different-id', state: 'committing', files: [] }));
+
+  const pending = await scanPendingTransactions({ root, tolerateInvalid: true });
+
+  assert.equal(pending.length, 2);
+  assert.deepEqual(pending.map((item) => item.transactionId).sort(), ['mismatch', 'path-id']);
+  assert.ok(pending.every((item) => item.invalid?.code === 'MANIFEST_INVALID'));
+  assert.equal(JSON.stringify(pending).includes('private'), false);
+});
+
+test('事务扫描绑定清单原始字节哈希且不把扫描元数据写进清单', async () => {
+  const root = await fixture();
+  const manifestPath = transactionManifestPath(root, 'tx-hash');
+  await mkdir(path.dirname(manifestPath), { recursive: true });
+  const bytes = Buffer.from(JSON.stringify({ transactionId: 'tx-hash', state: 'committing', files: [] }, null, 2));
+  await writeFile(manifestPath, bytes);
+
+  const [manifest] = await scanPendingTransactions({ root });
+
+  assert.equal(manifest.manifestHash, createHash('sha256').update(bytes).digest('hex'));
+  assert.equal(Object.keys(manifest).includes('manifestHash'), false);
+  assert.equal(Object.keys(manifest).includes('manifestPath'), false);
+  assert.equal(JSON.stringify(manifest).includes('manifestPath'), false);
 });
 
 test('拒绝非法或损坏事务清单', async () => {
@@ -284,10 +314,10 @@ test('启动扫描隔离单项失败并继续处理其他事务', async () => {
   const target = path.join(root, 'a.txt'); const content = await readFile(target); const digest = createHash('sha256').update(content).digest('hex');
   const snapshot = path.join(root, 'a.snapshot'); await writeFile(snapshot, content);
   const valid = { transactionId: 'tx-valid', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, beforeHash: digest, afterHash: digest }] };
-  const invalid = { transactionId: 'tx-invalid', state: 'committing', files: [{ relativePath: 'a.txt', target: path.join(root, '..', 'escape'), snapshot }] };
+  const invalid = { transactionId: 'b-invalid', state: 'committing', files: [{ relativePath: 'a.txt', target: path.join(root, '..', 'escape'), snapshot }] };
   await writeFile(transactionManifestPath(root, valid.transactionId), JSON.stringify(valid)); await writeFile(path.join(dir, 'b-invalid.json'), JSON.stringify(invalid));
   const failures = []; const result = await scanStartupRecovery({ root, onError: (failure) => failures.push(failure) });
-  assert.equal(result.length, 2); assert.equal(result.find((item) => item.transactionId === 'tx-valid').finalized, true); assert.equal(result.find((item) => item.transactionId === 'tx-invalid').decision, 'error'); assert.equal(failures.length, 1);
+  assert.equal(result.length, 2); assert.equal(result.find((item) => item.transactionId === 'tx-valid').finalized, true); assert.equal(result.find((item) => item.transactionId === 'b-invalid').decision, 'error'); assert.equal(failures.length, 1);
 });
 
 test('整轮扫描告警回调失败仍保留原始 SCAN_FAILED', async () => {
@@ -338,7 +368,7 @@ test('finalize_failed 文件未完全达到 afterHash 时不会跳过决策强�
   const digest = (value) => createHash('sha256').update(value).digest('hex');
   const manifest = { transactionId: 'tx-finalize-conflict', state: 'finalize_failed', files: [{ relativePath: 'a.txt', target, snapshot, beforeHash: digest(Buffer.from('old\n')), afterHash: digest(Buffer.from('one\n')) }] };
   const dir = path.join(root, '.openclaw-workbench', 'transactions'); await mkdir(dir, { recursive: true });
-  const manifestPath = path.join(dir, 'tx.json'); await writeFile(manifestPath, JSON.stringify(manifest));
+  const manifestPath = transactionManifestPath(root, manifest.transactionId); await writeFile(manifestPath, JSON.stringify(manifest));
   const results = await scanStartupRecovery({ root });
   assert.equal(results[0].finalized, false); assert.equal(results[0].decision, 'blocked'); assert.equal(results[0].report.files[0].currentMatchesAfter, false);
   assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'finalize_failed');
@@ -624,14 +654,56 @@ test('恢复应用失败且回滚再次失败时保留 ROLLBACK_PARTIAL 现场',
   ] };
   const manifestPath = transactionManifestPath(root, manifest.transactionId); await mkdir(path.dirname(manifestPath), { recursive: true }); await writeFile(manifestPath, JSON.stringify(manifest));
   let calls = 0;
-  await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, renameFile: async (...args) => {
+  const audit = { events: [], async append(event) { this.events.push(event); } };
+  await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, audit, renameFile: async (...args) => {
     calls += 1;
-    if (calls === 2 || calls === 3) throw new Error(`injected rename failure ${calls}`);
+    if (calls === 2 || calls === 3) throw new Error(`provider failure password=TOPSECRET injected rename ${calls} at ${path.join(root, 'private', 'absolute-target')}`);
     return (await import('node:fs/promises')).rename(...args);
   } }), (error) => error.code === 'ROLLBACK_PARTIAL' && error.details.rollbackErrors.length === 1);
   const failed = JSON.parse(await readFile(manifestPath, 'utf8'));
   assert.equal(failed.state, 'rollback_partial');
   assert.equal(failed.recoveryError.code, 'ROLLBACK_PARTIAL');
+  assert.equal(audit.events.length, 1);
+  for (const message of [failed.recoveryError.message, failed.recoveryError.rollbackErrors[0].error, audit.events[0].rollbackErrors[0].error]) {
+    assert.equal(typeof message, 'string');
+    assert.equal(message.includes(root), false);
+    assert.equal(message.includes('TOPSECRET'), false);
+    assert.equal(message.includes('provider failure'), false);
+  }
+  assert.equal(failed.recoveryError.rollbackErrors[0].path, 'a.txt');
+  assert.equal(audit.events[0].rollbackErrors[0].path, 'a.txt');
+});
+
+test('恢复应用失败时清单和审计仅保留安全错误码与相对路径', async () => {
+  const root = await fixture();
+  const target = path.join(root, 'a.txt'); const snapshot = path.join(root, 'a.snapshot'); const temp = path.join(root, 'a.temp');
+  const before = Buffer.from('one\ntwo\n'); const after = Buffer.from('one\nTWO\n');
+  const sha = (value) => createHash('sha256').update(value).digest('hex');
+  await writeFile(target, before); await writeFile(snapshot, before); await writeFile(temp, after);
+  const manifestPath = transactionManifestPath(root, 'tx-apply-redaction');
+  await mkdir(path.dirname(manifestPath), { recursive: true });
+  const manifest = { transactionId: 'tx-apply-redaction', state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, temp, beforeHash: sha(before), afterHash: sha(after) }] };
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const rawFailure = `provider failure apiKey=TOPSECRET at ${path.join(root, 'private', 'apply-target')}`;
+  const audit = { events: [], async append(event) { this.events.push(event); } };
+  let thrown;
+  try {
+    await executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, audit, renameFile: async () => { throw new Error(rawFailure); } });
+  } catch (error) { thrown = error; }
+  assert.equal(thrown.code, 'RECOVERY_APPLY_FAILED');
+  const failed = JSON.parse(await readFile(manifestPath, 'utf8'));
+  assert.equal(failed.recoveryError.code, 'RECOVERY_APPLY_FAILED');
+  assert.equal(failed.recoveryError.message.includes(root), false);
+  assert.equal(failed.recoveryError.message.includes('TOPSECRET'), false);
+  assert.equal(failed.recoveryError.message.includes('provider failure'), false);
+  assert.deepEqual(failed.recoveryError.applied, []);
+  assert.deepEqual(audit.events[0].files, ['a.txt']);
+  assert.equal(typeof audit.events[0].message, 'string');
+  assert.equal(audit.events[0].message.includes(root), false);
+  assert.equal(audit.events[0].message.includes('TOPSECRET'), false);
+  assert.equal(audit.events[0].message.includes('provider failure'), false);
+  assert.equal(thrown.message.includes(root), false);
+  assert.equal(thrown.message.includes('TOPSECRET'), false);
 });
 
 test('resume 完成后可更新事务清单并记录最终状态', async () => {
@@ -668,6 +740,28 @@ test('有 manifestPath 时恢复成功自动持久化终态', async () => {
   assert.equal(result.state, 'committed');
   assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'committed');
   assert.deepEqual(await scanPendingTransactions({ root }), []);
+});
+
+test('恢复执行在写锁内拒绝与审批哈希不一致的磁盘清单', async () => {
+  const root = await fixture();
+  const transactionId = 'tx-manifest-conflict';
+  const manifestPath = transactionManifestPath(root, transactionId);
+  const target = path.join(root, 'a.txt');
+  const snapshot = path.join(root, 'a.snapshot');
+  const temp = path.join(root, 'a.temp');
+  const before = Buffer.from('one\ntwo\n');
+  const after = Buffer.from('one\nTWO\n');
+  const digest = (value) => createHash('sha256').update(value).digest('hex');
+  await writeFile(target, before);
+  await writeFile(snapshot, before);
+  await writeFile(temp, after);
+  const manifest = { transactionId, state: 'committing', files: [{ relativePath: 'a.txt', target, snapshot, temp, beforeHash: digest(before), afterHash: digest(after) }] };
+  await mkdir(path.dirname(manifestPath), { recursive: true });
+  await writeFile(manifestPath, JSON.stringify(manifest));
+
+  await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, expectedManifestHash: '0'.repeat(64), mode: 'resume', approved: true }), (error) => error.code === 'MANIFEST_CONFLICT');
+  assert.equal(await readFile(target, 'utf8'), before.toString());
+  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'committing');
 });
 
 test('恢复拒绝非事务目录的 manifestPath，且不覆盖工作区文件', async () => {
@@ -722,8 +816,20 @@ test('恢复最终状态清单更新失败时返回 FINALIZE_FAILED', async () =
   const sha = (value) => createHash('sha256').update(value).digest('hex');
   const manifest = { transactionId: 'tx-finalize-fail', state: 'committing', files: [{ relativePath: 'a.txt', target, temp, snapshot, beforeHash: sha(await readFile(target)), afterHash: sha(await readFile(temp)) }] };
   const manifestPath = transactionManifestPath(root, 'tx-finalize-fail'); await mkdir(path.dirname(manifestPath), { recursive: true }); await writeFile(manifestPath, JSON.stringify(manifest));
-  await assert.rejects(() => executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, updateManifest: async () => { throw new Error('manifest unavailable'); } }), (e) => e.code === 'FINALIZE_FAILED' && e.details.recoveryManifestWritten === true);
-  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).state, 'finalize_failed');
+  const rawFailure = `OS provider error token=TOPSECRET at ${path.join(root, 'private', 'manifest-target')}`;
+  const audit = { events: [], async append(event) { this.events.push(event); } };
+  let thrown;
+  try { await executeRecovery({ root, manifest, manifestPath, mode: 'resume', approved: true, audit, updateManifest: async () => { throw new Error(rawFailure); } }); }
+  catch (error) { thrown = error; }
+  assert.equal(thrown.code, 'FINALIZE_FAILED');
+  const failed = JSON.parse(await readFile(manifestPath, 'utf8'));
+  assert.equal(failed.state, 'finalize_failed');
+  for (const message of [failed.finalizeError.message, audit.events[0].message, thrown.message]) {
+    assert.equal(typeof message, 'string');
+    assert.equal(message.includes(root), false);
+    assert.equal(message.includes('TOPSECRET'), false);
+    assert.equal(message.includes('OS provider error'), false);
+  }
   assert.equal(await readFile(target, 'utf8'), 'one\\nTWO\\n');
 });
 

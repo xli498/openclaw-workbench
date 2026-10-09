@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
@@ -15,6 +16,59 @@ import { createTerminalSessionManager } from '../runtime/terminal-session.mjs';
 async function request(address, pathname, options = {}) {
   const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: 'Bearer test-token-012345', ...(options.headers ?? {}) } });
   return { status: response.status, headers: response.headers, body: await response.json() };
+}
+
+async function requestWithoutPooling(address, pathname, options = {}) {
+  return new Promise((resolve, reject) => {
+    const body = options.body ?? '';
+    const request = http.request({
+      host: address.address,
+      port: address.port,
+      path: pathname,
+      method: options.method ?? 'GET',
+      agent: false,
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-token-012345', ...(body ? { 'content-length': Buffer.byteLength(body) } : {}), ...(options.headers ?? {}) },
+    }, (response) => {
+      let raw = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { raw += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: raw ? JSON.parse(raw) : null }));
+    });
+    request.on('error', reject);
+    request.end(body);
+  });
+}
+
+async function createPendingRecoveryFixture(root, { transactionId = 'tx-resume', current = 'before' } = {}) {
+  const transactionDir = path.join(root, '.openclaw-workbench', 'transactions');
+  const snapshotDir = path.join(root, '.openclaw-workbench', 'snapshots');
+  await mkdir(transactionDir, { recursive: true });
+  await mkdir(snapshotDir, { recursive: true });
+  const target = path.join(root, 'README.md');
+  const snapshot = path.join(snapshotDir, `${transactionId}-README.md`);
+  const temp = path.join(root, 'README.md.ocw-after.tmp');
+  const before = Buffer.from('before recovery\n');
+  const after = Buffer.from('after recovery\n');
+  const digest = (value) => createHash('sha256').update(value).digest('hex');
+  await writeFile(target, current === 'after' ? after : before);
+  await writeFile(snapshot, before);
+  await writeFile(temp, after);
+  const files = [{ relativePath: 'README.md', target, snapshot, temp, beforeHash: digest(before), afterHash: digest(after) }];
+  if (current === 'after') {
+    const untouchedTarget = path.join(root, 'NOTES.md');
+    const untouchedSnapshot = path.join(snapshotDir, `${transactionId}-NOTES.md`);
+    const untouchedTemp = path.join(root, 'NOTES.md.ocw-after.tmp');
+    const untouchedBefore = Buffer.from('untouched before\n');
+    const untouchedAfter = Buffer.from('untouched after\n');
+    await writeFile(untouchedTarget, untouchedBefore);
+    await writeFile(untouchedSnapshot, untouchedBefore);
+    await writeFile(untouchedTemp, untouchedAfter);
+    files.push({ relativePath: 'NOTES.md', target: untouchedTarget, snapshot: untouchedSnapshot, temp: untouchedTemp, beforeHash: digest(untouchedBefore), afterHash: digest(untouchedAfter) });
+  }
+  const manifest = { transactionId, state: 'committing', files };
+  const manifestPath = path.join(transactionDir, `${transactionId}.json`);
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  return { transactionId, manifest, manifestPath, target, before, after };
 }
 
 test('Runtime shutdown 只接受正确凭据并且只触发一次关闭回调', async () => {
@@ -286,6 +340,238 @@ test('控制面 recovery 接口只读暴露恢复判定，并隔离无效清单'
     assert.equal(inspectionFailure.reason, 'RECOVERY_PATH_ESCAPE');
     assert.equal(inspectionFailure.report, undefined);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); await rm(externalRoot, { recursive: true, force: true }); }
+});
+
+test('控制面 recovery 提案必须独立审批，并按清单哈希执行 resume', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-approval-'));
+  const fixture = await createPendingRecoveryFixture(root);
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.equal(created.body.proposal.action.status, 'awaiting_approval');
+    assert.equal(created.body.proposal.mode, 'resume');
+    assert.deepEqual(created.body.proposal.impact.files.map((file) => file.relativePath), ['README.md']);
+    assert.equal(await readFile(fixture.target, 'utf8'), fixture.before.toString());
+    assert.equal(JSON.stringify(created.body).includes(root), false);
+
+    const pending = await request(address, '/v1/recovery');
+    assert.equal(pending.body.transactions[0].proposal.action.id, created.body.proposal.action.id);
+    const denied = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(denied.status, 403);
+    const wrongHash = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: '0'.repeat(64) }) });
+    assert.equal(wrongHash.status, 409);
+
+    const approved = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    assert.equal(approved.body.recovery.state, 'committed');
+    assert.equal(await readFile(fixture.target, 'utf8'), fixture.after.toString());
+    assert.equal(JSON.parse(await readFile(fixture.manifestPath, 'utf8')).state, 'committed');
+    assert.deepEqual((await request(address, '/v1/recovery')).body.transactions, []);
+    const audit = await request(address, '/v1/audit?limit=50');
+    const eventTypes = audit.body.events.map((event) => event.type);
+    assert.ok(eventTypes.includes('transaction.recovery.proposed'));
+    assert.ok(eventTypes.includes('transaction.recovery.approved'));
+    assert.ok(eventTypes.includes('transaction.recovery.verified'));
+    assert.ok(eventTypes.includes('transaction.resume'));
+    assert.equal(JSON.stringify(audit.body).includes(root), false);
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('并发 recovery 提案创建不会突破 32 个待审批名额', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-capacity-'));
+  const fixture = await createPendingRecoveryFixture(root, { transactionId: 'tx-capacity' });
+  let releaseCapacity;
+  let capacityChecks = 0;
+  const allCapacityChecksStarted = new Promise((resolve) => { releaseCapacity = resolve; });
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    __testHooks: {
+      beforeRecoveryCapacityCheck: async () => {
+        capacityChecks += 1;
+        if (capacityChecks === 33) releaseCapacity();
+        await allCapacityChecksStarted;
+      },
+    },
+  });
+  const address = await app.listen();
+  try {
+    const requests = Array.from({ length: 33 }, () => requestWithoutPooling(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) }));
+    const responses = await Promise.all(requests);
+    assert.equal(responses.filter((response) => response.status === 201).length, 32);
+    assert.equal(responses.filter((response) => response.status === 429).length, 1);
+  } finally { releaseCapacity(); await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面 recovery rollback 只还原已确认的 after 文件，并阻断审批后的并发改写', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-rollback-'));
+  const fixture = await createPendingRecoveryFixture(root, { transactionId: 'tx-rollback', current: 'after' });
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'rollback' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    await writeFile(fixture.target, 'operator changed this\n');
+    const blocked = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(blocked.status, 409, JSON.stringify(blocked.body));
+    assert.equal(await readFile(fixture.target, 'utf8'), 'operator changed this\n');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+
+  const rollbackRoot = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-rollback-valid-'));
+  const rollbackFixture = await createPendingRecoveryFixture(rollbackRoot, { transactionId: 'tx-rollback-valid', current: 'after' });
+  const rollbackApp = createWorkbenchServer({ root: rollbackRoot, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const rollbackAddress = await rollbackApp.listen();
+  try {
+    const created = await request(rollbackAddress, `/v1/recovery/${rollbackFixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'rollback' }) });
+    const approved = await request(rollbackAddress, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    assert.equal(approved.body.recovery.state, 'rolled_back');
+    assert.equal(await readFile(rollbackFixture.target, 'utf8'), rollbackFixture.before.toString());
+  } finally { await rollbackApp.close(); await rm(rollbackRoot, { recursive: true, force: true }); }
+});
+
+test('控制面 recovery 将文件冲突返回 409、apply/compensation/finalization 故障返回 500', async () => {
+  const conflictRoot = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-status-conflict-'));
+  const conflictFixture = await createPendingRecoveryFixture(conflictRoot, { transactionId: 'tx-status-conflict' });
+  const conflictApp = createWorkbenchServer({ root: conflictRoot, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const conflictAddress = await conflictApp.listen();
+  try {
+    const created = await request(conflictAddress, `/v1/recovery/${conflictFixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    await writeFile(conflictFixture.target, 'operator change after proposal\n');
+    const approved = await request(conflictAddress, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 409);
+    assert.equal(approved.body.error, 'RECOVERY_STALE');
+  } finally { await conflictApp.close(); await rm(conflictRoot, { recursive: true, force: true }); }
+
+  for (const failureKind of ['apply', 'apply-conflict', 'partial', 'finalize']) {
+    const root = await mkdtemp(path.join(tmpdir(), `ocw-http-recovery-status-${failureKind}-`));
+    const isPartial = failureKind === 'partial';
+    const isApplyConflict = failureKind === 'apply-conflict';
+    const mode = isPartial ? 'rollback' : 'resume';
+    const fixture = await createPendingRecoveryFixture(root, { transactionId: `tx-status-${failureKind}`, ...(isPartial ? { current: 'after' } : {}) });
+    if (isPartial) {
+      const extraTarget = path.join(root, 'EXTRA.md');
+      const extraSnapshot = path.join(root, '.openclaw-workbench', 'snapshots', `${fixture.transactionId}-EXTRA.md`);
+      const extraTemp = path.join(root, 'EXTRA.md.ocw-after.tmp');
+      const extraBefore = Buffer.from('extra before\n');
+      const extraAfter = Buffer.from('extra after\n');
+      const digest = (value) => createHash('sha256').update(value).digest('hex');
+      await writeFile(extraTarget, extraAfter);
+      await writeFile(extraSnapshot, extraBefore);
+      await writeFile(extraTemp, extraAfter);
+      fixture.manifest.files.push({ relativePath: 'EXTRA.md', target: extraTarget, snapshot: extraSnapshot, temp: extraTemp, beforeHash: digest(extraBefore), afterHash: digest(extraAfter) });
+      await writeFile(fixture.manifestPath, JSON.stringify(fixture.manifest));
+    }
+    const rawFailure = `provider failure apiKey=TOPSECRET at ${path.join(root, 'private', 'target')}`;
+    const audit = { events: [], async append(event) { this.events.push(event); } };
+    let partialRenameCalls = 0;
+    const app = createWorkbenchServer({
+      root,
+      audit,
+      token: 'test-token-012345',
+      approvalToken: 'approve-token-012345',
+      __testHooks: failureKind === 'apply'
+        ? { recoveryRenameFile: async () => { throw new Error(rawFailure); } }
+        : isApplyConflict
+          ? { recoveryRenameFile: async (...args) => {
+            await writeFile(fixture.target, 'operator race during recovery\n');
+            throw Object.assign(new Error('target changed during recovery'), { code: 'TARGET_CHANGED' });
+          } }
+        : isPartial
+          ? { recoveryRenameFile: async (...args) => {
+            partialRenameCalls += 1;
+            if (partialRenameCalls === 2 || partialRenameCalls === 3) throw new Error(rawFailure);
+            return (await import('node:fs/promises')).rename(...args);
+          } }
+          : { recoveryUpdateManifest: async () => { throw new Error(rawFailure); } },
+    });
+    const address = await app.listen();
+    try {
+      const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode }) });
+      const approved = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+      assert.equal(approved.status, isApplyConflict ? 409 : 500, `${failureKind}: ${JSON.stringify(approved.body)}`);
+      const expectedCode = failureKind === 'apply' ? 'RECOVERY_APPLY_FAILED' : isApplyConflict ? 'RECOVERY_STALE' : isPartial ? 'ROLLBACK_PARTIAL' : 'FINALIZE_FAILED';
+      assert.equal(approved.body.error, expectedCode);
+      assert.equal(approved.body.message.includes(root), false);
+      assert.equal(approved.body.message.includes('TOPSECRET'), false);
+      const manifest = JSON.parse(await readFile(fixture.manifestPath, 'utf8'));
+      const message = failureKind === 'finalize' ? manifest.finalizeError.message : manifest.recoveryError.message;
+      assert.equal(message.includes(root), false);
+      assert.equal(message.includes('TOPSECRET'), false);
+      const eventType = failureKind === 'finalize' ? 'transaction.finalize_failed' : 'transaction.recovery_apply_failed';
+      const event = audit.events.find((item) => item.type === eventType);
+      assert.ok(event);
+      assert.equal(event.message.includes(root), false);
+      assert.equal(event.message.includes('TOPSECRET'), false);
+    } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test('控制面 recovery 在锁内发现磁盘清单被替换时拒绝执行', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-manifest-race-'));
+  const fixture = await createPendingRecoveryFixture(root, { transactionId: 'tx-manifest-race' });
+  const audit = { events: [], async append(event) {
+    this.events.push(event);
+    if (event.type === 'transaction.recovery.approved') {
+      await writeFile(fixture.manifestPath, JSON.stringify({ ...fixture.manifest, state: 'prepared' }));
+    }
+  } };
+  const app = createWorkbenchServer({ root, audit, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const approved = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 409, JSON.stringify(approved.body));
+    assert.equal(await readFile(fixture.target, 'utf8'), fixture.before.toString());
+    assert.equal(JSON.parse(await readFile(fixture.manifestPath, 'utf8')).state, 'prepared');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面 recovery 在审批审计期间文件状态变化时拒绝超出预览的 rollback', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-report-race-'));
+  const fixture = await createPendingRecoveryFixture(root, { transactionId: 'tx-report-race' });
+  const audit = { async append(event) {
+    if (event.type === 'transaction.recovery.approved') await writeFile(fixture.target, fixture.after);
+  } };
+  const app = createWorkbenchServer({ root, audit, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'rollback' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.equal(created.body.proposal.impact.files[0].effect, 'keep_before');
+    const approved = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 409, JSON.stringify(approved.body));
+    assert.equal(approved.body.error, 'RECOVERY_STALE');
+    assert.equal(await readFile(fixture.target, 'utf8'), fixture.after.toString());
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('Runtime 重启后旧 recovery proposal 不能执行或自动重放', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-restart-'));
+  const fixture = await createPendingRecoveryFixture(root, { transactionId: 'tx-restart' });
+  const first = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const firstAddress = await first.listen();
+  let proposalId;
+  try {
+    const created = await request(firstAddress, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    proposalId = created.body.proposal.action.id;
+  } finally { await first.close(); }
+
+  const restarted = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const restartedAddress = await restarted.listen();
+  try {
+    const current = await request(restartedAddress, '/v1/recovery');
+    assert.equal(current.body.transactions[0].decision, 'requires_approval');
+    assert.equal(current.body.transactions[0].proposal, undefined);
+    const replay = await request(restartedAddress, `/v1/recovery/proposals/${proposalId}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: '0'.repeat(64) }) });
+    assert.equal(replay.status, 404);
+    assert.equal(await readFile(fixture.target, 'utf8'), fixture.before.toString());
+  } finally { await restarted.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test('控制面提供 Patch Diff 只读预览并拒绝非 Patch 提案', async () => {

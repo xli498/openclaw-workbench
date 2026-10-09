@@ -146,6 +146,22 @@ select:disabled { color: var(--faint); }
 .operations-list-item small { color: var(--faint); display: block; font-size: 10px; margin-top: 3px; }
 .operations-list--events { max-height: 190px; overflow-y: auto; }
 .operations-list-empty { color: var(--faint); }
+.recovery-approval-note { background: rgba(226, 173, 61, .08); border-left: 2px solid var(--warning); color: var(--muted); font-size: 11px; line-height: 1.55; margin: 12px 0 0; padding: 8px 10px; }
+.recovery-transaction { background: rgba(255, 255, 255, .015); border: 1px solid rgba(37, 51, 74, .9); border-radius: 5px; margin-top: 10px; min-width: 0; padding: 12px; }
+.recovery-transaction__heading, .recovery-proposal__heading { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; }
+.recovery-transaction__heading > strong { color: var(--text); font-size: 11px; overflow-wrap: anywhere; }
+.recovery-transaction__summary { color: var(--muted); font-size: 10px; margin: 8px 0; overflow-wrap: anywhere; }
+.recovery-files { list-style: none; margin: 8px 0 0; padding: 0; }
+.recovery-file { align-items: flex-start; border-top: 1px solid rgba(37, 51, 74, .65); display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; padding: 7px 0; }
+.recovery-file code { color: var(--text); font: 10px/1.5 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+.recovery-file span { color: var(--muted); font-size: 10px; }
+.recovery-file--empty { color: var(--faint); font-size: 10px; }
+.recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.recovery-actions .button { width: auto; }
+.recovery-proposal { background: rgba(226, 173, 61, .05); border: 1px solid rgba(226, 173, 61, .28); border-radius: 4px; margin-top: 10px; padding: 10px; }
+.recovery-proposal__heading strong { color: var(--text); font-size: 11px; }
+.recovery-proposal__heading span { color: var(--warning); font-size: 10px; }
+.recovery-proposal .button { margin-top: 8px; width: auto; }
 .next-panel { align-items: center; background: #101a2a; border-left: 2px solid var(--accent-strong); display: flex; gap: 16px; margin-top: 14px; padding: 19px 22px; }
 .next-icon { color: var(--accent); font-size: 24px; font-weight: 300; }
 .next-panel h2 { font-size: 14px; margin-bottom: 5px; }

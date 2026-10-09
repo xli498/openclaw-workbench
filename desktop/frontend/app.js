@@ -79,6 +79,9 @@ let workMode = 'Ask';
 let planBusy = false;
 let codeProposalsState = [];
 let operationsBusy = false;
+let recoveryTransactions = [];
+let recoveryVisibleCount = 20;
+const RECOVERY_PAGE_SIZE = 20;
 
 function getStored(key) {
   try { return window.localStorage.getItem(key) ?? ''; } catch { return ''; }
@@ -157,13 +160,61 @@ function renderDiagnostics(payload) {
   }).join('') || '<div class="operations-list-empty">暂无诊断结果。</div>';
 }
 
+function recoveryDecisionLabel(item) {
+  if (item.decision === 'requires_approval') return '等待人工复核';
+  if (item.decision === 'blocked') return '已阻断';
+  if (item.decision === 'mark_committed') return '文件已完成，待收敛状态';
+  return item.decision || item.state || '未知';
+}
+
+function recoveryFileState(file) {
+  return file.currentMatchesAfter ? '当前已是新版本' : file.currentMatchesBefore ? '当前仍是原版本' : '当前状态与事务记录不一致';
+}
+
+function recoveryEffectLabel(effect) {
+  return ({
+    apply_after: '继续完成：应用已验证的新版本',
+    keep_after: '继续完成：保留已经写入的新版本',
+    restore_before: '回滚：从快照还原到原版本',
+    keep_before: '回滚：保留原版本，不改写文件'
+  })[effect] || '未知影响';
+}
+
+function renderRecoveryFileRows(files, impact = false) {
+  if (!Array.isArray(files) || !files.length) return '<li class="recovery-file recovery-file--empty">没有可展示的文件明细。</li>';
+  return files.map((file) => {
+    const status = impact ? recoveryEffectLabel(file.effect) : recoveryFileState(file);
+    return `<li class="recovery-file"><code>${escapeHtml(file.relativePath)}</code><span>${escapeHtml(status)}</span></li>`;
+  }).join('');
+}
+
 function renderRecovery(payload) {
-  const transactions = Array.isArray(payload?.transactions) ? payload.transactions : [];
+  recoveryTransactions = Array.isArray(payload?.transactions) ? payload.transactions : [];
+  const transactions = recoveryTransactions;
   const blocked = transactions.filter((item) => item.decision === 'blocked' || item.decision === 'requires_approval').length;
   recoveryState.textContent = transactions.length ? (blocked ? `${blocked} 项需处理` : '已检查') : '无待处理';
   recoveryState.className = `badge badge--${blocked ? 'warning' : 'success'}`;
   recoverySummary.textContent = transactions.length ? '重启后未完成动作不会自动重放，请人工复核。' : '当前没有待恢复事务。';
-  recoveryList.innerHTML = transactions.length ? transactions.slice(0, 20).map((item) => operationItem(item.transactionId || '事务', item.decision || item.state || '未知', item.reason || '')).join('') : '<div class="operations-list-empty">没有检测到待恢复事务。</div>';
+  const visibleTransactions = transactions.slice(0, recoveryVisibleCount);
+  const remaining = Math.max(0, transactions.length - visibleTransactions.length);
+  recoveryList.innerHTML = transactions.length ? visibleTransactions.map((item) => {
+    const transactionId = String(item.transactionId || '事务');
+    const proposals = Array.isArray(item.proposals) ? item.proposals : item.proposal ? [item.proposal] : [];
+    const proposedModes = new Set(proposals.map((proposal) => proposal.mode));
+    const files = Array.isArray(item.report?.files) ? item.report.files : [];
+    const proposalMarkup = proposals.map((proposal) => {
+      const action = proposal.action ?? {};
+      const impact = proposal.impact ?? action.preview ?? {};
+      const mode = proposal.mode === 'rollback' ? '回滚' : '继续完成';
+      return `<section class="recovery-proposal"><div class="recovery-proposal__heading"><strong>待批准：${escapeHtml(mode)}</strong><span>${escapeHtml(action.status || 'awaiting_approval')}</span></div><ul class="recovery-files">${renderRecoveryFileRows(impact.files, true)}</ul><button class="button button--small button--primary" type="button" data-recovery-action="approve" data-proposal-id="${escapeHtml(action.id)}" data-action-hash="${escapeHtml(action.actionHash)}">批准并执行恢复</button></section>`;
+    }).join('');
+    const proposalButtons = item.decision === 'requires_approval' ? [
+      item.canResume && !proposedModes.has('resume') ? `<button class="button button--small button--secondary" type="button" data-recovery-action="propose" data-transaction-id="${escapeHtml(transactionId)}" data-recovery-mode="resume">申请继续完成</button>` : '',
+      item.canRollback && !proposedModes.has('rollback') ? `<button class="button button--small button--secondary" type="button" data-recovery-action="propose" data-transaction-id="${escapeHtml(transactionId)}" data-recovery-mode="rollback">申请回滚</button>` : ''
+    ].filter(Boolean).join('') : '';
+    const currentFiles = files.length ? `<ul class="recovery-files">${renderRecoveryFileRows(files)}</ul>` : '';
+    return `<article class="recovery-transaction"><div class="recovery-transaction__heading"><strong>${escapeHtml(transactionId)}</strong><span class="badge badge--${item.decision === 'blocked' ? 'warning' : item.decision === 'requires_approval' ? 'warning' : 'muted'}">${escapeHtml(recoveryDecisionLabel(item))}</span></div><p class="recovery-transaction__summary">事务状态：${escapeHtml(item.state || '未知')}${item.reason ? ` · ${escapeHtml(item.reason)}` : ''}</p>${currentFiles}${proposalMarkup}${proposalButtons ? `<div class="recovery-actions">${proposalButtons}</div>` : ''}</article>`;
+  }).join('') + (remaining ? `<button class="button button--small button--secondary" type="button" data-recovery-show-more aria-controls="recovery-list" aria-label="显示其余 ${remaining} 项恢复事务">显示更多恢复事务（剩余 ${remaining} 项）</button>` : '') : '<div class="operations-list-empty">没有检测到待恢复事务。</div>';
 }
 
 function renderAudit(payload) {
@@ -208,6 +259,36 @@ async function refreshOperations() {
   } finally {
     operationsBusy = false;
     refreshOperationsButton.disabled = !runtimeReady;
+  }
+}
+
+async function handleRecoveryAction(button) {
+  if (!runtimeReady || !button) return;
+  const action = button.dataset.recoveryAction;
+  const transactionId = button.dataset.transactionId;
+  const mode = button.dataset.recoveryMode;
+  const proposalId = button.dataset.proposalId;
+  const actionHash = button.dataset.actionHash;
+  button.disabled = true;
+  try {
+    if (action === 'propose' && transactionId && (mode === 'resume' || mode === 'rollback')) {
+      await modelRequest('POST', `/v1/recovery/${encodeURIComponent(transactionId)}/proposals`, { mode }, false, { recoverRuntime: false });
+      await refreshOperations();
+      setFeedback(operationsFeedback, mode === 'resume' ? '已生成继续完成提案；请查看逐文件影响后再批准。' : '已生成回滚提案；请查看逐文件影响后再批准。', 'success');
+      return;
+    }
+    if (action === 'approve' && proposalId && actionHash) {
+      await modelRequest('POST', `/v1/recovery/proposals/${encodeURIComponent(proposalId)}/approve`, { actionHash }, true, { recoverRuntime: false });
+      await refreshOperations();
+      setFeedback(operationsFeedback, '恢复操作已完成；当前文件和审计记录已刷新。', 'success');
+      return;
+    }
+    throw new Error('恢复操作参数无效，请刷新状态后重试。');
+  } catch (error) {
+    await refreshOperations();
+    setFeedback(operationsFeedback, error.message || '恢复操作失败；未能确认执行结果，请检查当前状态。', 'error');
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -798,6 +879,16 @@ askMessageForm.addEventListener('submit', (event) => {
 });
 
 refreshOperationsButton.addEventListener('click', () => { void refreshOperations(); });
+recoveryList.addEventListener('click', (event) => {
+  const showMore = event.target.closest('[data-recovery-show-more]');
+  if (showMore) {
+    recoveryVisibleCount = Math.min(recoveryVisibleCount + RECOVERY_PAGE_SIZE, recoveryTransactions.length);
+    renderRecovery({ transactions: recoveryTransactions });
+    return;
+  }
+  const button = event.target.closest('[data-recovery-action]');
+  if (button) void handleRecoveryAction(button);
+});
 
 document.querySelector('#save-address').addEventListener('click', () => {
   const addressValue = addressInput.value.trim().replace(/\/$/, '');

@@ -16,7 +16,7 @@ import { createAction } from './action.mjs';
 import { AdapterError, createOpenClawAgentRunner, inspectOpenClaw, inspectOpenClawMcp } from './openclaw-adapter.mjs';
 import { createFileAuditLog } from './audit.mjs';
 import { PlanError } from './plan.mjs';
-import { RecoveryError, decideRecovery, inspectPendingTransaction, scanPendingTransactions } from './recovery.mjs';
+import { RecoveryError, decideRecovery, executeRecovery, inspectPendingTransaction, scanPendingTransactions } from './recovery.mjs';
 import { ConfigError, readConfig, importConfig, rollbackConfig, validateBackupId } from './config-store.mjs';
 import { snapshotDigest } from './snapshot-store.mjs';
 import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-registry.mjs';
@@ -37,6 +37,7 @@ const MAX_BODY_BYTES = 256 * 1024;
 const MAX_CONFIG_PROPOSALS = 32;
 const MAX_CONFIG_PROPOSAL_BYTES = 8 * 1024 * 1024;
 const MAX_MCP_PROPOSALS = 64;
+const MAX_RECOVERY_PROPOSALS = 32;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DECIMAL_INTEGER_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 const MODEL_HEALTH_CODES = new Set(['NOT_CONFIGURED', 'PROBE_OK', 'MODEL_HEALTH_FAILED', 'MODEL_PROTOCOL_UNSUPPORTED', 'MODEL_HTTP_STATUS', 'MODEL_RESPONSE_LIMIT', 'MODEL_RESPONSE_INVALID', 'MODEL_TIMEOUT', 'MODEL_ABORTED', 'MODEL_REQUEST_FAILED', 'SECRET_REF_INVALID', 'SECRET_NOT_FOUND', 'SECRET_PROVIDER_UNAVAILABLE', 'SECRET_PROVIDER_FAILED', 'SECRET_VALUE_INVALID']);
@@ -114,6 +115,34 @@ function safePlanFailures(failures) {
   });
 }
 
+function recoveryErrorMessage(error) {
+  const messages = {
+    RECOVERY_APPLY_FAILED: 'recovery application failed',
+    ROLLBACK_PARTIAL: 'recovery application failed',
+    FINALIZE_FAILED: 'recovery finalization failed',
+    SCAN_FAILED: 'transaction manifest could not be checked',
+    MANIFEST_INVALID: 'transaction manifest could not be checked',
+    MANIFEST_PATH_INVALID: 'transaction path is invalid',
+    RECOVERY_PATH_INVALID: 'transaction path is invalid',
+    RECOVERY_PATH_ESCAPE: 'transaction path is invalid',
+    RECOVERY_NOT_FOUND: 'transaction was not found',
+    RECOVERY_PROPOSAL_NOT_FOUND: 'recovery proposal was not found',
+    APPROVAL_REQUIRED: 'recovery requires explicit approval',
+    MODE_INVALID: 'recovery mode must be resume or rollback',
+    MANIFEST_CONFLICT: 'transaction manifest changed before recovery',
+    RECOVERY_STALE: 'transaction changed after the recovery proposal',
+    RECOVERY_BUSY: 'recovery transaction is already executing',
+    RECOVERY_PROPOSAL_BUSY: 'recovery proposal is already executing',
+    RECOVERY_BLOCKED: 'transaction is not eligible for recovery',
+    RESUME_NOT_APPLICABLE: 'resume is no longer applicable',
+    ROLLBACK_CONFLICT: 'transaction files are not in a known state',
+    RECOVERY_ACTION_HASH_MISMATCH: 'approval must bind the current recovery action hash',
+    RECOVERY_PROPOSAL_LIMIT: 'too many pending recovery proposals',
+    BUSY: 'workspace write lock is held',
+  };
+  return messages[error.code] ?? 'recovery request failed';
+}
+
 function errorResponse(error) {
   const safe = (code, message) => ({ error: code, message: message && message.length <= 256 && !/(?:authorization\s*:\s*bearer|bearer\s+|cookie\s*[:=]|credential\s*[:=]|token|password|secret|api[_ -]?key)\s*[^\s,;]*|[A-Za-z]:[\\/]|https?:\/\//i.test(message) ? message : 'request failed' });
   if (error instanceof WorkflowError) return { status: error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
@@ -131,7 +160,10 @@ function errorResponse(error) {
   if (error instanceof WorkspaceError) return { status: ['INVALID_PATH', 'PATH_ESCAPE', 'SENSITIVE_PATH', 'INTERNAL_PATH', 'SYMLINK_ESCAPE', 'NOT_A_FILE', 'READ_LIMIT', 'READ_RACE', 'TREE_LIMIT'].includes(error.code) ? 400 : 404, body: safe(error.code, error.message) };
   if (error instanceof ToolRegistryError) return { status: ['TOOL_BATCH_LIMIT', 'TOOL_OUTPUT_LIMIT', 'TOOL_ARGUMENT_LIMIT'].includes(error.code) ? 413 : ['TOOL_NOT_ALLOWED', 'TOOL_MODE_DENIED'].includes(error.code) ? 403 : error.code === 'TOOL_EXECUTION_FAILED' ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof AgentLoopError) return { status: ['AGENT_LOOP_ABORTED'].includes(error.code) ? 409 : ['TOOL_OUTPUT_LIMIT', 'TOOL_ARGUMENT_LIMIT'].includes(error.code) ? 413 : ['TOOL_NOT_ALLOWED', 'TOOL_MODE_DENIED'].includes(error.code) ? 403 : 400, body: safe(error.code, error.message) };
-  if (error instanceof RecoveryError) return { status: ['SCAN_FAILED', 'MANIFEST_INVALID'].includes(error.code) ? 500 : 400, body: safe(error.code, error.message) };
+  if (error instanceof RecoveryError) return {
+    status: ['SCAN_FAILED', 'MANIFEST_INVALID', 'RECOVERY_APPLY_FAILED', 'ROLLBACK_PARTIAL', 'FINALIZE_FAILED'].includes(error.code) ? 500 : ['RECOVERY_NOT_FOUND', 'RECOVERY_PROPOSAL_NOT_FOUND'].includes(error.code) ? 404 : ['APPROVAL_REQUIRED'].includes(error.code) ? 403 : ['MANIFEST_CONFLICT', 'RECOVERY_CONFLICT', 'RECOVERY_ACTION_HASH_MISMATCH', 'RECOVERY_BUSY', 'RECOVERY_PROPOSAL_BUSY', 'RECOVERY_STALE', 'RECOVERY_BLOCKED', 'RESUME_NOT_APPLICABLE', 'ROLLBACK_CONFLICT', 'BUSY'].includes(error.code) ? 409 : error.code === 'RECOVERY_PROPOSAL_LIMIT' ? 429 : 400,
+    body: safe(error.code, recoveryErrorMessage(error)),
+  };
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
@@ -194,6 +226,31 @@ function publicModelProposal(proposal) {
   return { action: proposal.action, profile: proposal.profile, ...(proposal.operation ? { operation: proposal.operation } : {}) };
 }
 
+function recoveryModeApplicable(mode, report) {
+  if (mode === 'resume') return report.files.every((file) => file.currentMatchesAfter || (file.currentMatchesBefore && file.tempAvailable && file.tempMatchesAfter));
+  if (mode === 'rollback') return report.files.every((file) => file.currentMatchesBefore || file.currentMatchesAfter);
+  return false;
+}
+
+function recoveryImpact(transactionId, state, mode, report) {
+  return Object.freeze({
+    transactionId,
+    state,
+    mode,
+    files: Object.freeze(report.files.map((file) => {
+      const currentState = file.currentMatchesAfter ? 'after' : file.currentMatchesBefore ? 'before' : 'unknown';
+      const effect = mode === 'resume'
+        ? currentState === 'after' ? 'keep_after' : 'apply_after'
+        : currentState === 'before' ? 'keep_before' : 'restore_before';
+      return Object.freeze({ relativePath: file.relativePath, currentState, effect });
+    })),
+  });
+}
+
+function publicRecoveryProposal(proposal) {
+  return { action: proposal.action, mode: proposal.mode, impact: proposal.impact };
+}
+
 const MODEL_TERMINAL_STATUSES = new Set(['verified', 'failed', 'timed_out', 'cancelled', 'denied']);
 
 function publicStoredModelProposal(record) {
@@ -236,6 +293,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const proposals = new Map();
   const configProposals = new Map();
   const configReservations = new Map();
+  const recoveryProposals = new Map();
+  const recoveryReservations = new Set();
+  const recoveryProposalLimit = __testHooks?.recoveryProposalLimit ?? MAX_RECOVERY_PROPOSALS;
+  const recoveryClaims = new Set();
   const mcpProposals = new Map();
   const mcpReservations = new Set();
   const mcpClaims = new Set();
@@ -714,12 +775,114 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           try {
             const report = await inspectPendingTransaction({ root, manifest });
             const decision = decideRecovery(report);
-            transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: decision.decision, reason: decision.reason ?? null, states: decision.states, report });
+            const proposals = [...recoveryProposals.values()]
+              .filter((proposal) => proposal.transactionId === manifest.transactionId)
+              .map(publicRecoveryProposal);
+            transactions.push({
+              transactionId: manifest.transactionId,
+              state: manifest.state,
+              decision: decision.decision,
+              reason: decision.reason ?? null,
+              states: decision.states,
+              canResume: decision.decision === 'requires_approval' && recoveryModeApplicable('resume', report),
+              canRollback: decision.decision === 'requires_approval' && recoveryModeApplicable('rollback', report),
+              report,
+              ...(proposals.length ? { proposal: proposals[0], proposals } : {}),
+            });
           } catch (error) {
-            transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: 'blocked', reason: error.code ?? 'RECOVERY_INSPECTION_FAILED', invalid: { code: error.code ?? 'RECOVERY_INSPECTION_FAILED', message: String(error.message ?? 'recovery inspection failed').slice(0, 512) } });
+            const code = typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'RECOVERY_INSPECTION_FAILED';
+            transactions.push({ transactionId: manifest.transactionId, state: manifest.state, decision: 'blocked', reason: code, invalid: { code, message: recoveryErrorMessage(error) } });
           }
         }
         return json(response, 200, { transactions });
+      }
+      const recoveryProposalRoute = url.pathname.match(/^\/v1\/recovery\/([^/]+)\/proposals$/);
+      if (request.method === 'POST' && recoveryProposalRoute) {
+        let transactionId;
+        try { transactionId = decodeURIComponent(recoveryProposalRoute[1]); }
+        catch { throw new RecoveryError('RECOVERY_NOT_FOUND', 'transaction was not found'); }
+        const input = await bodyOf(request);
+        if (input.mode !== 'resume' && input.mode !== 'rollback') throw new RecoveryError('MODE_INVALID', 'recovery mode must be resume or rollback');
+        const manifests = await scanPendingTransactions({ root, tolerateInvalid: true });
+        const manifest = manifests.find((item) => item.transactionId === transactionId);
+        if (!manifest) return json(response, 404, { error: 'RECOVERY_NOT_FOUND', message: 'pending transaction was not found' });
+        if (manifest.invalid) throw new RecoveryError('RECOVERY_BLOCKED', 'transaction manifest is invalid');
+        const report = await inspectPendingTransaction({ root, manifest });
+        const decision = decideRecovery(report);
+        if (decision.decision !== 'requires_approval') throw new RecoveryError('RECOVERY_BLOCKED', decision.reason ?? 'transaction is not awaiting recovery approval');
+        if (!recoveryModeApplicable(input.mode, report)) throw new RecoveryError(input.mode === 'resume' ? 'RESUME_NOT_APPLICABLE' : 'ROLLBACK_CONFLICT', 'transaction files no longer match the selected recovery operation');
+        await __testHooks?.beforeRecoveryCapacityCheck?.();
+        if (recoveryProposals.size + recoveryReservations.size >= recoveryProposalLimit) throw new RecoveryError('RECOVERY_PROPOSAL_LIMIT', 'too many pending recovery proposals');
+        const reservationId = randomUUID();
+        recoveryReservations.add(reservationId);
+        try {
+          const impact = recoveryImpact(transactionId, manifest.state, input.mode, report);
+          const reportHash = snapshotDigest(JSON.stringify(report));
+          const workspaceRevision = snapshotDigest(JSON.stringify({ manifestHash: manifest.manifestHash, reportHash }));
+          const action = transition(transition(createAction({
+            type: `recovery.${input.mode}`,
+            sessionId: 'recovery',
+            workspaceRevision,
+            target: transactionId,
+            preview: impact,
+            risk: 'high',
+          }), 'inspected'), 'awaiting_approval');
+          const proposal = Object.freeze({
+            action,
+            transactionId,
+            manifestPath: manifest.manifestPath,
+            manifestHash: manifest.manifestHash,
+            reportHash,
+            mode: input.mode,
+            impact,
+          });
+          await effectiveAudit?.append?.({ type: 'transaction.recovery.proposed', actor: 'user', actionId: action.id, actionHash: action.actionHash, transactionId, operation: input.mode, files: impact.files.map((file) => file.relativePath) });
+          recoveryProposals.set(action.id, proposal);
+          return json(response, 201, { proposal: publicRecoveryProposal(proposal) });
+        } finally {
+          recoveryReservations.delete(reservationId);
+        }
+      }
+      const recoveryApprovalRoute = url.pathname.match(/^\/v1\/recovery\/proposals\/([^/]+)\/approve$/);
+      if (request.method === 'POST' && recoveryApprovalRoute) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        let proposalId;
+        try { proposalId = decodeURIComponent(recoveryApprovalRoute[1]); }
+        catch { return json(response, 404, { error: 'RECOVERY_PROPOSAL_NOT_FOUND', message: 'recovery proposal was not found' }); }
+        const proposal = recoveryProposals.get(proposalId);
+        if (!proposal) return json(response, 404, { error: 'RECOVERY_PROPOSAL_NOT_FOUND', message: 'recovery proposal was not found' });
+        const input = await bodyOf(request);
+        if (input.actionHash !== proposal.action.actionHash) throw new RecoveryError('RECOVERY_ACTION_HASH_MISMATCH', 'approval must bind the current recovery action hash');
+        if (recoveryClaims.has(proposal.transactionId)) throw new RecoveryError('RECOVERY_BUSY', 'recovery transaction is already executing');
+        recoveryClaims.add(proposal.transactionId);
+        try {
+          const manifests = await scanPendingTransactions({ root, tolerateInvalid: true });
+          const manifest = manifests.find((item) => item.transactionId === proposal.transactionId);
+          if (!manifest || manifest.invalid || manifest.manifestPath !== proposal.manifestPath || manifest.manifestHash !== proposal.manifestHash) {
+            throw new RecoveryError('RECOVERY_STALE', 'transaction changed after the recovery proposal');
+          }
+          const report = await inspectPendingTransaction({ root, manifest });
+          const decision = decideRecovery(report);
+          if (decision.decision !== 'requires_approval' || !recoveryModeApplicable(proposal.mode, report) || snapshotDigest(JSON.stringify(report)) !== proposal.reportHash) {
+            throw new RecoveryError('RECOVERY_STALE', 'transaction files changed after the recovery proposal');
+          }
+          const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
+          await effectiveAudit?.append?.({ type: 'transaction.recovery.approved', actor: 'user', actionId: approved.id, actionHash: approved.actionHash, transactionId: proposal.transactionId, operation: proposal.mode, files: proposal.impact.files.map((file) => file.relativePath) });
+          const result = await executeRecovery({ root, manifest, manifestPath: proposal.manifestPath, expectedManifestHash: proposal.manifestHash, expectedReportHash: proposal.reportHash, mode: proposal.mode, approved: true, audit: effectiveAudit, renameFile: __testHooks?.recoveryRenameFile, updateManifest: __testHooks?.recoveryUpdateManifest });
+          const executing = transition(approved, 'executing');
+          const verified = transition(executing, 'verified');
+          for (const [id, item] of recoveryProposals) if (item.transactionId === proposal.transactionId) recoveryProposals.delete(id);
+          let verifiedAuditWritten = true;
+          try { await effectiveAudit?.append?.({ type: 'transaction.recovery.verified', actor: 'system', actionId: verified.id, actionHash: verified.actionHash, transactionId: proposal.transactionId, operation: proposal.mode, state: result.state, files: proposal.impact.files.map((file) => file.relativePath) }); }
+          catch { verifiedAuditWritten = false; }
+          return json(response, 200, { action: verified, recovery: { transactionId: result.transactionId, mode: result.mode, state: result.state, auditWritten: result.auditWritten !== false && verifiedAuditWritten } });
+        } catch (error) {
+          recoveryProposals.delete(proposal.action.id);
+          try { await effectiveAudit?.append?.({ type: 'transaction.recovery.failed', actor: 'system', actionId: proposal.action.id, actionHash: proposal.action.actionHash, transactionId: proposal.transactionId, operation: proposal.mode, code: error.code ?? 'RECOVERY_FAILED' }); } catch { /* preserve the recovery error */ }
+          throw error;
+        } finally {
+          recoveryClaims.delete(proposal.transactionId);
+        }
       }
       if (request.method === 'GET' && url.pathname === '/v1/commands') {
         const sessionId = url.searchParams.get('sessionId');
