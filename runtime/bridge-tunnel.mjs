@@ -106,6 +106,7 @@ export function createBridgeTunnelAdapter({
     const target = `http://127.0.0.1:${localPort}/${routePath}`;
     if (provider === 'cloudflare-named') return ['tunnel', 'run', namedTunnel, ...args];
     if (provider === 'ngrok-fixed') return ['http', '--domain', fixedHostname, `127.0.0.1:${localPort}`, ...args];
+    if (provider === 'ngrok') return ['http', `127.0.0.1:${localPort}`, ...args];
     return [...args, '--url', target];
   }
   function consumeOutput(data) {

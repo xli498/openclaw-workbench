@@ -65,6 +65,14 @@ test('ngrok fixed-domain mode rejects a provider URL that does not match the con
   await assert.rejects(() => adapter.start(), { code: 'TUNNEL_URL_TIMEOUT' });
 });
 
+test('ngrok ephemeral mode uses the ngrok HTTP subcommand and local target', async () => {
+  const { adapter, calls } = providerSetup({ provider: 'ngrok', command: 'ngrok', tunnelName: undefined, publicUrl: 'https://random.ngrok.app' });
+  const result = await adapter.start();
+  assert.equal(result.state, 'ready');
+  assert.deepEqual(calls[0].args.slice(0, 2), ['http', '127.0.0.1:43123']);
+  await adapter.stop();
+});
+
 test('provider list exposes all explicit tunnel variants', async () => {
   const { BRIDGE_TUNNEL_PROVIDERS } = await import('../runtime/bridge-tunnel.mjs');
   assert.deepEqual([...BRIDGE_TUNNEL_PROVIDERS].sort(), ['cloudflare-named', 'cloudflare-quick', 'ngrok', 'ngrok-fixed']);
