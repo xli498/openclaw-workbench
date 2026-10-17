@@ -35,6 +35,7 @@ $runtimeProcess = $null
 $desktopProcess = $null
 $credentialCleanupFailed = $false
 $smokeSucceeded = $false
+$msiDiagnosticsPath = Join-Path $env:RUNNER_TEMP 'msi-uninstall.diagnostics.txt'
 
 if (-not ('OpenClawInstallerSmokeCredential' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -94,6 +95,28 @@ function Get-MsiProductCode([string]$Path) {
   }
 }
 
+function Write-MsiTimeoutDiagnostics([string]$Path) {
+  try {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("Captured at $([DateTime]::UtcNow.ToString('O'))")
+    $lines.Add('--- msiexec processes ---')
+    Get-CimInstance Win32_Process -Filter "Name = 'msiexec.exe'" -ErrorAction SilentlyContinue |
+      Select-Object ProcessId, ParentProcessId, CommandLine, ExecutablePath |
+      Format-List | Out-String | ForEach-Object { $lines.Add($_.TrimEnd()) }
+    $lines.Add('--- Windows Installer service ---')
+    Get-Service -Name msiserver -ErrorAction SilentlyContinue |
+      Select-Object Name, Status, StartType |
+      Format-List | Out-String | ForEach-Object { $lines.Add($_.TrimEnd()) }
+    $lines.Add('--- recent MsiInstaller events ---')
+    Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; StartTime = (Get-Date).AddMinutes(-15) } -MaxEvents 50 -ErrorAction SilentlyContinue |
+      Select-Object TimeCreated, Id, LevelDisplayName, Message |
+      Format-List | Out-String | ForEach-Object { $lines.Add($_.TrimEnd()) }
+    Set-Content -LiteralPath $Path -Value $lines
+  } catch {
+    Set-Content -LiteralPath $Path -Value "Diagnostic collection failed: $($_.Exception.Message)"
+  }
+}
+
 function Invoke-InstallerProcess([string]$FilePath, [string[]]$Arguments, [string]$Operation, [AllowNull()][string]$RawArguments = $null, [int]$TimeoutSeconds = 180, [AllowNull()][string]$FailureLogPath = $null) {
   $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
   $startInfo.FileName = $FilePath
@@ -139,7 +162,12 @@ function Invoke-InstallerUninstall {
     $productCode = Get-MsiProductCode $installer.FullName
     $logPath = Join-Path $env:RUNNER_TEMP 'msi-uninstall.log'
     Set-Content -LiteralPath $logPath -Value "Starting MSI uninstall for product $productCode at $([DateTime]::UtcNow.ToString('O'))." -NoNewline
-    $exitCode = Invoke-InstallerProcess -FilePath 'msiexec.exe' -Arguments @('/x', $productCode, '/qn', '/norestart', '/L*V!+', $logPath) -Operation "$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath $logPath
+    try {
+      $exitCode = Invoke-InstallerProcess -FilePath 'msiexec.exe' -Arguments @('/x', $productCode, '/qn', '/norestart', '/L*V!+', $logPath) -Operation "$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath $logPath
+    } catch {
+      Write-MsiTimeoutDiagnostics $msiDiagnosticsPath
+      throw
+    }
   } else {
     $uninstaller = Get-ChildItem -LiteralPath $installRoot -File -Filter '*.exe' -Recurse |
       Where-Object { $_.Name -match '^un(?:inst|ins|install).*\.exe$' } |

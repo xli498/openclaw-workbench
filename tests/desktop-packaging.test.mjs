@@ -126,6 +126,10 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(smoke, /'\/L\*V!\+', \$logPath/);
   assert.match(smoke, /TimeoutSeconds 600/);
   assert.match(smoke, /FailureLogPath/);
+  assert.match(smoke, /Write-MsiTimeoutDiagnostics/);
+  assert.match(smoke, /msi-uninstall\.diagnostics\.txt/);
+  assert.match(smoke, /Get-CimInstance Win32_Process/);
+  assert.match(smoke, /Get-WinEvent/);
   assert.match(smoke, /-Operation "\$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath \$logPath/);
   assert.match(smoke, /if \(\$smokeSucceeded -and \(Test-Path -LiteralPath \$testRoot\)\)/);
   assert.doesNotMatch(smoke, /if \(\$uninstalled -and \(Test-Path -LiteralPath \$testRoot\)\)/);

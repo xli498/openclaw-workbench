@@ -114,6 +114,7 @@ jobs:
           name: windows-installer-smoke-diagnostics
           path: |
             ${{ runner.temp }}/msi-uninstall.log
+            ${{ runner.temp }}/msi-uninstall.diagnostics.txt
             ${{ runner.temp }}/OpenClaw Workbench installer packages/*.msi
           if-no-files-found: ignore
           retention-days: 3
