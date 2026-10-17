@@ -84,6 +84,27 @@ jobs:
           if ($msi.Count -ne 1 -or $nsis.Count -ne 1) { throw "Expected exactly one MSI and one NSIS installer" }
           if (($msi | Measure-Object -Property Length -Minimum).Minimum -le 0) { throw "MSI is empty" }
           if (($nsis | Measure-Object -Property Length -Minimum).Minimum -le 0) { throw "NSIS installer is empty" }
+      - name: Run Windows installer lifecycle smoke
+        shell: pwsh
+        run: |
+          $msi = @(Get-ChildItem -Path "desktop/target/release/bundle/msi" -Filter "*.msi" -File)
+          $nsis = @(Get-ChildItem -Path "desktop/target/release/bundle/nsis" -Filter "*.exe" -File)
+          if ($msi.Count -ne 1 -or $nsis.Count -ne 1) { throw "Expected one MSI and one NSIS installer for smoke tests" }
+
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'OpenClaw Workbench installer packages'
+          try {
+            New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+            $msiPath = Join-Path $packageRoot $msi[0].Name
+            $nsisPath = Join-Path $packageRoot $nsis[0].Name
+            Copy-Item -LiteralPath $msi[0].FullName -Destination $msiPath
+            Copy-Item -LiteralPath $nsis[0].FullName -Destination $nsisPath
+
+            $smoke = Join-Path $env:GITHUB_WORKSPACE 'scripts/windows-installer-smoke.ps1'
+            & $smoke -InstallerType 'msi' -InstallerPath $msiPath
+            & $smoke -InstallerType 'nsis' -InstallerPath $nsisPath
+          } finally {
+            if (Test-Path -LiteralPath $packageRoot) { Remove-Item -LiteralPath $packageRoot -Recurse -Force }
+          }
       - name: Upload Windows installers
         uses: actions/upload-artifact@v4
         with:

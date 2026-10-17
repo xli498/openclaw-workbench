@@ -56,16 +56,22 @@ the selected project. A failed or interrupted uninstall must not be treated as
 proof that cleanup succeeded.
 
 The Windows CI job verifies the MSI and NSIS files exist and that the package
-metadata is internally consistent. This is a contract check, not a GUI
-installation test. Real clean-install, upgrade, and uninstall verification
-must still be run on an isolated Windows machine with a disposable workspace;
-the release checklist is:
+metadata is internally consistent. It then copies each installer to a path
+containing spaces and, sequentially on the ephemeral runner, installs it into
+a separate temporary path that also contains spaces. The lifecycle smoke
+launches the installed desktop app, starts the bundled Node runtime against a
+disposable workspace, checks its authenticated health endpoint, writes an
+isolated test credential, uninstalls the app, and confirms the workspace and
+Credential Manager entry remain. The test credential and temporary files are
+removed afterward. This is an automated install/runtime/uninstall smoke test;
+it does not cover upgrading an earlier installation or exercising the full UI.
 
-1. Install the MSI and confirm the app opens, the bundled `runtime/node/node.exe`
-   starts, and no API key appears in the install directory or logs.
-2. Install a newer version over the same installation and confirm the workspace
+Upgrade verification must still be run on an isolated Windows machine with a
+disposable workspace; the remaining release checklist is:
+
+1. Install a newer version over the same installation and confirm the workspace
    selection, Credential Manager entry, and runtime health survive the upgrade.
-3. Uninstall from Windows Settings or the NSIS uninstaller, confirm the app and
+2. Uninstall from Windows Settings or the NSIS uninstaller, confirm the app and
    runtime files are gone, then confirm the workspace and Credential Manager
    entry remain until the user explicitly removes them.
 

@@ -75,3 +75,47 @@ test('installer lifecycle docs keep user data and credentials outside the bundle
   assert.match(docs, /workspace|工作区/);
   assert.match(docs, /uninstall.*(?:workspace|user data)|卸载.*(?:工作区|用户数据)/is);
 });
+
+test('Windows CI exercises installed app, bundled runtime, and uninstall for both installer formats', async () => {
+  const workflow = await readFile(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const smokePath = path.join(repoRoot, 'scripts', 'windows-installer-smoke.ps1');
+  const smoke = await readFile(smokePath, 'utf8');
+
+  const smokeStep = workflow.indexOf('Run Windows installer lifecycle smoke');
+  const uploadStep = workflow.indexOf('Upload Windows installers');
+  assert.ok(smokeStep >= 0 && uploadStep > smokeStep, 'installer smoke must pass before artifacts are published');
+  const smokeWorkflow = workflow.slice(smokeStep, uploadStep);
+  assert.match(smokeWorkflow, /try\s*\{[\s\S]*New-Item -ItemType Directory -Path \$packageRoot[\s\S]*finally\s*\{/);
+  const packageCopyTry = smokeWorkflow.indexOf('try {');
+  const packageCopyFinally = smokeWorkflow.indexOf('} finally {', packageCopyTry);
+  const copiedMsi = smokeWorkflow.indexOf('Copy-Item -LiteralPath $msi[0].FullName');
+  const copiedNsis = smokeWorkflow.indexOf('Copy-Item -LiteralPath $nsis[0].FullName');
+  assert.ok(packageCopyTry >= 0 && packageCopyFinally > packageCopyTry, 'package copy cleanup must have a try/finally boundary');
+  assert.ok(copiedMsi > packageCopyTry && copiedMsi < packageCopyFinally, 'MSI copy must be inside the package cleanup boundary');
+  assert.ok(copiedNsis > packageCopyTry && copiedNsis < packageCopyFinally, 'NSIS copy must be inside the package cleanup boundary');
+  assert.match(workflow, /scripts[\\/]windows-installer-smoke\.ps1/);
+  assert.match(workflow, /finally\s*\{[\s\S]*?Remove-Item -LiteralPath \$packageRoot -Recurse -Force/);
+  assert.match(smoke, /GITHUB_ACTIONS/);
+  assert.match(smoke, /OpenClaw Workbench installer smoke-/i);
+  assert.match(smoke, /msiexec\.exe/);
+  assert.match(smoke, /\/S/);
+  assert.match(smoke, /runtime[\\/]node[\\/]node\.exe/);
+  assert.match(smoke, /runtime[\\/]bin[\\/]workbench\.mjs/);
+  assert.match(smoke, /\/health/);
+  assert.match(smoke, /\/v1\/shutdown/);
+  assert.match(smoke, /CredReadW/);
+  assert.match(smoke, /CredDeleteW/);
+  assert.match(smoke, /\.ArgumentList\.Add/);
+  assert.match(smoke, /RawArguments/);
+  assert.match(smoke, /startInfo\.Arguments = \$RawArguments/);
+  assert.match(smoke, /INSTALLDIR=`"\$installRoot`"/);
+  assert.match(smoke, /"\/S \/D=\$installRoot"/);
+  assert.match(smoke, /if \(-not \('OpenClawInstallerSmokeCredential' -as \[type\]\)\)/);
+  assert.match(smoke, /function Get-InstalledDesktopExecutable/);
+  assert.match(smoke, /un\(\?:inst\|ins\|install\)/);
+  assert.match(smoke, /Get-ChildItem -LiteralPath \$installRoot -File -Filter '\*\.exe'/);
+  assert.match(smoke, /uninstall left the bundled Node runtime behind/);
+  assert.match(smoke, /uninstall left the bundled Runtime behind/);
+  assert.match(smoke, /installer smoke/);
+  assert.match(smoke, /finally/i);
+});
