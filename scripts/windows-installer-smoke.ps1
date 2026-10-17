@@ -94,7 +94,7 @@ function Get-MsiProductCode([string]$Path) {
   }
 }
 
-function Invoke-InstallerProcess([string]$FilePath, [string[]]$Arguments, [string]$Operation, [AllowNull()][string]$RawArguments = $null) {
+function Invoke-InstallerProcess([string]$FilePath, [string[]]$Arguments, [string]$Operation, [AllowNull()][string]$RawArguments = $null, [int]$TimeoutSeconds = 180, [AllowNull()][string]$FailureLogPath = $null) {
   $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
   $startInfo.FileName = $FilePath
   $startInfo.UseShellExecute = $false
@@ -108,8 +108,11 @@ function Invoke-InstallerProcess([string]$FilePath, [string[]]$Arguments, [strin
   $process = $null
   try {
     $process = [System.Diagnostics.Process]::Start($startInfo)
-    if (-not $process.WaitForExit(180000)) {
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
       $process.Kill($true)
+      if ($FailureLogPath -and (Test-Path -LiteralPath $FailureLogPath -PathType Leaf)) {
+        throw "$Operation timed out; diagnostic log retained at: $FailureLogPath"
+      }
       throw "$Operation timed out."
     }
     return $process.ExitCode
@@ -133,7 +136,8 @@ function Invoke-InstallerInstall {
 function Invoke-InstallerUninstall {
   if ($InstallerType -eq 'msi') {
     $productCode = Get-MsiProductCode $installer.FullName
-    $exitCode = Invoke-InstallerProcess -FilePath 'msiexec.exe' -Arguments @('/x', $productCode, '/qn', '/norestart') -Operation "$InstallerType uninstall"
+    $logPath = Join-Path $testRoot 'msi-uninstall.log'
+    $exitCode = Invoke-InstallerProcess -FilePath 'msiexec.exe' -Arguments @('/x', $productCode, '/qn', '/norestart', '/L*V', $logPath) -Operation "$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath $logPath
   } else {
     $uninstaller = Get-ChildItem -LiteralPath $installRoot -File -Filter '*.exe' -Recurse |
       Where-Object { $_.Name -match '^un(?:inst|ins|install).*\.exe$' } |
@@ -231,7 +235,7 @@ try {
       $credentialCleanupFailed = $true
     }
   }
-  if ($uninstalled -and (Test-Path -LiteralPath $testRoot)) {
+  if ($smokeSucceeded -and (Test-Path -LiteralPath $testRoot)) {
     Remove-Item -LiteralPath $testRoot -Recurse -Force
   } elseif (Test-Path -LiteralPath $workspace) {
     Remove-Item -LiteralPath $workspace -Recurse -Force

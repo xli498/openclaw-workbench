@@ -105,6 +105,14 @@ jobs:
           } finally {
             if (Test-Path -LiteralPath $packageRoot) { Remove-Item -LiteralPath $packageRoot -Recurse -Force }
           }
+      - name: Upload Windows installer smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-smoke-diagnostics
+          path: ${{ runner.temp }}/OpenClaw Workbench installer smoke-*/msi-uninstall.log
+          if-no-files-found: ignore
+          retention-days: 3
       - name: Upload Windows installers
         uses: actions/upload-artifact@v4
         with:
