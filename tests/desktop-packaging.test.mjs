@@ -130,12 +130,14 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(smoke, /msi-uninstall\.diagnostics\.txt/);
   assert.match(smoke, /Get-CimInstance Win32_Process/);
   assert.match(smoke, /Get-WinEvent/);
+  assert.match(smoke, /if \(\$Operation -eq 'msi uninstall'\) \{\s*Write-MsiTimeoutDiagnostics \$msiDiagnosticsPath \$process\.Id\s*\}\s*\$process\.Kill\(\$true\)/);
   assert.match(smoke, /-Operation "\$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath \$logPath/);
   assert.match(smoke, /if \(\$smokeSucceeded -and \(Test-Path -LiteralPath \$testRoot\)\)/);
   assert.doesNotMatch(smoke, /if \(\$uninstalled -and \(Test-Path -LiteralPath \$testRoot\)\)/);
   const diagnosticsWorkflow = workflow.slice(diagnosticsStep, uploadStep);
   assert.match(diagnosticsWorkflow, /if:\s*failure\(\)/);
   assert.match(diagnosticsWorkflow, /\$\{\{\s*runner\.temp\s*\}\}\/msi-uninstall\.log/);
+  assert.match(diagnosticsWorkflow, /\$\{\{\s*runner\.temp\s*\}\}\/msi-uninstall\.diagnostics\.txt/);
   assert.match(diagnosticsWorkflow, /\$\{\{\s*runner\.temp\s*\}\}\/OpenClaw Workbench installer packages\/\*\.msi/);
   assert.match(smokeWorkflow, /& \$smoke -InstallerType 'nsis' -InstallerPath \$nsisPath\s+\$smokeSucceeded = \$true/);
   assert.match(smokeWorkflow, /if \(\$smokeSucceeded -and \(Test-Path -LiteralPath \$packageRoot\)\)/);
