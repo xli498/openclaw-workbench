@@ -92,6 +92,7 @@ jobs:
           if ($msi.Count -ne 1 -or $nsis.Count -ne 1) { throw "Expected one MSI and one NSIS installer for smoke tests" }
 
           $packageRoot = Join-Path $env:RUNNER_TEMP 'OpenClaw Workbench installer packages'
+          $smokeSucceeded = $false
           try {
             New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
             $msiPath = Join-Path $packageRoot $msi[0].Name
@@ -102,15 +103,18 @@ jobs:
             $smoke = Join-Path $env:GITHUB_WORKSPACE 'scripts/windows-installer-smoke.ps1'
             & $smoke -InstallerType 'msi' -InstallerPath $msiPath
             & $smoke -InstallerType 'nsis' -InstallerPath $nsisPath
+            $smokeSucceeded = $true
           } finally {
-            if (Test-Path -LiteralPath $packageRoot) { Remove-Item -LiteralPath $packageRoot -Recurse -Force }
+            if ($smokeSucceeded -and (Test-Path -LiteralPath $packageRoot)) { Remove-Item -LiteralPath $packageRoot -Recurse -Force }
           }
       - name: Upload Windows installer smoke diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer-smoke-diagnostics
-          path: ${{ runner.temp }}/OpenClaw Workbench installer smoke-*/msi-uninstall.log
+          path: |
+            ${{ runner.temp }}/msi-uninstall.log
+            ${{ runner.temp }}/OpenClaw Workbench installer packages/*.msi
           if-no-files-found: ignore
           retention-days: 3
       - name: Upload Windows installers

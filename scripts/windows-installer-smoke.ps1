@@ -110,6 +110,7 @@ function Invoke-InstallerProcess([string]$FilePath, [string[]]$Arguments, [strin
     $process = [System.Diagnostics.Process]::Start($startInfo)
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
       $process.Kill($true)
+      [void]$process.WaitForExit(10000)
       if ($FailureLogPath -and (Test-Path -LiteralPath $FailureLogPath -PathType Leaf)) {
         throw "$Operation timed out; diagnostic log retained at: $FailureLogPath"
       }
@@ -136,8 +137,9 @@ function Invoke-InstallerInstall {
 function Invoke-InstallerUninstall {
   if ($InstallerType -eq 'msi') {
     $productCode = Get-MsiProductCode $installer.FullName
-    $logPath = Join-Path $testRoot 'msi-uninstall.log'
-    $exitCode = Invoke-InstallerProcess -FilePath 'msiexec.exe' -Arguments @('/x', $productCode, '/qn', '/norestart', '/L*V', $logPath) -Operation "$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath $logPath
+    $logPath = Join-Path $env:RUNNER_TEMP 'msi-uninstall.log'
+    Set-Content -LiteralPath $logPath -Value "Starting MSI uninstall for product $productCode at $([DateTime]::UtcNow.ToString('O'))." -NoNewline
+    $exitCode = Invoke-InstallerProcess -FilePath 'msiexec.exe' -Arguments @('/x', $productCode, '/qn', '/norestart', '/L*V!+', $logPath) -Operation "$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath $logPath
   } else {
     $uninstaller = Get-ChildItem -LiteralPath $installRoot -File -Filter '*.exe' -Recurse |
       Where-Object { $_.Name -match '^un(?:inst|ins|install).*\.exe$' } |

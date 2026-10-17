@@ -86,7 +86,8 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   const uploadStep = workflow.indexOf('Upload Windows installers');
   assert.ok(smokeStep >= 0 && uploadStep > smokeStep, 'installer smoke must pass before artifacts are published');
   assert.ok(diagnosticsStep > smokeStep && uploadStep > diagnosticsStep, 'diagnostics upload must follow installer smoke and precede published installers');
-  const smokeWorkflow = workflow.slice(smokeStep, uploadStep);
+  const smokeWorkflow = workflow.slice(smokeStep, diagnosticsStep);
+  assert.match(smokeWorkflow, /\$smokeSucceeded = \$false/);
   assert.match(smokeWorkflow, /try\s*\{[\s\S]*New-Item -ItemType Directory -Path \$packageRoot[\s\S]*finally\s*\{/);
   const packageCopyTry = smokeWorkflow.indexOf('try {');
   const packageCopyFinally = smokeWorkflow.indexOf('} finally {', packageCopyTry);
@@ -120,8 +121,9 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(smoke, /uninstall left the bundled Runtime behind/);
   assert.match(smoke, /function Invoke-InstallerProcess\([\s\S]*\[int\]\$TimeoutSeconds = 180/);
   assert.match(smoke, /WaitForExit\(\$TimeoutSeconds \* 1000\)/);
-  assert.match(smoke, /\$logPath = Join-Path \$testRoot 'msi-uninstall\.log'/);
-  assert.match(smoke, /'\/L\*V', \$logPath/);
+  assert.match(smoke, /\$logPath = Join-Path \$env:RUNNER_TEMP 'msi-uninstall\.log'/);
+  assert.match(smoke, /Set-Content -LiteralPath \$logPath -Value "Starting MSI uninstall/);
+  assert.match(smoke, /'\/L\*V!\+', \$logPath/);
   assert.match(smoke, /TimeoutSeconds 600/);
   assert.match(smoke, /FailureLogPath/);
   assert.match(smoke, /-Operation "\$InstallerType uninstall" -TimeoutSeconds 600 -FailureLogPath \$logPath/);
@@ -129,7 +131,10 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.doesNotMatch(smoke, /if \(\$uninstalled -and \(Test-Path -LiteralPath \$testRoot\)\)/);
   const diagnosticsWorkflow = workflow.slice(diagnosticsStep, uploadStep);
   assert.match(diagnosticsWorkflow, /if:\s*failure\(\)/);
-  assert.match(diagnosticsWorkflow, /\$\{\{\s*runner\.temp\s*\}\}\/OpenClaw Workbench installer smoke-\*\/msi-uninstall\.log/);
+  assert.match(diagnosticsWorkflow, /\$\{\{\s*runner\.temp\s*\}\}\/msi-uninstall\.log/);
+  assert.match(diagnosticsWorkflow, /\$\{\{\s*runner\.temp\s*\}\}\/OpenClaw Workbench installer packages\/\*\.msi/);
+  assert.match(smokeWorkflow, /& \$smoke -InstallerType 'nsis' -InstallerPath \$nsisPath\s+\$smokeSucceeded = \$true/);
+  assert.match(smokeWorkflow, /if \(\$smokeSucceeded -and \(Test-Path -LiteralPath \$packageRoot\)\)/);
   assert.match(smoke, /installer smoke/);
   assert.match(smoke, /finally/i);
 });
