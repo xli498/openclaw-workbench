@@ -123,7 +123,15 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(smoke, /WaitForExit\(\$TimeoutSeconds \* 1000\)/);
   assert.match(smoke, /\$logPath = Join-Path \$env:RUNNER_TEMP 'msi-uninstall\.log'/);
   assert.match(smoke, /Set-Content -LiteralPath \$logPath -Value "Starting MSI uninstall/);
-  assert.match(smoke, /'\/L\*V!\+', \$logPath/);
+  assert.match(smoke, /\/L\*V!\+/);
+  const uninstallStart = smoke.indexOf('function Invoke-InstallerUninstall');
+  const msiUninstallStart = smoke.indexOf("if ($InstallerType -eq 'msi') {", uninstallStart);
+  const nsisUninstallStart = smoke.indexOf('} else {', msiUninstallStart);
+  const msiUninstall = smoke.slice(msiUninstallStart, nsisUninstallStart);
+  assert.ok(uninstallStart >= 0 && msiUninstallStart > uninstallStart && nsisUninstallStart > msiUninstallStart, 'MSI uninstall branch must be discoverable');
+  assert.match(msiUninstall, /\$rawArguments = "\/x/);
+  assert.match(msiUninstall, /-RawArguments \$rawArguments/);
+  assert.doesNotMatch(msiUninstall, /-Arguments @\('\/x'/);
   assert.match(smoke, /TimeoutSeconds 600/);
   assert.match(smoke, /FailureLogPath/);
   assert.match(smoke, /Write-MsiTimeoutDiagnostics/);
