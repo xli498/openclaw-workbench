@@ -116,10 +116,12 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(smoke, /"\/S \/D=\$installRoot"/);
   assert.match(smoke, /if \(-not \('OpenClawInstallerSmokeCredential' -as \[type\]\)\)/);
   assert.match(smoke, /function Get-InstalledDesktopExecutable/);
+  assert.match(smoke, /function Wait-ForPathRemoval/);
   assert.match(smoke, /un\(\?:inst\|ins\|install\)/);
   assert.match(smoke, /Get-ChildItem -LiteralPath \$installRoot -File -Filter '\*\.exe'/);
   assert.match(smoke, /uninstall left the bundled Node runtime behind/);
   assert.match(smoke, /uninstall left the bundled Runtime behind/);
+  assert.match(smoke, /Wait-ForPathRemoval \$desktopExecutable/);
   assert.match(smoke, /function Invoke-InstallerProcess\([\s\S]*\[int\]\$TimeoutSeconds = 180/);
   assert.match(smoke, /WaitForExit\(\$TimeoutSeconds \* 1000\)/);
   assert.match(smoke, /\$logPath = Join-Path \$env:RUNNER_TEMP 'msi-uninstall\.log'/);
