@@ -122,6 +122,8 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(smoke, /uninstall left the bundled Node runtime behind/);
   assert.match(smoke, /uninstall left the bundled Runtime behind/);
   assert.match(smoke, /Wait-ForPathRemoval \$desktopExecutable/);
+  assert.match(smoke, /function Wait-ForInstalledProductRemoval\([\s\S]*Get-InstalledProductEntries/);
+  assert.match(smoke, /Wait-ForInstalledProductRemoval/);
   assert.match(smoke, /function Invoke-InstallerProcess\([\s\S]*\[int\]\$TimeoutSeconds = 180/);
   assert.match(smoke, /WaitForExit\(\$TimeoutSeconds \* 1000\)/);
   assert.match(smoke, /\$logPath = Join-Path \$env:RUNNER_TEMP 'msi-uninstall\.log'/);
@@ -135,6 +137,10 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(msiUninstall, /\$rawArguments = "\/x/);
   assert.match(msiUninstall, /-RawArguments \$rawArguments/);
   assert.doesNotMatch(msiUninstall, /-Arguments @\('\/x'/);
+  const nsisUninstall = smoke.slice(nsisUninstallStart, smoke.indexOf('  }\n  if ($exitCode', nsisUninstallStart));
+  assert.match(nsisUninstall, /\$rawArguments = '\/S'/);
+  assert.match(nsisUninstall, /-RawArguments \$rawArguments/);
+  assert.doesNotMatch(nsisUninstall, /-Arguments @\('\/S'/);
   assert.match(smoke, /TimeoutSeconds 600/);
   assert.match(smoke, /FailureLogPath/);
   assert.match(smoke, /Write-MsiTimeoutDiagnostics/);

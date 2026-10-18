@@ -87,6 +87,15 @@ function Wait-ForPathRemoval([string]$Path, [int]$TimeoutSeconds = 30) {
   return $true
 }
 
+function Wait-ForInstalledProductRemoval([int]$TimeoutSeconds = 30) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  while (@(Get-InstalledProductEntries).Count -gt 0) {
+    if ([DateTime]::UtcNow -ge $deadline) { return $false }
+    Start-Sleep -Milliseconds 250
+  }
+  return $true
+}
+
 function Get-MsiProductCode([string]$Path) {
   $windowsInstaller = New-Object -ComObject WindowsInstaller.Installer
   $database = $windowsInstaller.OpenDatabase($Path, 0)
@@ -185,13 +194,14 @@ function Invoke-InstallerUninstall {
       Where-Object { $_.Name -match '^un(?:inst|ins|install).*\.exe$' } |
       Select-Object -First 1
     if (-not $uninstaller) { throw 'NSIS uninstaller executable was not found.' }
-    $exitCode = Invoke-InstallerProcess -FilePath $uninstaller.FullName -Arguments @('/S') -Operation "$InstallerType uninstall"
+    $rawArguments = '/S'
+    $exitCode = Invoke-InstallerProcess -FilePath $uninstaller.FullName -Arguments @() -RawArguments $rawArguments -Operation "$InstallerType uninstall"
   }
   if ($exitCode -ne 0) { throw "$InstallerType uninstaller exited with code $exitCode." }
   if (-not (Wait-ForPathRemoval $desktopExecutable)) { throw "$InstallerType uninstall left the application executable behind." }
   if (-not (Wait-ForPathRemoval (Join-Path $installRoot 'runtime\node\node.exe'))) { throw "$InstallerType uninstall left the bundled Node runtime behind." }
   if (-not (Wait-ForPathRemoval (Join-Path $installRoot 'runtime\bin\workbench.mjs'))) { throw "$InstallerType uninstall left the bundled Runtime behind." }
-  if (Get-InstalledProductEntries) { throw "$InstallerType uninstall left an installed-product registration behind." }
+  if (-not (Wait-ForInstalledProductRemoval)) { throw "$InstallerType uninstall left an installed-product registration behind." }
 }
 
 try {
