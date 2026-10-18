@@ -83,7 +83,7 @@ function Get-MsiProductCode([string]$Path) {
   $database = $windowsInstaller.OpenDatabase($Path, 0)
   $view = $database.OpenView('SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''')
   try {
-    $view.Execute()
+    [void]$view.Execute()
     $record = $view.Fetch()
     if (-not $record) { throw 'MSI ProductCode is missing.' }
     return $record.StringData(1)

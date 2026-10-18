@@ -108,6 +108,7 @@ test('Windows CI exercises installed app, bundled runtime, and uninstall for bot
   assert.match(smoke, /\/v1\/shutdown/);
   assert.match(smoke, /CredReadW/);
   assert.match(smoke, /CredDeleteW/);
+  assert.match(smoke, /\[void\]\$view\.Execute\(\)/);
   assert.match(smoke, /\.ArgumentList\.Add/);
   assert.match(smoke, /RawArguments/);
   assert.match(smoke, /startInfo\.Arguments = \$RawArguments/);
