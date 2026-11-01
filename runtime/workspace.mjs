@@ -158,7 +158,16 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         throw new WorkspaceError('GIT_UNAVAILABLE', `cannot read git revision: ${error.message}`);
       }
     },
-    async workspaceRevision() {
+    async workspaceRevision({ ignoredPaths = [] } = {}) {
+      if (!Array.isArray(ignoredPaths) || ignoredPaths.length > 128) {
+        throw new WorkspaceError('REVISION_OPTIONS_INVALID', 'revision ignored paths are invalid');
+      }
+      const ignored = new Set(ignoredPaths.map((relativePath) => {
+        const normalized = assertRelative(relativePath).replaceAll('\\', '/');
+        if (normalized === '.') throw new WorkspaceError('REVISION_OPTIONS_INVALID', 'revision ignored path must name a file');
+        return normalized;
+      }));
+      const isIgnored = (relativePath) => ignored.has(relativePath.replaceAll('\\', '/'));
       let revisionBytes = 0;
       let revisionEntries = 0;
       const accountEntry = (bytes = 0) => {
@@ -217,7 +226,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
         const [{ value: { stdout: head } }, { value: { stdout: tracked } }, { value: { stdout: untracked } }] = probes;
         const digest = createHash('sha256').update(head).update('\0');
         for (const relativePath of [...new Set([...tracked.split('\0'), ...untracked.split('\0')].filter(Boolean))].sort()) {
-          if (isSensitive(relativePath) || isInternalWorkspacePath(relativePath)) continue;
+          if (isIgnored(relativePath) || isSensitive(relativePath) || isInternalWorkspacePath(relativePath)) continue;
           accountEntry();
           const resolved = await resolveSafe(relativePath, { allowMissing: true });
           const targetRelative = path.relative(rootReal, resolved.targetReal);
@@ -248,7 +257,7 @@ export async function createWorkspace(root, { sensitivePatterns = DEFAULT_SENSIT
             const entries = await readdir(directory, { withFileTypes: true });
             for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
               const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
-              if (isInternalWorkspacePath(relativePath) || isSensitive(relativePath)) continue;
+              if (isIgnored(relativePath) || isInternalWorkspacePath(relativePath) || isSensitive(relativePath)) continue;
               accountEntry();
               const absolutePath = path.join(directory, entry.name);
               const info = await lstat(absolutePath);

@@ -4,7 +4,7 @@
 
 > 这是独立的、非官方 OpenClaw 项目，不会自动修改 OpenClaw 配置。当前版本是可测试的 Runtime 产品基线，不是已经接管生产环境的完整控制面。
 
-产品核心的可验收闭环是：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具 → 审批提案 → 验证与脱敏审计。`Streamable HTTP MCP Bridge` 属于独立里程碑；公网隧道未内置，LSP 未实现，持久 PTY 未实现，不能用诊断或一次性命令执行冒充这些能力。
+产品核心的可验收闭环是：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具 → 审批提案 → 验证与脱敏审计。`Streamable HTTP MCP Bridge` 已作为独立的本机回环服务实现；公网隧道未内置，LSP 未实现，持久 PTY 未实现，不能用诊断或一次性命令执行冒充这些能力。
 
 ## 当前可运行入口
 
@@ -12,6 +12,7 @@
 
 ```bash
 npm test
+npm run smoke:mcp-bridge
 node bin/workbench.mjs --help
 node bin/workbench.mjs --root /path/to/workspace --json
 ```
@@ -60,6 +61,25 @@ console.log(await app.listen());
 
 每个请求都要带 `Authorization: Bearer <token>`；`/approve` 另外必须带独立的 `X-Approval-Token: <审批 token>`，并在 JSON body 中提交提案当前的 `actionHash`。这两个 token 不会由 Workbench 生成或回显，也不要提交到仓库。控制面是 **loopback-only**：它不提供公网监听、Gateway 接管、WebSocket Bridge 或生产部署能力；`/v1/events` 和 SSE 只是只读事件读取，不是执行入口。
 
+## 本机 Streamable HTTP MCP Bridge
+
+Bridge 是独立于控制面的本地 `node:http` 服务。它使用 MCP `2025-06-18` 的 Streamable HTTP 会话语义：`initialize` 协商会话，`tools/list` 和 `tools/call` 使用 `Mcp-Session-Id` 与 `MCP-Protocol-Version`，支持有限 JSON/SSE 响应、`GET` SSE 订阅与 `DELETE` 关闭。空闲会话会过期，`stop()` 会关闭所有 SSE 流。
+
+```js
+const bridge = app.createMcpBridge({
+  token: process.env.OPENCLAW_WORKBENCH_MCP_TOKEN,
+  // 可选：只作短时路由定位，不是认证凭据；不要输出或记录它。
+  pathToken: process.env.OPENCLAW_WORKBENCH_MCP_PATH_TOKEN,
+});
+const address = await bridge.start();
+console.log({ host: address.address, port: address.port });
+// 进程退出时调用 await bridge.stop()；app.close() 也会停止子 Bridge。
+```
+
+Bridge 只允许 `127.0.0.1`、`::1` 或 `localhost` 绑定。每个请求仍必须携带独立的 `Authorization: Bearer <MCP token>`；可选 path token 位于路径中，只作路由定位，不能替代 Bearer，也不能放入查询参数、日志、终端历史或仓库。启用它时不要输出或传播完整 endpoint。默认拒绝带 `Origin` 的跨域请求。只读工作区工具立即执行，`workspace.patch` 与 `workspace.command` 只返回审批提案，必须回到控制面使用独立审批 token 才能生效。
+
+运行 `npm run smoke:mcp-bridge` 可在临时本地工作区验证初始化、工具调用、审批边界、SSE、回放与攻击拦截，不需要真实模型、OpenClaw 登录态或 token。Cloudflare Tunnel、ngrok、反向代理和任何公网暴露均未随本项目提供或验证；不要将 Bridge 直接转发到公网。
+
 主路径按 Ask → Plan → Code 理解：
 
 1. **Ask**：`POST /v1/sessions`（`{"mode":"Ask"}`）后调用 `/messages`；用于只读问答，不能创建修改提案。
@@ -98,7 +118,8 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | Gateway WebSocket 传输边界 | 已实现回环连接/请求关联/超时取消；未实现 OpenClaw 协议和生命周期 |
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
 | MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具 |
-| 公网 Bridge | 未实现 |
+| 本机 Streamable HTTP MCP Bridge | 已实现；回环绑定、Bearer、会话、SSE、回放保护和审批提案边界 |
+| 公网 Bridge / 隧道 | 未实现、未验证 |
 | 生产部署承诺 | 不承诺 |
 
 ## 安全边界
@@ -107,6 +128,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 - action hash 绑定 session、workspace revision、目标和不可变预览；执行前重新校验。
 - 命令首次执行前写入持久化 ledger，重复 action hash 永久阻断，除非由明确的人工恢复流程处理。
 - 启动扫描不会自动重跑命令；`claimed`/`executing` 等未完成状态只进入 `manual_review`。
+- 本机 MCP Bridge 的路径令牌只是短时路由定位，Bearer 才是认证；Bridge 不监听公网，不接受把 Bearer 或其他认证凭据放入 URL。
 - ledger 和审计日志不保存 API Key、环境变量密钥或用户凭据；命令预览只包含 argv、cwd 和资源参数。
 - 这套库不能替代宿主机权限隔离、容器隔离、密钥管理或 OpenClaw 正式审批系统。
 

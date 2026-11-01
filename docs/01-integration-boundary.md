@@ -14,7 +14,7 @@ MCP runtime 控制面通过 `GET /v1/mcp/runtimes` 提供只读实例状态；`P
 | Gateway 控制 | Control UI 文档，浏览器通过 WebSocket 与 Gateway 通信，支持 token/password、设备配对和 scope 升级审批 | 优先复用正式 Gateway 协议；协议版本必须锁定并做兼容测试 |
 | Chat | Control UI 已支持 `chat.history`、`chat.send`、`chat.abort`、`chat.inject` 与工具事件 | 产品 Runtime 封装为会话事件流；所有事件做 schema 校验 |
 | Exec 审批 | Control UI 文档列出 `exec.approvals.*`，存在审批策略与 allowlist | 产品默认不放宽现有策略；高风险动作保留二次审批 |
-| MCP | `openclaw mcp` 支持 server/client registry、status/doctor/probe、Control UI `/mcp`；`serve` 为 stdio MCP server | 已有审批门禁注册骨架、`enabled` 配置门禁、显式 `shell:false` stdio JSON-RPC transport、受限的一次性 HTTP POST JSON/SSE 响应 transport，以及内部 runtime 的 start/stop/allowlist call 边界；command/args 和 endpoint 拒绝注入与凭据材料，header 拒绝控制字符注入且允许调用方显式传入认证 header；不读取 SecretRef、不自动重连；标准 SSE 双通道、完整 streamable HTTP 会话语义、HTTP 工具执行路由与 OpenClaw 私有协议仍未接入 |
+| MCP | `openclaw mcp` 支持 server/client registry、status/doctor/probe、Control UI `/mcp`；`serve` 为 stdio MCP server | 已有审批门禁注册骨架、`enabled` 配置门禁、显式 `shell:false` stdio JSON-RPC transport、受限的一次性 HTTP POST JSON/SSE 响应 transport，以及内部 runtime 的 start/stop/allowlist call 边界；另有独立本机 Streamable HTTP Bridge，固定 MCP `2025-06-18`、回环绑定、Bearer、会话/重放保护、有限 JSON/SSE、空闲过期与工具审批提案。它不读取 SecretRef、不自动重连，不接入 OpenClaw 私有协议，也不提供公网暴露 |
 | 插件/Skill | 文档提供插件、Skill 管理和权限请求能力 | 不自动安装；安装、启用、升级均需审计和审批 |
 | 配置写入 | Control UI 文档描述 config get/set/apply/patch、base-hash guard、SecretRef 预检和校验 | 产品配置层必须保留 hash guard、备份、迁移和回滚 |
 | 诊断 | Control UI 支持 status、health、models、logs.tail 等诊断入口 | 统一收集脱敏诊断，不采集密钥和完整敏感内容 |
@@ -51,4 +51,4 @@ OpenClaw 已具备足够多的底层能力，可以作为产品基础；但 Work
 
 ## 产品核心验收边界
 
-核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用和会话关闭；公网隧道未内置。LSP 未实现，持久 PTY 未实现，不能把 CLI 诊断或一次性命令执行称作这两项能力。
+核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用、会话关闭与空闲过期：它只能绑定 loopback，每次请求仍需 Bearer，path token 仅用于短时路由定位且不得记录，默认拒绝跨域 Origin。Cloudflare Tunnel、ngrok 和其他公网隧道未内置、未验证。LSP 未实现，持久 PTY 未实现，不能把 CLI 诊断或一次性命令执行称作这两项能力。
