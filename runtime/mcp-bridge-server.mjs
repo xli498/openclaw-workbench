@@ -7,7 +7,9 @@ const PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024;
 const DEFAULT_MAX_SESSIONS = 32;
+const DEFAULT_MAX_REPLAY_EVENTS = 100;
 const DEFAULT_IDLE_SESSION_MS = 15 * 60 * 1000;
+const EVENT_ID_PATTERN = /^evt-[1-9][0-9]{0,14}$/;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 const JSON_RPC_ID = /^(?:[A-Za-z0-9._:-]{1,128}|0|[1-9][0-9]{0,15})$/;
 const PATH_TOKEN = /^[A-Za-z0-9_-]{16,256}$/;
@@ -139,6 +141,7 @@ export function createMcpBridgeServer({
   maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
   maxSessions = DEFAULT_MAX_SESSIONS,
+  maxReplayEvents = DEFAULT_MAX_REPLAY_EVENTS,
   idleSessionMs = DEFAULT_IDLE_SESSION_MS,
   allowedOrigins = [],
   clock = () => Date.now(),
@@ -147,7 +150,7 @@ export function createMcpBridgeServer({
   if (typeof token !== 'string' || token.length < 16) throw new McpBridgeError('MCP_AUTH_CONFIG_INVALID', 'bridge bearer token must be at least 16 characters');
   if (!LOOPBACK_HOSTS.has(host)) throw new McpBridgeError('MCP_BIND_INVALID', 'bridge host must be loopback');
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new McpBridgeError('MCP_PORT_INVALID', 'bridge port is invalid');
-  for (const [name, value, maximum] of [['maxBodyBytes', maxBodyBytes, 4 * 1024 * 1024], ['maxResponseBytes', maxResponseBytes, 4 * 1024 * 1024], ['maxSessions', maxSessions, 256], ['idleSessionMs', idleSessionMs, 24 * 60 * 60 * 1000], ['pathTokenTtlMs', pathTokenTtlMs, 24 * 60 * 60 * 1000]]) {
+  for (const [name, value, maximum] of [['maxBodyBytes', maxBodyBytes, 4 * 1024 * 1024], ['maxResponseBytes', maxResponseBytes, 4 * 1024 * 1024], ['maxSessions', maxSessions, 256], ['maxReplayEvents', maxReplayEvents, 1000], ['idleSessionMs', idleSessionMs, 24 * 60 * 60 * 1000], ['pathTokenTtlMs', pathTokenTtlMs, 24 * 60 * 60 * 1000]]) {
     if (!Number.isSafeInteger(value) || value < 1 || value > maximum) throw new McpBridgeError('MCP_CONFIG_INVALID', `${name} is invalid`);
   }
   if (!Array.isArray(allowedOrigins) || allowedOrigins.some((origin) => typeof origin !== 'string' || !origin || origin.length > 512)) throw new McpBridgeError('MCP_ORIGIN_CONFIG_INVALID', 'allowed origins are invalid');
@@ -198,6 +201,85 @@ export function createMcpBridgeServer({
     session.requestIds.add(id);
   }
 
+  // GET SSE replay: resolve the buffered slice strictly after `rawId`.
+  // Returns [] when the client is already at the latest event. Throws
+  // MCP_EVENT_ID_INVALID for a malformed id and MCP_EVENT_EXPIRED when the
+  // id is unknown, already truncated out of the buffer, or ahead of the
+  // latest buffered event. Expiry is never papered over with a partial
+  // replay: a 410 tells the client its continuity is broken and it must
+  // resync (fresh GET without Last-Event-ID, plus tools/list or tools/call
+  // if it needs current state). Event ids are scoped to one session, so a
+  // lookup here can only ever return this session's own buffered events.
+  function resolveReplay(session, rawId) {
+    if (typeof rawId !== 'string' || !EVENT_ID_PATTERN.test(rawId)) fail('MCP_EVENT_ID_INVALID', 'MCP Last-Event-ID is invalid');
+    const sequence = Number(rawId.slice(4));
+    const buffer = session.eventBuffer;
+    if (buffer.length === 0) fail('MCP_EVENT_EXPIRED', 'MCP event buffer has no event to resume from');
+    const first = buffer[0].sequence;
+    const last = buffer[buffer.length - 1].sequence;
+    if (sequence < first || sequence > last) fail('MCP_EVENT_EXPIRED', 'MCP Last-Event-ID is expired or unknown');
+    return buffer.filter((entry) => entry.sequence > sequence);
+  }
+
+  // HTTP routing decision table (MCP 2025-06-18, bridge boundary).
+  // Pre-dispatch, in order (first match wins; earlier checks hide later
+  // ones, e.g. a missing Bearer never reveals whether a session exists):
+  //   wrong endpoint / expired path token -> 404 MCP_ENDPOINT_NOT_FOUND
+  //   disallowed Origin                  -> 403 MCP_ORIGIN_FORBIDDEN
+  //   missing/wrong Bearer               -> 401 MCP_UNAUTHORIZED
+  //   non-POST/GET/DELETE method         -> 405 MCP_METHOD_NOT_ALLOWED
+  //   POST without application/json      -> 415 MCP_CONTENT_TYPE_INVALID
+  //   GET without text/event-stream      -> 406 MCP_ACCEPT_INVALID
+  //   missing/malformed session header   -> 400 MCP_SESSION_REQUIRED
+  //   unknown/expired session, or wrong
+  //     mcp-protocol-version             -> 404 MCP_SESSION_NOT_FOUND /
+  //                                         400 MCP_PROTOCOL_INVALID
+  //   GET with malformed Last-Event-ID   -> 400 MCP_EVENT_ID_INVALID
+  //   GET with expired/unknown
+  //     Last-Event-ID                    -> 410 MCP_EVENT_EXPIRED (JSON,
+  //                                         never a partial replay)
+  // POST initialize (no session header allowed):
+  //   header present                     -> 400 MCP_SESSION_FIXATION
+  //   protocolVersion != 2025-06-18      -> 400 MCP_PROTOCOL_INVALID
+  //   session table full                 -> 429 MCP_SESSION_LIMIT
+  //   otherwise                          -> 200 + new mcp-session-id
+  // POST request (id present; id is claimed before dispatch and is NOT
+  // released when dispatch fails, so a retry with the same id is a
+  // replay, not a second execution):
+  //   id already claimed, any session    -> 409 MCP_REQUEST_REPLAY
+  //   notifications/initialized          -> null result, HTTP 200
+  //   ping                               -> {} result, HTTP 200
+  //   tools/list                         -> catalog, HTTP 200
+  //   tools/call, unknown/aliased name
+  //     or non-object arguments          -> tool result isError
+  //                                         TOOL_INPUT_INVALID, HTTP 200
+  //   tools/call, read tool              -> registry mode Ask executes
+  //                                         the allowlisted read tool
+  //   tools/call, workspace.patch /
+  //     workspace.command                -> registry mode Code returns
+  //                                         an awaiting_approval proposal
+  //                                         ONLY; nothing is applied or
+  //                                         executed by the bridge
+  //   tools/call, registry failure       -> tool result isError with the
+  //                                         registry's safe code, HTTP 200
+  //   any other method                   -> JSON-RPC -32601, HTTP 200
+  //   POST asking for SSE (Accept is
+  //     exactly text/event-stream)       -> single SSE message frame,
+  //                                         NOT a resumable stream and
+  //                                         NOT added to the replay buffer
+  // POST notification (no id):
+  //   notifications/initialized          -> 202, no body
+  //   anything else                      -> 400 MCP_NOTIFICATION_INVALID
+  // GET (live SSE stream):
+  //   no Last-Event-ID                   -> live events only, from now on
+  //   Last-Event-ID at latest event      -> live events only, from now on
+  //   Last-Event-ID inside the buffer    -> buffered events after it, in
+  //                                         order, then live events
+  //   (live and replayed frames are server notifications only; a POST
+  //   response is never broadcast and never buffered)
+  // DELETE                               -> close session, 204; the
+  //                                         session's buffer and claimed
+  //                                         request ids are dropped with it
   async function dispatch(session, rpc, signal) {
     if (rpc.method === 'notifications/initialized') return null;
     if (rpc.method === 'ping') return {};
@@ -224,10 +306,17 @@ export function createMcpBridgeServer({
         const session = requireSession(request);
         const accept = String(request.headers.accept ?? '').toLowerCase();
         if (!accept.includes('text/event-stream')) return responseError(response, 406, 'MCP_ACCEPT_INVALID');
+        const replay = request.headers['last-event-id'] === undefined ? [] : resolveReplay(session, request.headers['last-event-id']);
         response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
         response.write(': connected\n\n');
         session.streams.add(response);
         response.once('close', () => session.streams.delete(response));
+        try {
+          for (const entry of replay) response.write(`id: ${entry.id}\nevent: message\ndata: ${entry.encoded}\n\n`);
+        } catch {
+          session.streams.delete(response);
+          try { response.end(); } catch {}
+        }
         return;
       }
       if (request.method === 'DELETE') {
@@ -247,7 +336,7 @@ export function createMcpBridgeServer({
           expireSessions();
           if (sessions.size >= maxSessions) return responseError(response, 429, 'MCP_SESSION_LIMIT');
           const id = randomUUID();
-          const session = { id, lastActivity: clock(), requestIds: new Set(), streams: new Set() };
+          const session = { id, lastActivity: clock(), requestIds: new Set(), streams: new Set(), eventBuffer: [], nextEventSequence: 1 };
           sessions.set(id, session);
           const result = rpcResult(rpc.id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'openclaw-workbench', version: '0.1.0' } });
           response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'mcp-session-id': id });
@@ -277,12 +366,13 @@ export function createMcpBridgeServer({
     } catch (error) {
       const code = safeCode(error);
       const status = code === 'MCP_BODY_LIMIT' || code === 'MCP_RESPONSE_LIMIT' ? 413
-        : code === 'MCP_SESSION_NOT_FOUND' ? 404
-          : code === 'MCP_REQUEST_REPLAY' ? 409
-            : code === 'MCP_SESSION_LIMIT' ? 429
-              : ['MCP_ORIGIN_FORBIDDEN'].includes(code) ? 403
-                : ['MCP_JSON_INVALID', 'MCP_JSONRPC_INVALID', 'MCP_PROTOCOL_INVALID', 'MCP_SESSION_REQUIRED', 'MCP_SESSION_FIXATION', 'MCP_NOTIFICATION_INVALID'].includes(code) ? 400
-                  : 500;
+        : code === 'MCP_EVENT_EXPIRED' ? 410
+          : code === 'MCP_SESSION_NOT_FOUND' ? 404
+            : code === 'MCP_REQUEST_REPLAY' ? 409
+              : code === 'MCP_SESSION_LIMIT' ? 429
+                : ['MCP_ORIGIN_FORBIDDEN'].includes(code) ? 403
+                  : ['MCP_JSON_INVALID', 'MCP_JSONRPC_INVALID', 'MCP_PROTOCOL_INVALID', 'MCP_SESSION_REQUIRED', 'MCP_SESSION_FIXATION', 'MCP_NOTIFICATION_INVALID', 'MCP_EVENT_ID_INVALID'].includes(code) ? 400
+                    : 500;
       if (!response.headersSent) responseError(response, status, code);
       else response.end();
     }
@@ -325,13 +415,22 @@ export function createMcpBridgeServer({
     if (!plainObject(notification) || typeof notification.method !== 'string' || !notification.method || notification.method.length > 128 || /[\0\r\n]/.test(notification.method) || (notification.params !== undefined && !plainObject(notification.params))) fail('MCP_NOTIFICATION_INVALID', 'MCP broadcast notification is invalid');
     const session = sessions.get(sessionId);
     const encoded = boundedJson({ jsonrpc: '2.0', method: notification.method, params: notification.params ?? {} }, maxResponseBytes, 'MCP_RESPONSE_LIMIT');
+    // Buffer first, deliver second: an event broadcast while no stream is
+    // open is still replayable until it is truncated out of the bounded
+    // per-session buffer, the session expires, or the session closes.
+    // Broadcast is the ONLY source of buffered events; tool execution
+    // never auto-generates one, and a POST response is never buffered.
+    const eventId = `evt-${session.nextEventSequence}`;
+    session.eventBuffer.push({ id: eventId, sequence: session.nextEventSequence, encoded });
+    session.nextEventSequence += 1;
+    while (session.eventBuffer.length > maxReplayEvents) session.eventBuffer.shift();
     let delivered = 0;
     for (const response of [...session.streams]) {
-      try { response.write(`event: message\ndata: ${encoded}\n\n`); delivered += 1; }
+      try { response.write(`id: ${eventId}\nevent: message\ndata: ${encoded}\n\n`); delivered += 1; }
       catch { session.streams.delete(response); }
     }
     session.lastActivity = clock();
-    return Object.freeze({ sessionId, delivered });
+    return Object.freeze({ sessionId, delivered, eventId });
   }
 
   return Object.freeze({ start, stop, address, endpointPath: () => endpoint, protocolVersion: PROTOCOL_VERSION, broadcast, sessionCount: () => sessions.size, streamCount: (sessionId) => sessions.get(sessionId)?.streams.size ?? 0 });
