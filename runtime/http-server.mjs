@@ -545,6 +545,14 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.health.checked', actor: 'system', serverId: updated.id, status: health.status, code: health.code ?? null });
         return json(response, 200, { server: { id: updated.id, name: updated.name, enabled: updated.enabled }, health });
       }
+      const mcpTools = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/tools$/);
+      if (request.method === 'GET' && mcpTools) {
+        const serverRecord = mcpRegistry.get(mcpTools[1]);
+        if (!serverRecord) return json(response, 404, { error: 'MCP_NOT_FOUND', message: 'MCP server not found' });
+        if (!runtime.status().some((instance) => instance.id === serverRecord.id)) return json(response, 409, { error: 'MCP_NOT_RUNNING', message: 'MCP server is not running' });
+        const listed = await runtime.listTools(serverRecord.id, { expectedConfigHash: serverRecord.configHash, approved: true });
+        return json(response, 200, listed);
+      }
       if (request.method === 'POST' && url.pathname === '/v1/mcp/servers') {
         const input = await bodyOf(request);
         if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new McpRegistryError('MCP_SESSION_REQUIRED', 'sessionId is required');
@@ -631,6 +639,44 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         mcpProposals.set(action.id, proposal);
         return json(response, 201, { proposal: publicMcpProposal(proposal) });
       }
+      const mcpRemove = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/remove$/);
+      if (request.method === 'POST' && mcpRemove) {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new McpRegistryError('MCP_SESSION_REQUIRED', 'sessionId is required');
+        if (typeof input.configHash !== 'string' || !input.configHash) throw new McpRegistryError('MCP_CONFLICT', 'configHash is required');
+        if (mcpProposals.size + mcpReservations.size >= MAX_MCP_PROPOSALS) throw new McpRegistryError('MCP_PROPOSAL_LIMIT', 'too many pending MCP proposals');
+        const serverConfig = mcpRegistry.get(mcpRemove[1]);
+        if (!serverConfig) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+        const preview = { serverId: serverConfig.id, expectedConfigHash: input.configHash, operation: 'remove' };
+        const action = transition(transition(createAction({ type: 'mcp.remove', sessionId: input.sessionId, workspaceRevision: serverConfig.configHash, target: serverConfig.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, server: serverConfig, operation: 'remove', expectedConfigHash: input.configHash });
+        mcpReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, serverId: serverConfig.id, operation: 'remove' }); }
+        catch (error) { mcpReservations.delete(action.id); throw error; }
+        mcpReservations.delete(action.id);
+        mcpProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicMcpProposal(proposal) });
+      }
+      const mcpUpdate = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/update$/);
+      if (request.method === 'POST' && mcpUpdate) {
+        const input = await bodyOf(request);
+        if (typeof input.sessionId !== 'string' || !input.sessionId || input.sessionId.length > 128) throw new McpRegistryError('MCP_SESSION_REQUIRED', 'sessionId is required');
+        if (typeof input.configHash !== 'string' || !input.configHash) throw new McpRegistryError('MCP_CONFLICT', 'configHash is required');
+        if (mcpProposals.size + mcpReservations.size >= MAX_MCP_PROPOSALS) throw new McpRegistryError('MCP_PROPOSAL_LIMIT', 'too many pending MCP proposals');
+        const current = mcpRegistry.get(mcpUpdate[1]);
+        if (!current) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+        if (!input.server || typeof input.server !== 'object') throw new McpRegistryError('MCP_INPUT_INVALID', 'server is required');
+        const nextConfig = normalizeMcpServer({ ...input.server, id: mcpUpdate[1] });
+        const preview = { serverId: current.id, expectedConfigHash: input.configHash, next: nextConfig };
+        const action = transition(transition(createAction({ type: 'mcp.update', sessionId: input.sessionId, workspaceRevision: current.configHash, target: current.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
+        const proposal = Object.freeze({ action, server: nextConfig, operation: 'update', expectedConfigHash: input.configHash });
+        mcpReservations.add(action.id);
+        try { if (effectiveAudit) await effectiveAudit.append({ type: 'mcp.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, serverId: current.id, operation: 'update' }); }
+        catch (error) { mcpReservations.delete(action.id); throw error; }
+        mcpReservations.delete(action.id);
+        mcpProposals.set(action.id, proposal);
+        return json(response, 201, { proposal: publicMcpProposal(proposal) });
+      }
       const mcpApproval = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/approve$/);
       if (request.method === 'POST' && mcpApproval) {
         if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
@@ -648,6 +694,13 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           if (proposal.operation === 'register') server = mcpRegistry.register(proposal.server);
           else if (proposal.operation === 'authorize_tools') server = mcpRegistry.authorizeTools(proposal.server.id, proposal.tools, proposal.expectedConfigHash);
           else if (proposal.operation === 'set_enabled') server = mcpRegistry.setEnabled(proposal.server.id, proposal.enabled, proposal.expectedConfigHash);
+          else if (proposal.operation === 'remove') {
+            if (runtime.status().some((instance) => instance.id === proposal.server.id)) throw new McpRuntimeError('MCP_SERVER_RUNNING', 'MCP server must be stopped before removal');
+            server = mcpRegistry.remove(proposal.server.id, proposal.expectedConfigHash);
+          } else if (proposal.operation === 'update') {
+            if (runtime.status().some((instance) => instance.id === proposal.server.id)) throw new McpRuntimeError('MCP_SERVER_RUNNING', 'MCP server must be stopped before update');
+            server = mcpRegistry.update(proposal.server.id, proposal.server, proposal.expectedConfigHash);
+          }
           else if (proposal.operation === 'runtime_start') runtimeResult = await runtime.start(proposal.server.id, { expectedConfigHash: proposal.expectedConfigHash, approved: true });
           else if (proposal.operation === 'runtime_stop') {
             const current = mcpRegistry.get(proposal.server.id);

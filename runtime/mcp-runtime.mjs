@@ -102,11 +102,29 @@ export function createMcpServerRuntime({ registry, transportFactory, stdioOption
     }
   }
 
+  async function listTools(id, { expectedConfigHash, approved = false } = {}) {
+    const instance = instances.get(id);
+    if (!instance || instance.state !== 'ready') throw new McpRuntimeError('MCP_NOT_RUNNING', 'MCP server is not running');
+    requireApproval(approved);
+    const server = getServer(id);
+    requireHash(expectedConfigHash, server);
+    if (instance.configHash !== server.configHash) throw new McpRuntimeError('MCP_CONFLICT', 'MCP server configuration changed after start');
+    if (server.enabled !== true) throw new McpRuntimeError('MCP_SERVER_DISABLED', 'MCP server is disabled');
+    let result;
+    try { result = await instance.client.request('tools/list', {}); }
+    catch (error) {
+      const code = typeof error?.code === 'string' && error.code.startsWith('MCP_') ? error.code : 'MCP_REQUEST_FAILED';
+      throw new McpRuntimeError(code, 'MCP tools list failed');
+    }
+    if (!result || typeof result !== 'object' || !Array.isArray(result.tools) || result.tools.some((tool) => !tool || typeof tool.name !== 'string')) throw new McpRuntimeError('MCP_RESPONSE_INVALID', 'MCP server returned an invalid tools list');
+    return Object.freeze({ id, tools: Object.freeze(result.tools.map((tool) => Object.freeze({ name: tool.name, authorized: server.tools.includes(tool.name) }))) });
+  }
+
   async function close() {
     const current = [...instances.values()];
     instances.clear();
     for (const instance of current) { instance.closed = true; await instance.closeOnce(); }
   }
 
-  return Object.freeze({ start, stop, callTool, close, status: () => Object.freeze([...instances.values()].map(publicInstance)) });
+  return Object.freeze({ start, stop, callTool, listTools, close, status: () => Object.freeze([...instances.values()].map(publicInstance)) });
 }

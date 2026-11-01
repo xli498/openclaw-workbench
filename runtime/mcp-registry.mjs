@@ -168,6 +168,28 @@ export function createMcpRegistry({ root, storePath = join(root ?? '', '.opencla
     try { persist(); } catch (error) { records.set(id, current); throw error; }
     return next;
   }
+  function remove(id, expectedConfigHash) {
+    const current = records.get(id);
+    if (!current) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+    if (current.configHash !== expectedConfigHash) throw new McpRegistryError('MCP_CONFLICT', 'MCP server changed before removal');
+    records.delete(id);
+    try { persist(); } catch (error) { records.set(id, current); throw error; }
+    return Object.freeze({ id, removed: true });
+  }
+  function update(id, input, expectedConfigHash) {
+    const current = records.get(id);
+    if (!current) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
+    if (current.configHash !== expectedConfigHash) throw new McpRegistryError('MCP_CONFLICT', 'MCP server changed before update');
+    const next = validate(input);
+    if (next.id !== id) throw new McpRegistryError('MCP_ID_INVALID', 'MCP update cannot change the server id');
+    // A config change invalidates the previous enablement: the operator must
+    // re-enable (and re-authorize tools if they changed) after an update, so
+    // a stale running instance can never silently keep serving new config.
+    const updated = publicServer(withHash({ ...next, enabled: false, health: { status: 'unknown', checkedAt: null } }));
+    records.set(id, updated);
+    try { persist(); } catch (error) { records.set(id, current); throw error; }
+    return updated;
+  }
   function setEnabled(id, enabled, expectedConfigHash) {
     const current = records.get(id);
     if (!current) throw new McpRegistryError('MCP_NOT_FOUND', 'MCP server not found');
@@ -178,5 +200,5 @@ export function createMcpRegistry({ root, storePath = join(root ?? '', '.opencla
     try { persist(); } catch (error) { records.set(id, current); throw error; }
     return next;
   }
-  return Object.freeze({ validate, register, authorizeTools, updateHealth, setEnabled, get: (id) => records.has(id) ? publicServer(records.get(id)) : null, list: () => Object.freeze([...records.values()].map(publicServer)), snapshotPath: storePath });
+  return Object.freeze({ validate, register, authorizeTools, updateHealth, setEnabled, remove, update, get: (id) => records.has(id) ? publicServer(records.get(id)) : null, list: () => Object.freeze([...records.values()].map(publicServer)), snapshotPath: storePath });
 }
