@@ -27,6 +27,7 @@ export { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 export { McpBridgeError, createMcpBridgeServer } from './mcp-bridge-server.mjs';
 export { BridgeTunnelError, BRIDGE_TUNNEL_PROVIDERS, createBridgeTunnelAdapter } from './bridge-tunnel.mjs';
 export { TerminalSessionError, createTerminalSessionManager } from './terminal-session.mjs';
+export { PtyProviderError, createPosixPtyProvider, ptyAvailable } from './pty-provider.mjs';
 export { LspClientError, LSP_READ_ONLY_METHODS, createLspClient } from './lsp-client.mjs';
 export { collectDiagnostics } from './diagnostics.mjs';
 
