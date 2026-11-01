@@ -26,7 +26,10 @@ test('红队真实攻击：HTTP response 洪泛在达到上限时被中止', asy
     const transport = createMcpHttpTransport({ endpoint, maxFrameBytes: 128 });
     await transport.start();
     await assert.rejects(transport.request('flood'), (error) => error.code === 'MCP_FRAME_LIMIT');
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Deterministic close driving: poll for the server-observed close
+    // instead of a fixed 20ms sleep, which lost the race under parallel
+    // load whenever socket-close propagation stalled.
+    for (let waited = 0; !clientClosed && waited < 2000; waited += 10) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(clientClosed, true);
     assert.equal(transport.getState(), 'failed');
     await transport.close();
