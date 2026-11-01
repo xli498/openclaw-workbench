@@ -241,7 +241,31 @@ public static class OcwConPty
         $sysRoot = if ($childSystemRoot) { $childSystemRoot } else { $env:SystemRoot }
         $cmdExists = $false
         if ($sysRoot) { $cmdExists = Test-Path -LiteralPath (Join-Path $sysRoot 'System32\cmd.exe') -PathType Leaf }
-        throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb), cwdExists=$cwdExists, cmdExists=$cmdExists, envCount=$($envPairs.Count), hpc=$($hPC -ne [IntPtr]::Zero), attr=$($attrList -ne [IntPtr]::Zero))"
+        # Bisection probes (diagnostic only -- the session still fails
+        # with the original error below). Each probe reuses the same
+        # HPCON, attribute list, flags, and command line, and nulls
+        # out one input, so the pattern localizes the fault:
+        #   noEnv+noCwd ok, env+noCwd fail, noEnv+cwd ok => env block
+        #   noEnv+noCwd ok, env+noCwd ok, noEnv+cwd fail => cwd
+        #   all fail => shared cmdline/startup/attribute inputs
+        # A fresh StringBuilder is built per probe because CreateProcess
+        # may modify the command-line buffer in place. Probe children
+        # are the same echo command; their handles are closed at once
+        # and never waited on, and their console output is discarded
+        # when the helper exits. No argv values are reported.
+        function Test-CreateProcess($envArg, $cwdArg) {
+          $pi = New-Object OcwConPty+ProcessInformation
+          $probeCmd = New-Object System.Text.StringBuilder($commandLine)
+          $ok = [OcwConPty]::CreateProcess($null, $probeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envArg, $cwdArg, [ref]$startup, [ref]$pi)
+          $code = if ($ok) { 0 } else { [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+          if ($pi.hProcess -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($pi.hProcess) }
+          if ($pi.hThread -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($pi.hThread) }
+          return $code
+        }
+        $probeNoEnvNoCwd = Test-CreateProcess $null $null
+        $probeEnvNoCwd = Test-CreateProcess $envBlock $null
+        $probeNoEnvCwd = Test-CreateProcess $null $cwd
+        throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb), cwdExists=$cwdExists, cmdExists=$cmdExists, envCount=$($envPairs.Count), hpc=$($hPC -ne [IntPtr]::Zero), attr=$($attrList -ne [IntPtr]::Zero), probeNoEnvNoCwd=$probeNoEnvNoCwd, probeEnvNoCwd=$probeEnvNoCwd, probeNoEnvCwd=$probeNoEnvCwd)"
       }
     } finally {
       [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
