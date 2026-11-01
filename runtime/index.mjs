@@ -21,6 +21,7 @@ export { WorkspaceToolError, createWorkspaceToolRegistry } from './workspace-too
 export { ToolRegistryError, createToolRegistry } from './tool-registry.mjs';
 export { AgentLoopError, runAgentLoop } from './agent-loop.mjs';
 export { GatewayAdapterError, createGatewayAdapter } from './gateway-adapter.mjs';
+export { GatewayLifecycleError, createGatewayLifecycle } from './gateway-lifecycle.mjs';
 export { McpTransportError, createMcpStdioTransport } from './mcp-transport.mjs';
 export { McpHttpTransportError, createMcpHttpTransport } from './mcp-http-transport.mjs';
 export { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
