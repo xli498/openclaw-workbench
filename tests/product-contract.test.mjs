@@ -19,7 +19,7 @@ test('产品契约明确区分核心闭环、受限 Bridge 和未实现的外部
     '只读工具',
     '审批提案',
     'Streamable HTTP MCP Bridge',
-    '公网隧道未内置',
+    '真实公网部署未验证',
     'LSP 未实现',
     '持久 PTY 未实现',
   ]) assert.match(text, new RegExp(phrase));
