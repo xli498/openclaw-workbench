@@ -77,6 +77,33 @@ Content-Type: application/json
 
 事务恢复状态可通过只读 `GET /v1/recovery` 查看。接口返回未完成事务的检查报告和 `requires_approval`、`mark_committed` 或 `blocked` 判定；损坏清单会被隔离，其他事务继续返回。该接口不会执行 `resume`、`rollback` 或审批。工作区浏览使用 `GET /v1/workspace/tree`，单文件只读预览使用 `GET /v1/workspace/read?path=<relativePath>`；越界、敏感路径和符号链接逃逸均被拒绝。
 
+### 事务恢复提案与审批
+
+当事务为 `requires_approval` 且当前文件状态仍适用于所选操作时，客户端先创建一次性的内存提案：
+
+```http
+POST /v1/recovery/:transactionId/proposals
+Content-Type: application/json
+
+{"mode":"resume"}
+```
+
+`mode` 只能是 `resume` 或 `rollback`。响应中的 `proposal.impact.files` 逐项列出相对路径、当前状态（`before` / `after` / `unknown`）及将要发生的效果（`apply_after`、`keep_after`、`restore_before` 或 `keep_before`）。提案绑定创建时的清单字节 SHA-256、恢复报告摘要和 `actionHash`；最多同时保留 32 个待审批提案，超过上限返回 `429 RECOVERY_PROPOSAL_LIMIT`。
+
+客户端必须向操作者展示影响并明确批准，随后使用独立于普通 API Bearer 的审批凭据执行：
+
+```http
+POST /v1/recovery/proposals/:proposalId/approve
+X-Approval-Token: <独立审批凭据>
+Content-Type: application/json
+
+{"actionHash":"<proposal.action.actionHash>"}
+```
+
+批准时 Runtime 会重新扫描事务、复核清单字节哈希和逐文件报告，并在现有恢复写锁内再次校验清单；目标文件、报告、清单、action hash 或并发锁/执行 claim 任一发生冲突都会返回 `409`，不覆盖变化后的文件。缺少独立审批凭据返回 `403 APPROVAL_AUTH_REQUIRED`；事务或提案不存在返回 `404`；超过 32 个待审批提案返回 `429 RECOVERY_PROPOSAL_LIMIT`。服务端恢复应用失败、部分补偿失败、最终状态清单持久化失败或恢复扫描失败返回 `500`（分别使用 `RECOVERY_APPLY_FAILED`、`ROLLBACK_PARTIAL`、`FINALIZE_FAILED` 或相应扫描错误码）。
+
+提案在成功、失败或冲突后被消费；提案只存在于内存，Runtime 重启后不会自动恢复、批准或重放，操作者必须重新检查并创建新的提案。恢复成功、失败和部分补偿审计仅保留安全错误码、相对文件路径、模式、ID、摘要哈希与状态；失败说明使用受控通用文案，不持久化或回显原始 provider/OS 错误、绝对路径或凭据。恢复失败清单同样只保存安全错误码和相对路径，不保存原始错误文本。文件内容和审批凭据不会写入审计。
+
 会话、提案和事件快照仅接受位于已解析工作区根目录内的普通文件；快照文件或其 `.openclaw-workbench` 上级目录为符号链接时，恢复和写入都会以各自的 `*_STORE_INVALID` 错误拒绝。原子写入后的文件权限固定为 `0600`，目录以 `0700` 创建。该措施用于阻断配置错误或本地替换造成的路径逃逸；它不替代操作系统账户隔离，也不承诺对拥有同等本机文件系统权限的对手提供竞争条件防护。
 
 每个快照文件写入前还会以同目录 `<snapshot>.lock` 目录进行独占保护。检测到该锁时，写入立即以 `SESSION_STORE_BUSY`、`PROPOSAL_STORE_BUSY` 或 `EVENT_STORE_BUSY` 拒绝，不会等待、重试、抢占锁或以旧内存覆盖现有快照。锁只覆盖同步“写临时文件→rename→chmod”的临界区；进程崩溃留下的锁必须由本机操作者检查后处理，系统不会自行接管。

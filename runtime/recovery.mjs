@@ -9,6 +9,8 @@ export class RecoveryError extends Error {
 }
 
 const STATES = new Set(['prepared', 'committing', 'committed', 'rolled_back', 'rollback_partial', 'finalize_failed', 'recovery_apply_failed']);
+const TRANSACTION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const WINDOWS_RESERVED_TRANSACTION_ID = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 
 function inside(root, candidate) {
   const base = path.resolve(root);
@@ -21,6 +23,16 @@ function safeRelativePath(value) {
 }
 
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
+
+function safeRecoveryErrorCode(error) {
+  return typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'RECOVERY_FAILED';
+}
+
+function invalidManifestMessage(error) {
+  return error?.code === 'MANIFEST_PATH_INVALID'
+    ? 'transaction manifest contains an invalid path'
+    : 'transaction manifest is invalid';
+}
 
 function canonicalManifestPath(root, transactionId) {
   return path.resolve(root, '.openclaw-workbench', 'transactions', `${transactionId}.json`);
@@ -86,12 +98,12 @@ async function withRecoveryLock(root, fn) {
 }
 
 export function validateTransactionManifest({ root, manifest }) {
-  if (!manifest || !manifest.transactionId || !STATES.has(manifest.state) || !Array.isArray(manifest.files)) {
+  if (!manifest || typeof manifest.transactionId !== 'string' || !TRANSACTION_ID_PATTERN.test(manifest.transactionId) || WINDOWS_RESERVED_TRANSACTION_ID.test(manifest.transactionId) || !STATES.has(manifest.state) || !Array.isArray(manifest.files)) {
     throw new RecoveryError('MANIFEST_INVALID', 'invalid transaction manifest');
   }
   for (const file of manifest.files) {
     if (!safeRelativePath(file.relativePath) || !file.target || path.resolve(file.target) !== path.resolve(root, file.relativePath) || !inside(root, file.target) || (file.snapshot && !inside(root, file.snapshot))) {
-      throw new RecoveryError('MANIFEST_PATH_INVALID', file.relativePath ?? 'unknown');
+    throw new RecoveryError('MANIFEST_PATH_INVALID', 'transaction manifest contains an invalid path');
     }
     if (file.temp && !inside(root, file.temp)) throw new RecoveryError('MANIFEST_PATH_INVALID', file.relativePath);
   }
@@ -105,9 +117,9 @@ export async function scanPendingTransactions({ root, directory = '.openclaw-wor
   try { stable = await openStableParent(root, path.join(transactionDir, '.scan-anchor')); }
   catch (error) {
     if (error.code === 'TARGET_PARENT_UNAVAILABLE' && /ENOENT/.test(error.message)) return Object.freeze([]);
-    throw new RecoveryError('SCAN_FAILED', error.message);
+    throw new RecoveryError('SCAN_FAILED', 'transaction scan failed');
   }
-  const entries = await readdir(stable.stableParent, { withFileTypes: true }).catch((error) => { throw new RecoveryError('SCAN_FAILED', error.message); });
+  const entries = await readdir(stable.stableParent, { withFileTypes: true }).catch(() => { throw new RecoveryError('SCAN_FAILED', 'transaction scan failed'); });
   const pending = [];
   try {
     for (const entry of entries) {
@@ -115,22 +127,34 @@ export async function scanPendingTransactions({ root, directory = '.openclaw-wor
       const filePath = path.join(transactionDir, entry.name);
       let handle;
       let manifest;
+      let manifestBytes;
       try {
         handle = await open(path.join(stable.stableParent, entry.name), constants.O_RDONLY | constants.O_NOFOLLOW);
         if (!(await handle.stat()).isFile()) throw new Error('manifest is not a regular file');
-        manifest = JSON.parse(await handle.readFile({ encoding: 'utf8' }));
+        manifestBytes = await handle.readFile();
+        manifest = JSON.parse(manifestBytes.toString('utf8'));
       } catch (error) {
-        if (!tolerateInvalid) throw new RecoveryError('MANIFEST_INVALID', entry.name, { error: error.message });
-        pending.push(Object.freeze({ transactionId: entry.name, state: 'unknown', manifestPath: filePath, invalid: Object.freeze({ code: 'MANIFEST_INVALID', message: error.message }) }));
+        if (!tolerateInvalid) throw new RecoveryError('MANIFEST_INVALID', 'transaction manifest is invalid');
+        pending.push(Object.freeze({ transactionId: entry.name, state: 'unknown', manifestPath: filePath, invalid: Object.freeze({ code: 'MANIFEST_INVALID', message: 'transaction manifest is invalid' }) }));
         continue;
       } finally { await handle?.close().catch(() => {}); }
-      try { validateTransactionManifest({ root, manifest }); }
+      try {
+        validateTransactionManifest({ root, manifest });
+        if (manifest.transactionId !== entry.name.slice(0, -'.json'.length)) throw new RecoveryError('MANIFEST_INVALID', 'transaction id does not match its manifest filename');
+      }
       catch (error) {
         if (!tolerateInvalid) throw error;
-        pending.push(Object.freeze({ transactionId: manifest?.transactionId ?? entry.name, state: manifest?.state ?? 'unknown', manifestPath: filePath, invalid: Object.freeze({ code: error.code ?? 'MANIFEST_INVALID', message: error.message }) }));
+        pending.push(Object.freeze({ transactionId: entry.name.slice(0, -'.json'.length), state: manifest?.state ?? 'unknown', manifestPath: filePath, invalid: Object.freeze({ code: error.code ?? 'MANIFEST_INVALID', message: invalidManifestMessage(error) }) }));
         continue;
       }
-      if (manifest.state === 'prepared' || manifest.state === 'committing' || manifest.state === 'rollback_partial' || manifest.state === 'finalize_failed' || manifest.state === 'recovery_apply_failed') pending.push(Object.freeze({ ...manifest, manifestPath: filePath }));
+      if (manifest.state === 'prepared' || manifest.state === 'committing' || manifest.state === 'rollback_partial' || manifest.state === 'finalize_failed' || manifest.state === 'recovery_apply_failed') {
+        const pendingManifest = { ...manifest };
+        Object.defineProperties(pendingManifest, {
+          manifestPath: { value: filePath, enumerable: false },
+          manifestHash: { value: hash(manifestBytes), enumerable: false },
+        });
+        pending.push(Object.freeze(pendingManifest));
+      }
     }
   } finally { await stable.directory.close().catch(() => {}); }
   return Object.freeze(pending);
@@ -192,13 +216,21 @@ export async function finalizeAlreadyCommitted({ root, manifest, manifestPath, a
   });
 }
 
-export async function executeRecovery({ root, manifest, manifestPath, mode, approved = false, audit, renameFile = rename, updateManifest } = {}) {
+export async function executeRecovery({ root, manifest, manifestPath, expectedManifestHash, expectedReportHash, mode, approved = false, audit, renameFile = rename, updateManifest } = {}) {
   validateTransactionManifest({ root, manifest });
   if (!approved) throw new RecoveryError('APPROVAL_REQUIRED', 'recovery requires explicit approval');
   if (mode !== 'rollback' && mode !== 'resume') throw new RecoveryError('MODE_INVALID', mode ?? 'missing mode');
   if (manifestPath) assertBoundManifestPath(root, manifest, manifestPath);
   return withRecoveryLock(root, async () => {
+    if (expectedManifestHash !== undefined) {
+      if (!manifestPath) throw new RecoveryError('MANIFEST_PATH_REQUIRED', 'manifest hash requires a durable manifest path');
+      const persistedManifest = await readSafeFile(root, manifestPath, 'transaction manifest');
+      if (!persistedManifest || hash(persistedManifest) !== expectedManifestHash) throw new RecoveryError('MANIFEST_CONFLICT', 'transaction manifest changed before recovery');
+    }
     const report = await inspectPendingTransaction({ root, manifest });
+    if (expectedReportHash !== undefined && hash(JSON.stringify(report)) !== expectedReportHash) {
+      throw new RecoveryError('RECOVERY_STALE', 'transaction files changed before recovery');
+    }
     const decision = decideRecovery(report);
     if (decision.decision === 'blocked') throw new RecoveryError('RECOVERY_BLOCKED', decision.reason, decision);
     if (mode === 'resume' && !report.files.every((file) => file.currentMatchesAfter || (file.currentMatchesBefore && file.tempAvailable && file.tempMatchesAfter))) {
@@ -213,7 +245,7 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
         if (file.snapshot) await assertSafeExistingPath(root, file.snapshot, file.relativePath);
         if (file.temp) await assertSafeExistingPath(root, file.temp, file.relativePath);
         if (mode === 'resume' && file.temp && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesAfter) {
-          const content = await readSafeFile(root, file.temp, file.relativePath).catch((error) => { throw new RecoveryError('TEMP_UNAVAILABLE', file.relativePath, { error: error.message }); });
+          const content = await readSafeFile(root, file.temp, file.relativePath).catch(() => { throw new RecoveryError('TEMP_UNAVAILABLE', file.relativePath); });
           if (hash(content) !== file.afterHash) throw new RecoveryError('TEMP_HASH_MISMATCH', file.relativePath);
           try {
             await replaceWithinStableParent({ root, source: file.temp, target: file.target, renameFile, expectedSourceHash: file.afterHash, expectedTargetHash: file.beforeHash, expectedAfterHash: file.afterHash });
@@ -223,7 +255,7 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
             throw error;
           }
         } else if (mode === 'rollback' && file.snapshot && !report.files.find((item) => item.relativePath === file.relativePath).currentMatchesBefore) {
-          const content = await readSafeFile(root, file.snapshot, file.relativePath).catch((error) => { throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath, { error: error.message }); });
+          const content = await readSafeFile(root, file.snapshot, file.relativePath).catch(() => { throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath); });
           if (!content) throw new RecoveryError('SNAPSHOT_UNAVAILABLE', file.relativePath);
           if (hash(content) !== file.beforeHash) throw new RecoveryError('SNAPSHOT_HASH_MISMATCH', file.relativePath);
           const temp = `${file.target}.ocw-recovery.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -260,19 +292,24 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
             await unlinkStableFile(root, temp).catch(() => {});
             throw error;
           }
-        } catch (rollbackError) { rollbackErrors.push({ path: file.relativePath, error: rollbackError.message }); }
+        } catch (rollbackError) { rollbackErrors.push({ path: file.relativePath, code: safeRecoveryErrorCode(rollbackError), error: 'compensation failed' }); }
       }
-      const failureCode = rollbackErrors.length ? 'ROLLBACK_PARTIAL' : 'RECOVERY_APPLY_FAILED';
+      // Only target/source drift is a client-visible conflict. Missing or corrupted
+      // recovery material is an internal apply failure and must remain HTTP 500.
+      const conflictCodes = new Set(['TARGET_CHANGED', 'SOURCE_CHANGED']);
+      const failureCode = rollbackErrors.length ? 'ROLLBACK_PARTIAL' : conflictCodes.has(error.code) ? 'RECOVERY_STALE' : 'RECOVERY_APPLY_FAILED';
       const failureState = rollbackErrors.length ? 'rollback_partial' : 'recovery_apply_failed';
+      const causeCode = safeRecoveryErrorCode(error);
+      const failureMessage = rollbackErrors.length ? 'recovery was only partially compensated' : failureCode === 'RECOVERY_STALE' ? 'transaction files changed during recovery' : 'recovery application failed';
       let recoveryManifestWritten = false;
       if (manifestPath && inside(root, manifestPath)) {
         try {
-          await atomicWriteManifest(root, manifestPath, { ...manifest, state: failureState, recoveryError: { code: failureCode, message: error.message, applied: appliedPaths, rollbackErrors } });
+          await atomicWriteManifest(root, manifestPath, { ...manifest, state: failureState, recoveryError: { code: failureCode, causeCode, message: failureMessage, applied: appliedPaths, rollbackErrors } });
           recoveryManifestWritten = true;
         } catch { /* 状态落盘失败不掩盖恢复主错误 */ }
       }
-      if (audit) await audit.append({ type: 'transaction.recovery_apply_failed', actor: 'system', transactionId: manifest.transactionId, files: manifest.files.map((file) => file.relativePath), code: failureCode, applied: appliedPaths, rollbackErrors, recoveryManifestWritten }).catch(() => {});
-      throw new RecoveryError(failureCode, error.message, { state: failureState, applied: appliedPaths, rollbackErrors, recoveryManifestWritten });
+      if (audit) await audit.append({ type: 'transaction.recovery_apply_failed', actor: 'system', transactionId: manifest.transactionId, files: manifest.files.map((file) => file.relativePath), code: failureCode, causeCode, message: failureMessage, applied: appliedPaths, rollbackErrors, recoveryManifestWritten }).catch(() => {});
+      throw new RecoveryError(failureCode, failureMessage, { state: failureState, causeCode, applied: appliedPaths, rollbackErrors, recoveryManifestWritten });
     }
     const finalState = mode === 'rollback' ? 'rolled_back' : 'committed';
     // 具备清单路径时，成功恢复必须同步落盘终态；否则下次扫描会把已完成事务再次当作 pending。
@@ -281,14 +318,16 @@ export async function executeRecovery({ root, manifest, manifestPath, mode, appr
       try { await finalize({ ...manifest, state: finalState }); }
       catch (error) {
         let recoveryManifestWritten = false;
+        const causeCode = safeRecoveryErrorCode(error);
+        const failureMessage = 'recovery finalization failed';
         if (manifestPath && inside(root, manifestPath)) {
           try {
-            await atomicWriteManifest(root, manifestPath, { ...manifest, state: 'finalize_failed', finalizeError: { state: finalState, message: error.message } });
+            await atomicWriteManifest(root, manifestPath, { ...manifest, state: 'finalize_failed', finalizeError: { state: finalState, code: 'FINALIZE_FAILED', causeCode, message: failureMessage } });
             recoveryManifestWritten = true;
           } catch { /* 保留 FINALIZE_FAILED；下一次启动仍可依靠文件 hash 重新判断 */ }
         }
-        if (audit) await audit.append({ type: 'transaction.finalize_failed', actor: 'system', transactionId: manifest.transactionId, files: manifest.files.map((file) => file.relativePath), state: finalState, recoveryManifestWritten, error: error.message }).catch(() => {});
-        throw new RecoveryError('FINALIZE_FAILED', error.message, { state: finalState, recoveryManifestWritten });
+        if (audit) await audit.append({ type: 'transaction.finalize_failed', actor: 'system', transactionId: manifest.transactionId, files: manifest.files.map((file) => file.relativePath), state: finalState, code: 'FINALIZE_FAILED', causeCode, message: failureMessage, recoveryManifestWritten }).catch(() => {});
+        throw new RecoveryError('FINALIZE_FAILED', failureMessage, { state: finalState, causeCode, recoveryManifestWritten });
       }
     }
     let auditWritten = false;
