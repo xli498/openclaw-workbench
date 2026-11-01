@@ -185,7 +185,7 @@ public static class OcwConPty
   $size.Y = [int16]$rows
   $hPC = [IntPtr]::Zero
   $hr = [OcwConPty]::CreatePseudoConsole($size, $inputPipe.Read, $outputPipe.Write, 0, [ref]$hPC)
-  if ($hr -ne 0 -or $hPC -eq [IntPtr]::Zero) { throw 'CreatePseudoConsole failed' }
+  if ($hr -ne 0 -or $hPC -eq [IntPtr]::Zero) { throw "CreatePseudoConsole failed (hr=$hr)" }
 
   $attrSize = [IntPtr]::Zero
   [void][OcwConPty]::InitializeProcThreadAttributeList([IntPtr]::Zero, 1, 0, [ref]$attrSize)
@@ -197,16 +197,20 @@ public static class OcwConPty
     try {
       if (-not [OcwConPty]::UpdateProcThreadAttribute($attrList, 0, [OcwConPty]::ProcThreadAttributePseudoConsole, $pcPtr, [IntPtr][IntPtr]::Size, [IntPtr]::Zero, [IntPtr]::Zero)) { throw 'UpdateProcThreadAttribute failed' }
       $startup = New-Object OcwConPty+StartupInfoEx
-      # cb is the size of STARTUPINFO, not STARTUPINFOEX: CreateProcess
-      # validates cb against the base structure, and the attribute list
-      # is read only because EXTENDED_STARTUPINFO_PRESENT is set.
-      # NOTE: SizeOf must be given a structure INSTANCE here. Passing
-      # the type literal ([OcwConPty+StartupInfo]) binds PowerShell to
+      # cb MUST be sizeof(STARTUPINFOEX), not sizeof(STARTUPINFO):
+      # Microsoft's STARTUPINFOEX docs state this explicitly ("Be sure
+      # to set the cb member of the STARTUPINFO structure to
+      # sizeof(STARTUPINFOEX)"), and the ConPTY sample does the same.
+      # A previous iteration set sizeof(STARTUPINFO) here and
+      # CreateProcess then failed outright -- that was the wrong
+      # direction, corrected here.
+      # NOTE: SizeOf must be given a structure INSTANCE. Passing the
+      # type literal ([OcwConPty+StartupInfoEx]) binds PowerShell to
       # the SizeOf(object) overload, which throws "Type
       # 'System.RuntimeType' cannot be marshaled" -- that one-line
-      # mistake killed the helper before CreateProcess in every earlier
-      # Windows run, which is why the failure never got past startup.
-      $startup.StartupInfo.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf((New-Object OcwConPty+StartupInfo))
+      # mistake killed the helper before CreateProcess in the earliest
+      # Windows runs.
+      $startup.StartupInfo.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf((New-Object OcwConPty+StartupInfoEx))
       $startup.lpAttributeList = $attrList
       $procInfo = New-Object OcwConPty+ProcessInformation
       $flags = [OcwConPty]::ExtendedStartupinfoPresent -bor [OcwConPty]::CreateUnicodeEnvironment
@@ -215,8 +219,10 @@ public static class OcwConPty
       # the child through the attribute list, which is only applied to
       # inheritable handles. FALSE leaves the child without a console
       # (or fails CreateProcess outright), which is the classic ConPTY
-      # P/Invoke failure mode.
-      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) { throw 'CreateProcess failed' }
+      # P/Invoke failure mode. The Win32 code is attached so any
+      # further CreateProcess failure is precisely identified instead
+      # of a bare message (SetLastError=true is set on the import).
+      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) { throw "CreateProcess failed (Win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
     } finally {
       [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
     }
