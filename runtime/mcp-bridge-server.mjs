@@ -320,5 +320,19 @@ export function createMcpBridgeServer({
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 
-  return Object.freeze({ start, stop, address, endpointPath: () => endpoint, protocolVersion: PROTOCOL_VERSION });
+  function broadcast(sessionId, notification) {
+    if (typeof sessionId !== 'string' || !sessions.has(sessionId)) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
+    if (!plainObject(notification) || typeof notification.method !== 'string' || !notification.method || notification.method.length > 128 || /[\0\r\n]/.test(notification.method) || (notification.params !== undefined && !plainObject(notification.params))) fail('MCP_NOTIFICATION_INVALID', 'MCP broadcast notification is invalid');
+    const session = sessions.get(sessionId);
+    const encoded = boundedJson({ jsonrpc: '2.0', method: notification.method, params: notification.params ?? {} }, maxResponseBytes, 'MCP_RESPONSE_LIMIT');
+    let delivered = 0;
+    for (const response of [...session.streams]) {
+      try { response.write(`event: message\ndata: ${encoded}\n\n`); delivered += 1; }
+      catch { session.streams.delete(response); }
+    }
+    session.lastActivity = clock();
+    return Object.freeze({ sessionId, delivered });
+  }
+
+  return Object.freeze({ start, stop, address, endpointPath: () => endpoint, protocolVersion: PROTOCOL_VERSION, broadcast, sessionCount: () => sessions.size, streamCount: (sessionId) => sessions.get(sessionId)?.streams.size ?? 0 });
 }
