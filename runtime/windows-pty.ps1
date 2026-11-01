@@ -325,7 +325,17 @@ public static class OcwConPty
     [void][OcwConPty]::CloseHandle($inputPipe.Read)
     [void][OcwConPty]::CloseHandle($outputPipe.Write)
   }
-  [Environment]::Exit([int]$exitCode)
+  # GetExitCodeProcess returns a DWORD; a child exit code >= 2^31 is an
+  # NTSTATUS value, and PowerShell's [int] cast of such a uint throws
+  # ("too large or too small for an Int32") instead of wrapping -- so
+  # a child exiting with e.g. 0xC0000002 crashed the helper at this
+  # line instead of reporting failure. The provider only distinguishes
+  # zero from non-zero (the numeric code is not carried on the failed
+  # result, a known gap shared with the POSIX provider), so normalize
+  # here: 0 stays 0, anything else becomes 1. Behavior is identical
+  # for all codes except >= 2^31, where it replaces a helper crash
+  # with the failure the provider would have reported anyway.
+  if ($exitCode -eq 0) { [Environment]::Exit(0) } else { [Environment]::Exit(1) }
 } catch {
   [Console]::Error.WriteLine("PTY_FAILED: $($_.Exception.Message)")
   [Environment]::Exit(1)
