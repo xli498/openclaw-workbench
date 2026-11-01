@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1220" />
+    <title>OpenClaw Workbench</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-mark" aria-hidden="true">OC</div>
+        <div>
+          <p class="eyebrow">LOCAL DEVELOPMENT WORKBENCH</p>
+          <h1>OpenClaw Workbench</h1>
+        </div>
+        <div class="topbar-status" aria-label="桌面状态"><span class="status-dot status-dot--idle" aria-hidden="true"></span><span>桌面壳已启动</span></div>
+      </header>
+
+      <main class="content">
+        <section class="welcome-row" aria-labelledby="welcome-title">
+          <div>
+            <p class="eyebrow">首屏连接</p>
+            <h2 id="welcome-title">先选择一个本地项目</h2>
+            <p class="intro">项目路径只保存在当前用户的桌面配置中。Runtime 接入桌面进程后，状态会在这里自动更新。</p>
+          </div>
+          <div class="mode-chip"><span class="mode-chip__key">MODE</span> 本地</div>
+        </section>
+
+        <section class="workspace-panel panel" aria-labelledby="workspace-title">
+          <div class="panel-heading"><div><p class="section-kicker">01 / WORKSPACE</p><h2 id="workspace-title">工作区</h2></div><span id="workspace-state" class="badge badge--muted">尚未选择</span></div>
+          <label class="field-label" for="project-path">项目文件夹路径</label>
+          <div class="path-entry">
+            <input id="project-path" name="project-path" type="text" inputmode="url" autocomplete="off" placeholder="例如：C:\\Users\\你\\Projects\\my-app" aria-describedby="project-help project-feedback" />
+            <button id="browse-workspace" class="button button--secondary" type="button">浏览文件夹</button>
+            <button id="save-project" class="button button--primary" type="button">保存项目</button>
+          </div>
+          <p id="project-help" class="field-help">选择文件夹或输入本地绝对路径；桌面进程会校验路径，且不会将路径发送到网络。</p>
+          <p id="project-feedback" class="feedback" role="status" aria-live="polite"></p>
+        </section>
+
+        <div class="status-grid">
+          <section class="panel status-panel" aria-labelledby="runtime-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">02 / RUNTIME</p><h2 id="runtime-title">运行时</h2></div><span id="runtime-state" class="badge badge--warning">未接入</span></div>
+            <div class="status-value"><span id="runtime-dot" class="status-dot status-dot--warning" aria-hidden="true"></span><strong id="runtime-copy">等待启动本地 Runtime</strong></div>
+            <div class="runtime-actions"><button id="start-runtime" class="button button--primary" type="button">启动 Runtime</button><button id="stop-runtime" class="button button--secondary" type="button" disabled>停止 Runtime</button></div>
+            <p class="status-copy">Runtime 由桌面进程管理；控制令牌只在桌面内存中使用，不会显示在页面或链接中。</p>
+          </section>
+
+          <section class="panel status-panel" aria-labelledby="connection-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">03 / CONNECTION</p><h2 id="connection-title">控制台连接</h2></div><span id="connection-state" class="badge badge--muted">未配置</span></div>
+            <label class="field-label" for="runtime-address">Runtime 地址</label>
+            <div class="address-entry">
+              <input id="runtime-address" name="runtime-address" type="url" inputmode="url" autocomplete="off" placeholder="http://127.0.0.1:3000" aria-describedby="address-feedback" />
+              <button id="save-address" class="button button--secondary" type="button">保存</button>
+            </div>
+            <p id="address-feedback" class="feedback" role="status" aria-live="polite"></p>
+            <a id="console-link" class="console-link console-link--disabled" href="#" aria-disabled="true" tabindex="-1" title="需要桌面认证后才能打开控制台">打开控制台（需要桌面认证） <span aria-hidden="true">↗</span></a>
+          </section>
+        </div>
+
+        <section class="panel model-panel" aria-labelledby="model-title">
+          <div class="panel-heading">
+            <div><p class="section-kicker">04 / MODEL</p><h2 id="model-title">模型配置</h2></div>
+            <span id="model-state" class="badge badge--muted">Runtime 未运行</span>
+          </div>
+          <div class="model-layout">
+            <div>
+              <p class="field-help model-intro">配置一个 OpenAI-compatible 模型。API Key 仅发送给本地 Runtime 并保存到 Windows 凭据管理器；模型登记与启用都需要单独批准。</p>
+              <fieldset id="model-settings-form" class="model-settings-form" disabled>
+                <div class="model-fields">
+                  <label><span class="field-label">档案 ID</span><input id="model-id" autocomplete="off" placeholder="primary" /></label>
+                  <label><span class="field-label">Provider</span><input id="model-provider" autocomplete="off" placeholder="OpenAI-compatible" /></label>
+                  <label class="model-field--wide"><span class="field-label">API Endpoint</span><input id="model-endpoint" type="url" inputmode="url" autocomplete="url" placeholder="https://api.example.com/v1" /></label>
+                  <label><span class="field-label">模型名称</span><input id="model-name" autocomplete="off" placeholder="model-name" /></label>
+                  <label><span class="field-label">API Key</span><input id="model-api-key" type="password" autocomplete="new-password" placeholder="输入 API Key" /></label>
+                </div>
+                <div class="model-submit-row"><button id="save-model" class="button button--primary" type="button">保存并提交审批</button></div>
+              </fieldset>
+              <p id="model-feedback" class="feedback" role="status" aria-live="polite"></p>
+            </div>
+            <div class="model-management">
+              <div class="model-picker-heading"><label class="field-label" for="model-profile-picker">已配置模型</label><button id="refresh-models" class="button button--secondary" type="button" disabled>刷新状态</button></div>
+              <select id="model-profile-picker" aria-describedby="model-profile-list">
+                <option value="">启动 Runtime 后加载</option>
+              </select>
+              <div id="model-profile-list" class="model-profile-list" role="status" aria-live="polite">启动 Runtime 后加载模型状态。</div>
+              <div class="model-actions">
+                <button id="enable-model" class="button button--secondary" type="button" disabled>启用模型</button>
+                <button id="test-model" class="button button--secondary" type="button" disabled>测试连接</button>
+              </div>
+              <section id="model-proposal" class="model-proposal" aria-live="polite" hidden>
+                <div><strong>待人工批准</strong><p id="model-proposal-summary"></p></div>
+                <button id="approve-model" class="button button--primary" type="button">批准</button>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel ask-panel" aria-labelledby="ask-title">
+          <div class="panel-heading">
+            <div><p class="section-kicker">05 / ASK</p><h2 id="ask-title">Ask 工作台</h2></div>
+            <div class="mode-switch" role="tablist" aria-label="工作模式">
+              <button id="mode-ask" class="button button--small mode-button mode-button--active" type="button" role="tab" aria-selected="true">Ask</button>
+              <button id="mode-plan" class="button button--small mode-button" type="button" role="tab" aria-selected="false">Plan</button>
+              <button id="mode-code" class="button button--small mode-button" type="button" role="tab" aria-selected="false">Code</button>
+            </div>
+          </div>
+          <div class="mode-status-row"><span id="ask-mode-state" class="badge badge--success">Ask · 只读</span><span id="mode-safety-note">当前模式只读取项目，不会修改文件。</span></div>
+          <div id="ask-runtime-warning" class="ask-runtime-warning" role="status" aria-live="polite">
+            <strong>Runtime 未启动</strong>
+            <span>先选择项目并启动 Runtime，才能读取会话和发送 Ask 消息。</span>
+          </div>
+          <div class="ask-toolbar">
+            <div class="ask-session-picker">
+              <label class="field-label" for="ask-session-select">当前会话</label>
+              <select id="ask-session-select" aria-describedby="ask-session-status" disabled>
+                <option value="">启动 Runtime 后加载</option>
+              </select>
+            </div>
+            <button id="new-ask-session" class="button button--primary" type="button" disabled>新建会话</button>
+            <span id="ask-session-status" class="ask-session-status" role="status" aria-live="polite">Runtime 未启动</span>
+          </div>
+          <div id="ask-messages" class="ask-messages" aria-live="polite" aria-label="Ask 消息">
+            <p class="ask-empty">启动 Runtime 后，这里会显示 Ask 会话消息。</p>
+          </div>
+          <form id="ask-message-form" class="ask-composer">
+            <label id="message-input-label" class="field-label" for="ask-message-input">向当前项目提问</label>
+            <div class="ask-composer-row">
+              <textarea id="ask-message-input" rows="3" maxlength="32768" placeholder="例如：请阅读当前项目并总结主要风险" disabled></textarea>
+              <button id="send-ask-message" class="button button--primary" type="submit" disabled>发送</button>
+            </div>
+            <p id="ask-feedback" class="feedback" role="status" aria-live="polite"></p>
+            <p id="mode-help" class="field-help">Ask 只调用读取能力，不创建 Patch 或命令提案；任何修改都必须切换到 Code 流程并单独审批。</p>
+          </form>
+          <section id="plan-panel" class="mode-panel" hidden aria-labelledby="plan-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">READ ONLY</p><h3 id="plan-title">规划审查</h3></div><span class="badge badge--success">不会修改文件</span></div>
+            <label class="field-label" for="plan-question">规划问题</label>
+            <textarea id="plan-question" class="mode-textarea" rows="3" maxlength="32768" placeholder="例如：规划将登录流程迁移到 OAuth 需要哪些步骤？" disabled></textarea>
+            <button id="run-plan" class="button button--primary" type="button" disabled>生成 Plan</button>
+            <div id="plan-result" class="plan-result" aria-live="polite"><p class="ask-empty">输入问题后生成只读方案。</p></div>
+          </section>
+          <section id="code-panel" class="mode-panel" hidden aria-labelledby="code-title">
+            <div class="panel-heading panel-heading--compact"><div><p class="section-kicker">APPROVAL REQUIRED</p><h3 id="code-title">Code 提案</h3></div><span class="badge badge--warning">审批后才会修改</span></div>
+            <p class="field-help">Code 可以提出 Patch 或命令，但 Runtime 会在执行前暂停，必须由你明确批准。</p>
+            <div id="code-proposals" class="code-proposals" aria-live="polite"><p class="ask-empty">发送 Code 请求后，待审批提案会显示在这里。</p></div>
+          </section>
+        </section>
+
+        <section class="panel operations-panel" aria-labelledby="operations-title">
+          <div class="panel-heading">
+            <div><p class="section-kicker">06 / OPERATIONS</p><h2 id="operations-title">运行状态与恢复</h2></div>
+            <button id="refresh-operations" class="button button--secondary" type="button" disabled>刷新状态</button>
+          </div>
+          <div class="operations-grid">
+            <section class="operations-card" aria-labelledby="diagnostics-title">
+              <div class="operations-card-heading"><h3 id="diagnostics-title">诊断</h3><span id="diagnostics-state" class="badge badge--muted">未读取</span></div>
+              <p id="diagnostics-summary" class="operations-summary">Runtime 启动后读取组件健康状态。</p>
+              <div id="diagnostics-list" class="operations-list" role="status" aria-live="polite"></div>
+            </section>
+            <section class="operations-card" aria-labelledby="recovery-title">
+              <div class="operations-card-heading"><h3 id="recovery-title">恢复</h3><span id="recovery-state" class="badge badge--muted">未读取</span></div>
+              <p id="recovery-summary" class="operations-summary">没有自动执行恢复；需要人工复核的动作会列在这里。</p>
+              <p class="recovery-approval-note">先查看受影响文件和操作，再单独批准。未批准的恢复不会执行，Runtime 重启后也不会自动重放。</p>
+              <div id="recovery-list" class="operations-list" role="status" aria-live="polite"></div>
+            </section>
+            <section class="operations-card operations-card--wide" aria-labelledby="audit-title">
+              <div class="operations-card-heading"><h3 id="audit-title">最近审计事件</h3><span id="audit-state" class="badge badge--muted">未读取</span></div>
+              <div id="audit-list" class="operations-list operations-list--events" role="status" aria-live="polite"></div>
+            </section>
+            <section class="operations-card operations-card--wide" aria-labelledby="status-title">
+              <div class="operations-card-heading"><h3 id="status-title">持久化状态</h3><span id="status-state" class="badge badge--muted">未读取</span></div>
+              <div id="status-list" class="operations-list" role="status" aria-live="polite"></div>
+            </section>
+          </div>
+          <p id="operations-feedback" class="feedback" role="status" aria-live="polite"></p>
+        </section>
+      </main>
+
+      <footer class="footer"><span>OpenClaw Workbench 0.1.0</span><span>本地优先 · 审批优先</span></footer>
+    </div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

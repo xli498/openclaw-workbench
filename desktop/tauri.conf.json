@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OpenClaw Workbench",
+  "version": "0.1.0",
+  "identifier": "com.openclaw.workbench",
+  "build": {
+    "frontendDist": "frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "OpenClaw Workbench",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.ico"],
+    "targets": ["msi", "nsis"],
+    "resources": {
+      "../bin": "runtime/bin",
+      "../runtime": "runtime/runtime",
+      "../package.json": "runtime/package.json",
+      "node-runtime": "runtime/node"
+    },
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    }
+  }
+}
