@@ -307,12 +307,19 @@ public static class OcwConPty
     $exitCode = 0
     if (-not [OcwConPty]::GetExitCodeProcess($procInfo.hProcess, [ref]$exitCode)) { throw 'GetExitCodeProcess failed' }
   } finally {
+    # Close the streams BEFORE stopping the pumps: a pump blocked in
+    # a synchronous Read is only unblocked when its stream is closed
+    # (the Read then throws into the pump's catch block). Stopping
+    # first can block forever on that stuck Read, so the helper never
+    # reaches [Environment]::Exit -- and a lingering helper keeps the
+    # test-file process alive through its piped stdio, hanging the
+    # whole Windows run even though the single test already timed out.
     try { $inputStream.Close() } catch { }
+    try { $outputStream.Close() } catch { }
     try { $outputPump.Stop() } catch { }
     try { $inputPump.Stop() } catch { }
     try { $outputPump.Dispose() } catch { }
     try { $inputPump.Dispose() } catch { }
-    try { $outputStream.Close() } catch { }
     [void][OcwConPty]::CloseHandle($procInfo.hProcess)
     [OcwConPty]::ClosePseudoConsole($hPC)
     [void][OcwConPty]::CloseHandle($inputPipe.Read)

@@ -56,7 +56,18 @@ async function runConPty(root, argv, { writeInput = null } = {}) {
     onExit: (result) => resolveExit(result),
   });
   if (writeInput !== null) await handle.write(writeInput);
-  const result = await withTimeout(exited, 60_000, 'ConPTY child exit');
+  let result;
+  try {
+    result = await withTimeout(exited, 60_000, 'ConPTY child exit');
+  } catch (error) {
+    // A timed-out session must not orphan its helper: without the
+    // abort, a helper stuck waiting on its child (or in cleanup) keeps
+    // the test-file process alive through its piped stdio and hangs
+    // the whole Windows run even though this test already failed.
+    // Abort triggers the provider's taskkill of the helper tree.
+    controller.abort();
+    throw error;
+  }
   return { handle, outputs, result, controller };
 }
 
