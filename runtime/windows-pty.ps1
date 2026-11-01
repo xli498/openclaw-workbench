@@ -200,17 +200,25 @@ public static class OcwConPty
       # cb MUST be sizeof(STARTUPINFOEX), not sizeof(STARTUPINFO):
       # Microsoft's STARTUPINFOEX docs state this explicitly ("Be sure
       # to set the cb member of the STARTUPINFO structure to
-      # sizeof(STARTUPINFOEX)"), and the ConPTY sample does the same.
-      # A previous iteration set sizeof(STARTUPINFO) here and
-      # CreateProcess then failed outright -- that was the wrong
-      # direction, corrected here.
-      # NOTE: SizeOf must be given a structure INSTANCE. Passing the
-      # type literal ([OcwConPty+StartupInfoEx]) binds PowerShell to
-      # the SizeOf(object) overload, which throws "Type
-      # 'System.RuntimeType' cannot be marshaled" -- that one-line
-      # mistake killed the helper before CreateProcess in the earliest
-      # Windows runs.
-      $startup.StartupInfo.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf((New-Object OcwConPty+StartupInfoEx))
+      # sizeof(STARTUPINFOEX)"), and the official ConPTY sample does
+      # the same.
+      # NOTE (PowerShell nested-struct trap, found by the Win32 87
+      # failure): $startup.StartupInfo.cb = X does NOT persist, because
+      # StartupInfo is a value-type field -- PowerShell hands back a
+      # COPY of the nested struct, the cb assignment lands on the copy,
+      # and it is discarded, leaving cb = 0, which makes CreateProcess
+      # fail with ERROR_INVALID_PARAMETER (87). The working pattern is
+      # copy-modify-reassign: pull the nested struct into a variable,
+      # set cb there, and write the whole struct back. (Top-level field
+      # assignment does persist -- Coord X/Y and SecurityAttributes
+      # nLength prove it -- only the nested level is lost.)
+      # NOTE: SizeOf must likewise be given a structure INSTANCE.
+      # Passing the type literal binds PowerShell to the SizeOf(object)
+      # overload, which throws "Type 'System.RuntimeType' cannot be
+      # marshaled" -- the failure of the earliest Windows runs.
+      $si = $startup.StartupInfo
+      $si.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf((New-Object OcwConPty+StartupInfoEx))
+      $startup.StartupInfo = $si
       $startup.lpAttributeList = $attrList
       $procInfo = New-Object OcwConPty+ProcessInformation
       $flags = [OcwConPty]::ExtendedStartupinfoPresent -bor [OcwConPty]::CreateUnicodeEnvironment
@@ -222,7 +230,7 @@ public static class OcwConPty
       # P/Invoke failure mode. The Win32 code is attached so any
       # further CreateProcess failure is precisely identified instead
       # of a bare message (SetLastError=true is set on the import).
-      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) { throw "CreateProcess failed (Win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
+      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) { throw "CreateProcess failed (Win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()), cb=$($startup.StartupInfo.cb))" }
     } finally {
       [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
     }
