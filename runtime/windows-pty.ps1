@@ -229,57 +229,35 @@ public static class OcwConPty
       # the child through the attribute list, which is only applied to
       # inheritable handles. FALSE leaves the child without a console
       # (or fails CreateProcess outright), which is the classic ConPTY
-      # P/Invoke failure mode. The Win32 code is attached so any
-      # further CreateProcess failure is precisely identified instead
-      # of a bare message (SetLastError=true is set on the import).
-      # The booleans below exist to pin down ERROR_PATH_NOT_FOUND (3):
-      # they say whether the working directory and the cmd.exe the
-      # child resolves to actually exist, without logging argv values.
-      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) {
+      # P/Invoke failure mode.
+      # Application-name resolution: a bare module name (no directory
+      # separator) relies on CreateProcess's own search, which fails in
+      # this hosted context -- proven by failure-path probes on Windows
+      # CI: bare name -> Win32 3 (explicit cwd) / 123 (null cwd)
+      # regardless of env, while the full System32 path -> 0 with
+      # everything else identical. So bare names are resolved to a full
+      # path first: a real file under System32 (existence-guarded, so
+      # only genuine system binaries take this path), else the first
+      # Get-Command match over PATH. If resolution fails, appName stays
+      # NULL (previous behavior). The child still sees the original
+      # command line unchanged.
+      $appName = $null
+      $firstArg = [string]$argv[0]
+      if ($firstArg -notmatch '[\\/]') {
+        if ($childSystemRoot) {
+          $sysCandidate = Join-Path $childSystemRoot "System32\$firstArg"
+          if (Test-Path -LiteralPath $sysCandidate -PathType Leaf) { $appName = $sysCandidate }
+        }
+        if (-not $appName) {
+          try {
+            $found = @(Get-Command $firstArg -ErrorAction Stop)
+            if ($found.Count -gt 0 -and $found[0].Source) { $appName = [string]$found[0].Source }
+          } catch { }
+        }
+      }
+      if (-not [OcwConPty]::CreateProcess($appName, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) {
         $win32 = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        $cwdExists = Test-Path -LiteralPath $cwd -PathType Container
-        $sysRoot = if ($childSystemRoot) { $childSystemRoot } else { $env:SystemRoot }
-        $cmdExists = $false
-        if ($sysRoot) { $cmdExists = Test-Path -LiteralPath (Join-Path $sysRoot 'System32\cmd.exe') -PathType Leaf }
-        # Bisection probes (diagnostic only -- the session still fails
-        # with the original error below). Each probe reuses the same
-        # HPCON, attribute list, flags, and command line, and nulls
-        # out one input, so the pattern localizes the fault:
-        #   noEnv+noCwd ok, env+noCwd fail, noEnv+cwd ok => env block
-        #   noEnv+noCwd ok, env+noCwd ok, noEnv+cwd fail => cwd
-        #   all fail => shared cmdline/startup/attribute inputs
-        # A fresh StringBuilder is built per probe because CreateProcess
-        # may modify the command-line buffer in place. Probe children
-        # are the same echo command; their handles are closed at once
-        # and never waited on, and their console output is discarded
-        # when the helper exits. No argv values are reported.
-        # Second-round probes (Win32 3 with cwd, 123 without): cwd is
-        # the only input that changes the error, yet Test-Path says it
-        # exists -- so this round also prints the cwd value itself and
-        # the helper's inherited location, and probes a guaranteed
-        # directory (SystemRoot) and a full-path application name, to
-        # separate "this temp path is the problem" from "cwd passing
-        # or module resolution is the problem".
-        function Test-CreateProcess($envArg, $cwdArg, $appArg) {
-          $pi = New-Object OcwConPty+ProcessInformation
-          $probeCmd = New-Object System.Text.StringBuilder($commandLine)
-          $ok = [OcwConPty]::CreateProcess($appArg, $probeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envArg, $cwdArg, [ref]$startup, [ref]$pi)
-          $code = if ($ok) { 0 } else { [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() }
-          if ($pi.hProcess -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($pi.hProcess) }
-          if ($pi.hThread -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($pi.hThread) }
-          return $code
-        }
-        $probeNoEnvNoCwd = Test-CreateProcess $null $null $null
-        $probeEnvNoCwd = Test-CreateProcess $envBlock $null $null
-        $probeNoEnvCwd = Test-CreateProcess $null $cwd $null
-        $probeSysRootCwd = $null
-        $probeFullApp = $null
-        if ($sysRoot) {
-          $probeSysRootCwd = Test-CreateProcess $null $sysRoot $null
-          $probeFullApp = Test-CreateProcess $null $cwd (Join-Path $sysRoot 'System32\cmd.exe')
-        }
-        $here = (Get-Location).Path
-        throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb), cwd=[$cwd], here=[$here], cwdExists=$cwdExists, cmdExists=$cmdExists, envCount=$($envPairs.Count), hpc=$($hPC -ne [IntPtr]::Zero), attr=$($attrList -ne [IntPtr]::Zero), probeNoEnvNoCwd=$probeNoEnvNoCwd, probeEnvNoCwd=$probeEnvNoCwd, probeNoEnvCwd=$probeNoEnvCwd, probeSysRootCwd=$probeSysRootCwd, probeFullApp=$probeFullApp)"
+        throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb))"
       }
     } finally {
       [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
