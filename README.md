@@ -1,5 +1,7 @@
 # OpenClaw Workbench
 
+> **已停更，仅作历史参考/展示。**
+
 面向 OpenClaw 的可审计本地 Agent Runtime 基础设施，提供审批绑定的 Patch 和 Terminal 执行闭环。
 
 > 这是独立的、非官方 OpenClaw 项目，不会自动修改 OpenClaw 配置。当前版本是可测试的 Runtime 产品基线，不是已经接管生产环境的完整控制面。
