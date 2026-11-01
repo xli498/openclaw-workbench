@@ -61,11 +61,18 @@
 2. 完成独立最终代码审核，修复 Critical/Important 问题后再创建/合并 PR；当前本地 commit 为 `59fe813`，远端推送等待授权和网络恢复。
 3. 仅在用户明确需要时设计真正 PTY provider；在此之前保持 `pty:false` 产品边界。
 
-## 仍未闭合项（截至本轮闭环，2026-11-01，写明原因与下一步，不冒充完成）
+## 第二轮闭环已完成（2026-11-01，PR #28–#32）
 
-- **LSP**：未实现。下一步：先定语言服务器接入边界（工作区内、只读优先、审批门禁是否适用），再按垂直切片实现并补测试。
-- **真正 PTY provider**：未实现；默认 fallback 明确报告 `pty:false`。下一步：仅在用户明确需要时设计（宿主显式注入、进程树、权限与秘密环境复审），在此之前保持 `pty:false` 产品边界。
-- **OpenClaw channel / Gateway 生命周期**：未实现；`createGatewayAdapter` 只有回环 WebSocket 传输边界，固定禁止公网地址，不自动连接、启动 Gateway 或读取密钥。下一步：先以当前版本实测 OpenClaw 稳定集成接口，再设计生命周期接入。
-- **标准 SSE 双通道与完整 streamable HTTP 会话语义、HTTP 工具执行路由**：未开放；`createMcpHttpTransport` 只有受限一次性 POST JSON-RPC 边界。下一步：按 MCP `2025-06-18` 会话语义逐项补齐并补红队测试。
-- **完整 MCP 管理**：只有受控注册骨架（默认禁用，不启动 Server、不调用工具）。下一步：在注册骨架上补管理面，仍须守住 allowlist、审批与配置漂移失效规则。
-- **公网隧道真实部署验证**：受控 CLI 适配器（cloudflare-quick/named、ngrok/ngrok-fixed，`shell:false`、Bearer 只放环境变量、随机路由路径）已实现，但真实 Cloudflare/ngrok 启动、域名绑定、TLS、设备配对和公网运维仍未验证。下一步：在受控环境实测一次完整公网部署后再改文档口径，验证前不称生产可用。
+- **标准 SSE 双通道与 streamable HTTP 会话语义（已完成客户端与桥接广播）**：`createMcpHttpTransport` 新增 `initialize` 协商（仅接受 `2025-06-18`）、`notify`（202/204）、GET SSE `subscribe`（Last-Event-ID 续接、按事件分帧限额、畸形事件忽略、超限报错）与 DELETE `terminateSession`；桥接服务端新增受控 `broadcast(sessionId, notification)` 与 `streamCount`。工具执行仍走审批与 allowlist；服务端自动推送仅来自显式 `broadcast` 调用，不由工具执行自动产生。
+- **完整 MCP 管理面 API（已完成）**：注册表新增 `update`（配置变更后强制重新启用，旧实例因 configHash 失效）与 `remove`（hash 校验，运行中拒绝）；运行时新增 `listTools`（返回工具名与 authorized 标记，列出绝不等于授权）；控制面新增 update/remove 提案与 GET tools。桌面端 MCP 管理面板仍未实现。
+- **LSP（只读客户端切片已完成，全量 LSP 未闭合）**：`createLspClient` 为工作区内 stdio 客户端，仅允许只读方法（initialize、hover、definition、references、documentSymbol、completion、workspace/symbol、shutdown）；服务端请求绝不自动执行（默认回 -32601），命令/参数拒绝 shell 与凭据材料，环境值绝不进错误与日志，applyEdit/executeCommand 在送达前即被拒绝。
+- **真正 PTY provider（POSIX 显式注入切片已完成，默认仍 pty:false）**：`createPosixPtyProvider` 经 Python pty 桥接 helper 实现交互输入、增量输出与进程组取消（cancel 杀整个进程组），环境最小化且绝不进记录；Windows 与无 python3 时明确报 PTY_UNAVAILABLE，绝不伪造 PTY。未实现：窗口尺寸调整（resize）、Windows PTY。
+
+## 仍未闭合项（截至第二轮闭环，2026-11-01，写明原因与下一步，不冒充完成）
+
+- **LSP 全量**：未实现。下一步：在只读切片上补文档同步（didOpen/didChange/didClose）、诊断接入与经审批的编辑路径（applyEdit 仍须走 Patch 审批），并支持多语言服务器配置。
+- **PTY 窗口尺寸与 Windows PTY**：未实现。下一步：仅在明确需要时做 resize 协议（宿主注入的尺寸通道）与 Windows ConPTY 方案，默认仍保持 pty:false。
+- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针已完成）。`createGatewayLifecycle` 的 probe() 在本机与 CI 环境实测为 CLI_NOT_FOUND（openclaw 未安装），start() 无显式注入适配器时明确拒绝，绝不猜测或硬编码 OpenClaw 私有协议；`createGatewayAdapter` 仍只有回环 WebSocket 传输边界且禁公网。下一步：先在已安装 OpenClaw 的受控环境实测稳定集成接口与 docs/01 的 Gateway WebSocket、设备配对、scope 升级清单，再设计生命周期接入。
+- **完整 streamable HTTP 会话语义的剩余项**：未全部开放。下一步：按 MCP `2025-06-18` 补服务端对客户端请求的断线续接（Last-Event-ID 回放）与 HTTP 工具执行路由的完整语义，仍须守住审批与 allowlist。
+- **MCP 管理桌面面板**：未实现。下一步：在已完成的管理面 API 上补桌面控制台面板，仍须守住审批与配置漂移失效。
+- **公网隧道真实部署验证**：未验证，已按受控规则停下（不是漏做）。核查：本机与 CI 均无 cloudflared/ngrok CLI；真实验证需要下载第三方隧道二进制，且 named/fixed 模式需要账号凭证与域名绑定，超出受控范围；适配器本身已用 mock CLI 验过（shell:false、Bearer 仅放环境变量、随机路由、reset 失效旧路由、状态/审计不含 URL 与 token）。下一步：仅在已安装 cloudflared 且操作者明确批准的前提下，对哑元回环服务做一次短时 quick-tunnel 试验、立即关闭、只记录通过/失败（不记录 URL），验证前不称生产可用。
