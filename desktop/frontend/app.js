@@ -65,6 +65,17 @@ const auditList = document.querySelector('#audit-list');
 const statusState = document.querySelector('#status-state');
 const statusList = document.querySelector('#status-list');
 const operationsFeedback = document.querySelector('#operations-feedback');
+const mcpState = document.querySelector('#mcp-state');
+const mcpList = document.querySelector('#mcp-list');
+const mcpFeedback = document.querySelector('#mcp-feedback');
+const refreshMcpButton = document.querySelector('#refresh-mcp');
+const mcpProposalPanel = document.querySelector('#mcp-proposal');
+const mcpProposalSummary = document.querySelector('#mcp-proposal-summary');
+const approveMcp = document.querySelector('#approve-mcp');
+const mcpUpdateForm = document.querySelector('#mcp-update-form');
+const mcpUpdateTarget = document.querySelector('#mcp-update-target');
+const mcpUpdateName = document.querySelector('#mcp-update-name');
+const submitMcpUpdate = document.querySelector('#submit-mcp-update');
 const invoke = window.__TAURI__?.core?.invoke;
 const openDialog = window.__TAURI__?.dialog?.open;
 let runtimeReady = false;
@@ -79,6 +90,14 @@ let workMode = 'Ask';
 let planBusy = false;
 let codeProposalsState = [];
 let operationsBusy = false;
+let mcpServers = [];
+let mcpToolsById = {};
+let mcpRuntimes = [];
+let mcpPendingProposal = null;
+let mcpUpdateTargetId = '';
+let mcpKnownHashes = {};
+let mcpStaleIds = new Set();
+let mcpBusy = false;
 let recoveryTransactions = [];
 let recoveryVisibleCount = 20;
 const RECOVERY_PAGE_SIZE = 20;
@@ -289,6 +308,203 @@ async function handleRecoveryAction(button) {
     setFeedback(operationsFeedback, error.message || '恢复操作失败；未能确认执行结果，请检查当前状态。', 'error');
   } finally {
     button.disabled = false;
+  }
+}
+
+function mcpHealthLabel(status) {
+  return status === 'ready' ? '正常' : status === 'unavailable' ? '不可用' : status === 'error' ? '异常' : '未知';
+}
+
+function updateMcpActionState() {
+  refreshMcpButton.disabled = !runtimeReady || mcpBusy;
+  approveMcp.disabled = !runtimeReady || !mcpPendingProposal?.action;
+}
+
+// Display boundary: this renderer only ever reads a server's display name,
+// id, enabled flag, health status, and authorized tool names. The registry
+// record also carries transport details, but those fields are never read
+// here and never interpolated into panel markup. The full record is kept in
+// memory only so update/remove proposals can bind the current config hash
+// and so an update proposal can carry the new configuration to the
+// control-plane proposal endpoint; that transmission is not a display.
+function renderMcpServers(payload) {
+  const servers = Array.isArray(payload?.servers) ? payload.servers : [];
+  const runtimes = Array.isArray(payload?.runtimes) ? payload.runtimes : mcpRuntimes;
+  mcpServers = servers;
+  mcpRuntimes = runtimes;
+  const runningIds = new Set(runtimes.filter((item) => item.state === 'ready' || item.state === 'starting').map((item) => item.id));
+  mcpState.textContent = servers.length ? `${servers.length} 个已注册服务器` : '暂无已注册服务器';
+  mcpState.className = `badge ${servers.length ? 'badge--success' : 'badge--muted'}`;
+  if (!servers.length) {
+    mcpList.innerHTML = '<div class="operations-list-empty">暂无已注册 MCP 服务器。</div>';
+    updateMcpActionState();
+    return;
+  }
+  mcpList.innerHTML = servers.map((server) => {
+    const stale = mcpStaleIds.has(server.id);
+    const liveTools = mcpToolsById[server.id];
+    // A live tools listing only names tools and marks each authorized or not;
+    // listing a tool is not authorization. When the server is not running the
+    // listing is unavailable and the panel falls back to the registry's
+    // authorized tool names, which are by construction the authorized set.
+    const toolText = Array.isArray(liveTools)
+      ? (liveTools.length ? liveTools.map((tool) => `${tool.name} · ${tool.authorized ? '已授权' : '未授权'}`).join('、') : '运行时未列出工具')
+      : (Array.isArray(server.tools) && server.tools.length ? server.tools.map((name) => `${name} · 已授权`).join('、') : '暂无已授权工具');
+    const running = runningIds.has(server.id) ? '运行中' : '未运行';
+    return `<article class="mcp-server"><div class="mcp-server__heading"><strong>${escapeHtml(server.name ?? server.id)}</strong><span class="badge badge--${server.enabled ? 'success' : 'muted'}">${server.enabled ? '已启用' : '未启用'}</span><span>${escapeHtml(running)} · ${escapeHtml(mcpHealthLabel(server.health?.status))}</span></div>${stale ? '<p class="mcp-stale">配置已变化，旧实例已失效，需重新启用。</p>' : ''}<p class="mcp-tools">工具：${escapeHtml(toolText)}</p><div class="mcp-actions"><button class="button button--small button--secondary" type="button" data-mcp-action="update" data-server-id="${escapeHtml(server.id)}">申请更新</button><button class="button button--small button--secondary" type="button" data-mcp-action="remove" data-server-id="${escapeHtml(server.id)}">申请移除</button></div></article>`;
+  }).join('');
+  updateMcpActionState();
+}
+
+function renderMcpProposal(proposal) {
+  mcpPendingProposal = proposal ?? null;
+  if (!mcpPendingProposal?.action) {
+    mcpProposalPanel.hidden = true;
+    mcpProposalSummary.textContent = '';
+    updateMcpActionState();
+    return;
+  }
+  const action = mcpPendingProposal.action;
+  const operation = mcpPendingProposal.operation === 'update' ? '更新' : mcpPendingProposal.operation === 'remove' ? '移除' : (mcpPendingProposal.operation || '变更');
+  // Only the proposal's target name/id and status are shown. The proposal
+  // payload may carry a full server configuration; it is never rendered.
+  const target = mcpPendingProposal.server?.name ?? mcpPendingProposal.server?.id ?? action.target ?? '';
+  mcpProposalSummary.textContent = `${operation}提案：${target} · 状态：${action.status ?? 'awaiting_approval'}${operation === '更新' ? ' · 批准后需重新启用' : ''}`;
+  mcpProposalPanel.hidden = false;
+  updateMcpActionState();
+}
+
+function markMcpStale(serverId) {
+  mcpStaleIds.add(serverId);
+  delete mcpToolsById[serverId];
+  renderMcpServers({ servers: mcpServers, runtimes: mcpRuntimes });
+}
+
+function clearMcp() {
+  mcpServers = [];
+  mcpToolsById = {};
+  mcpRuntimes = [];
+  mcpPendingProposal = null;
+  mcpUpdateTargetId = '';
+  mcpList.innerHTML = '<div class="operations-list-empty">Runtime 未启动。</div>';
+  mcpState.textContent = '未读取';
+  mcpState.className = 'badge badge--muted';
+  mcpProposalPanel.hidden = true;
+  mcpProposalSummary.textContent = '';
+  mcpUpdateForm.hidden = true;
+  mcpUpdateTarget.textContent = '';
+  mcpUpdateName.value = '';
+  updateMcpActionState();
+}
+
+async function refreshMcp() {
+  if (!runtimeReady || !invoke || mcpBusy) return;
+  mcpBusy = true;
+  updateMcpActionState();
+  try {
+    const serversBody = await modelRequest('GET', '/v1/mcp/servers', null, false, { recoverRuntime: false });
+    const servers = Array.isArray(serversBody?.servers) ? serversBody.servers : [];
+    let runtimes = [];
+    try {
+      const runtimesBody = await modelRequest('GET', '/v1/mcp/runtimes', null, false, { recoverRuntime: false });
+      runtimes = Array.isArray(runtimesBody?.runtimes) ? runtimesBody.runtimes : [];
+    } catch { runtimes = []; }
+    // Drift signal: the backend exposes no dedicated "stale" field, so the
+    // panel tracks each server's config hash across refreshes. A hash that
+    // changed since the panel last saw it means the old instance no longer
+    // matches the registered configuration.
+    for (const server of servers) {
+      if (mcpKnownHashes[server.id] && mcpKnownHashes[server.id] !== server.configHash) markMcpStale(server.id);
+      mcpKnownHashes[server.id] = server.configHash;
+    }
+    renderMcpServers({ servers, runtimes });
+    for (const server of servers) {
+      try {
+        const toolsBody = await modelRequest('GET', `/v1/mcp/servers/${encodeURIComponent(server.id)}/tools`, null, false, { recoverRuntime: false });
+        if (Array.isArray(toolsBody?.tools)) mcpToolsById[server.id] = toolsBody.tools;
+      } catch (error) {
+        // A hash conflict means the running instance is stale; drop its tool
+        // list so the panel falls back to the registry's authorized names.
+        // A not-running server simply has no live listing to show.
+        if ((error.message || '').includes('MCP_CONFLICT')) markMcpStale(server.id);
+      }
+    }
+    renderMcpServers({ servers, runtimes });
+    setFeedback(mcpFeedback, 'MCP 状态已刷新。', 'success');
+  } catch (error) {
+    setFeedback(mcpFeedback, error.message || 'MCP 状态读取失败。', 'error');
+  } finally {
+    mcpBusy = false;
+    updateMcpActionState();
+  }
+}
+
+async function handleMcpAction(button) {
+  if (!runtimeReady || !button) return;
+  const action = button.dataset.mcpAction;
+  const serverId = button.dataset.serverId;
+  const server = mcpServers.find((item) => item.id === serverId);
+  if (!server) return;
+  if (action === 'update') {
+    mcpUpdateTargetId = server.id;
+    mcpUpdateTarget.textContent = `服务器：${server.name ?? server.id}`;
+    mcpUpdateName.value = server.name ?? server.id;
+    mcpUpdateForm.hidden = false;
+    mcpUpdateName.focus();
+    return;
+  }
+  if (action === 'remove') {
+    button.disabled = true;
+    try {
+      // Proposal only: nothing is removed until the proposal is approved
+      // through the independent approval path below.
+      const result = await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(server.id)}/remove`, { sessionId: 'desktop-mcp', configHash: server.configHash }, false, { recoverRuntime: false });
+      renderMcpProposal(result.proposal);
+      setFeedback(mcpFeedback, '移除提案已提交，等待独立审批；批准前服务器保持原状。', 'success');
+    } catch (error) {
+      if ((error.message || '').includes('MCP_CONFLICT')) {
+        markMcpStale(server.id);
+        setFeedback(mcpFeedback, '配置已变化，旧实例已失效；请刷新列表后重试。', 'error');
+      } else {
+        setFeedback(mcpFeedback, error.message || '移除提案提交失败。', 'error');
+      }
+    } finally {
+      button.disabled = false;
+    }
+  }
+}
+
+async function submitMcpUpdateProposal() {
+  const server = mcpServers.find((item) => item.id === mcpUpdateTargetId);
+  const newName = mcpUpdateName.value.trim();
+  if (!runtimeReady || !server) {
+    setFeedback(mcpFeedback, '请先选择要更新的服务器。', 'error');
+    return;
+  }
+  if (!newName) {
+    setFeedback(mcpFeedback, '请输入新的显示名称。', 'error');
+    mcpUpdateName.focus();
+    return;
+  }
+  submitMcpUpdate.disabled = true;
+  try {
+    // Proposal only: the panel changes nothing itself. Only the display
+    // name is edited here; the rest of the configuration is carried through
+    // untouched to the proposal endpoint, and the update takes effect only
+    // after independent approval. Approval resets enablement server-side,
+    // so the operator must re-enable afterwards.
+    const result = await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(server.id)}/update`, { sessionId: 'desktop-mcp', configHash: server.configHash, server: { ...server, name: newName } }, false, { recoverRuntime: false });
+    renderMcpProposal(result.proposal);
+    setFeedback(mcpFeedback, '更新提案已提交，等待独立审批；批准前原配置保持不变，批准后需重新启用。', 'success');
+  } catch (error) {
+    if ((error.message || '').includes('MCP_CONFLICT')) {
+      markMcpStale(server.id);
+      setFeedback(mcpFeedback, '配置已变化，旧实例已失效；请刷新列表后重试。', 'error');
+    } else {
+      setFeedback(mcpFeedback, error.message || '更新提案提交失败。', 'error');
+    }
+  } finally {
+    submitMcpUpdate.disabled = false;
   }
 }
 
@@ -663,6 +879,7 @@ function renderRuntime(status) {
   updateModelActionState();
   if (ready && !wasReady) {
     void refreshModels();
+    void refreshMcp();
     void refreshAskSessions({ selectLatest: true });
   }
   if (!ready && wasReady) {
@@ -677,13 +894,17 @@ function renderRuntime(status) {
     renderAskSessions([]);
     setFeedback(askFeedback, '', '');
     clearOperations();
+    clearMcp();
   }
   if (status?.address) {
     addressInput.value = status.address;
     setStored(STORAGE_KEYS.runtimeAddress, status.address);
     updateConnectionState(status.address);
   }
-  if (ready) void refreshOperations();
+  if (ready) {
+    void refreshOperations();
+    void refreshMcp();
+  }
 }
 
 async function refreshRuntime() {
@@ -879,6 +1100,31 @@ askMessageForm.addEventListener('submit', (event) => {
 });
 
 refreshOperationsButton.addEventListener('click', () => { void refreshOperations(); });
+refreshMcpButton.addEventListener('click', () => { void refreshMcp(); });
+mcpList.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-mcp-action]');
+  if (button) void handleMcpAction(button);
+});
+submitMcpUpdate.addEventListener('click', () => { void submitMcpUpdateProposal(); });
+approveMcp.addEventListener('click', async () => {
+  const action = mcpPendingProposal?.action;
+  if (!action || !runtimeReady) return;
+  approveMcp.disabled = true;
+  try {
+    // The approve route is keyed by proposal action id, mirroring the model
+    // approval path; approval=true routes through the independent approval
+    // token instead of the ordinary control token.
+    await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(action.id)}/approve`, { actionHash: action.actionHash }, true, { recoverRuntime: false });
+    const wasUpdate = mcpPendingProposal.operation === 'update';
+    renderMcpProposal(null);
+    await refreshMcp();
+    setFeedback(mcpFeedback, wasUpdate ? 'MCP 变更已批准；服务器已停用，需重新启用。' : 'MCP 变更已批准。', 'success');
+  } catch (error) {
+    setFeedback(mcpFeedback, error.message || 'MCP 审批失败。', 'error');
+  } finally {
+    updateMcpActionState();
+  }
+});
 recoveryList.addEventListener('click', (event) => {
   const showMore = event.target.closest('[data-recovery-show-more]');
   if (showMore) {

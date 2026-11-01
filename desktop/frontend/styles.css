@@ -133,6 +133,16 @@ select:disabled { color: var(--faint); }
 .operations-panel { margin-top: 14px; padding: 24px; }
 .operations-panel > .panel-heading { align-items: center; }
 .operations-panel > .panel-heading .button { min-height: 32px; padding: 0 10px; }
+.mcp-panel { margin-top: 14px; padding: 24px; }
+.mcp-panel > .panel-heading { align-items: center; }
+.mcp-panel > .panel-heading .button { min-height: 32px; padding: 0 10px; }
+.mcp-server { border-top: 1px solid rgba(37, 51, 74, .75); padding: 12px 0; }
+.mcp-server:first-child { border-top: 0; padding-top: 0; }
+.mcp-server__heading { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; }
+.mcp-server__heading strong { color: var(--text); font-size: 13px; }
+.mcp-stale { color: var(--warning); font-size: 12px; margin: 6px 0 0; }
+.mcp-tools { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.mcp-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .operations-grid { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .operations-card { background: #0d1727; border: 1px solid var(--line); border-radius: 5px; min-width: 0; padding: 16px; }
 .operations-card--wide { grid-column: 1 / -1; }
