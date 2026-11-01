@@ -37,12 +37,14 @@ try {
   }
   if ($cols -lt 1 -or $cols -gt 500 -or $rows -lt 1 -or $rows -gt 200) { throw 'size is invalid' }
   $envPairs = @()
+  $childSystemRoot = $null
   if ($null -ne $inputObject.env) {
     foreach ($property in $inputObject.env.PSObject.Properties) {
       $key = [string]$property.Name
       $value = [string]$property.Value
       if ($key -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,127}$' -or $value.Length -gt 4096 -or ($value -match "[\0\r\n]")) { throw 'env entry is invalid' }
       $envPairs += "$key=$value"
+      if ($key -eq 'SystemRoot') { $childSystemRoot = $value }
     }
   }
 
@@ -230,7 +232,17 @@ public static class OcwConPty
       # P/Invoke failure mode. The Win32 code is attached so any
       # further CreateProcess failure is precisely identified instead
       # of a bare message (SetLastError=true is set on the import).
-      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) { throw "CreateProcess failed (Win32 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()), cb=$($startup.StartupInfo.cb))" }
+      # The booleans below exist to pin down ERROR_PATH_NOT_FOUND (3):
+      # they say whether the working directory and the cmd.exe the
+      # child resolves to actually exist, without logging argv values.
+      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) {
+        $win32 = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $cwdExists = Test-Path -LiteralPath $cwd -PathType Container
+        $sysRoot = if ($childSystemRoot) { $childSystemRoot } else { $env:SystemRoot }
+        $cmdExists = $false
+        if ($sysRoot) { $cmdExists = Test-Path -LiteralPath (Join-Path $sysRoot 'System32\cmd.exe') -PathType Leaf }
+        throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb), cwdExists=$cwdExists, cmdExists=$cmdExists, envCount=$($envPairs.Count), hpc=$($hPC -ne [IntPtr]::Zero), attr=$($attrList -ne [IntPtr]::Zero))"
+      }
     } finally {
       [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
     }
