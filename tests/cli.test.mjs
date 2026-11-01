@@ -41,10 +41,20 @@ test('CLI 以 JSON 输出启动恢复摘要', async () => {
 
 test('CLI 在提供 token 时启动长期本地服务，并保留可关闭句柄', async () => {
   const chunks = [];
+  let shutdown;
   const app = { startup: Promise.resolve({ summary: { scanned: 0, finalized: 0, errors: 0 } }), listen: async () => ({ address: '127.0.0.1', port: 4312 }), close: async () => {} };
-  const result = await runCli(['--port', '4312', '--openclaw-command-env', 'MY_OPENCLAW', '--json'], { stdout: { write: (value) => chunks.push(value) }, cwd: await fixture(), env: { OPENCLAW_WORKBENCH_TOKEN: 'test-token-012345', OPENCLAW_WORKBENCH_APPROVAL_TOKEN: 'approve-token-012345', MY_OPENCLAW: 'openclaw.cmd' }, createServer: (options) => { assert.equal(options.host, '127.0.0.1'); assert.equal(options.port, 4312); assert.deepEqual(options.adapter, { command: 'openclaw.cmd' }); return app; } });
+  const result = await runCli(['--port', '4312', '--openclaw-command-env', 'MY_OPENCLAW', '--json'], { stdout: { write: (value) => chunks.push(value) }, cwd: await fixture(), env: { OPENCLAW_WORKBENCH_TOKEN: 'test-token-012345', OPENCLAW_WORKBENCH_APPROVAL_TOKEN: 'approve-token-012345', MY_OPENCLAW: 'openclaw.cmd' }, createServer: (options) => { assert.equal(options.host, '127.0.0.1'); assert.equal(options.port, 4312); assert.deepEqual(options.adapter, { command: 'openclaw.cmd' }); shutdown = options.onShutdown; return app; } });
   assert.equal(result.app, app);
   assert.deepEqual(JSON.parse(chunks.join('')).service, { host: '127.0.0.1', port: 4312 });
+  assert.equal(typeof shutdown, 'function');
+});
+
+test('CLI 启动后立即从进程环境移除临时控制和审批令牌', async () => {
+  const env = { OPENCLAW_WORKBENCH_TOKEN: 'test-token-012345', OPENCLAW_WORKBENCH_APPROVAL_TOKEN: 'approve-token-012345' };
+  const app = { startup: Promise.resolve({ summary: { scanned: 0, finalized: 0, errors: 0 } }), listen: async () => ({ address: '127.0.0.1', port: 4312 }), close: async () => {} };
+  await runCli(['--port', '4312'], { stdout: { write() {} }, cwd: await fixture(), env, createServer: () => app });
+  assert.equal('OPENCLAW_WORKBENCH_TOKEN' in env, false);
+  assert.equal('OPENCLAW_WORKBENCH_APPROVAL_TOKEN' in env, false);
 });
 
 test('CLI 拒绝只提供访问令牌而没有独立审批令牌的服务启动', async () => {
