@@ -60,3 +60,12 @@
 1. 本地 release gates 已完成：全量测试、MCP smoke、语法检查和包内容审查；仍需在 GitHub 上完成 Node 22、Node 24、Windows CI 的远端检查。
 2. 完成独立最终代码审核，修复 Critical/Important 问题后再创建/合并 PR；当前本地 commit 为 `59fe813`，远端推送等待授权和网络恢复。
 3. 仅在用户明确需要时设计真正 PTY provider；在此之前保持 `pty:false` 产品边界。
+
+## 仍未闭合项（截至本轮闭环，2026-11-01，写明原因与下一步，不冒充完成）
+
+- **LSP**：未实现。下一步：先定语言服务器接入边界（工作区内、只读优先、审批门禁是否适用），再按垂直切片实现并补测试。
+- **真正 PTY provider**：未实现；默认 fallback 明确报告 `pty:false`。下一步：仅在用户明确需要时设计（宿主显式注入、进程树、权限与秘密环境复审），在此之前保持 `pty:false` 产品边界。
+- **OpenClaw channel / Gateway 生命周期**：未实现；`createGatewayAdapter` 只有回环 WebSocket 传输边界，固定禁止公网地址，不自动连接、启动 Gateway 或读取密钥。下一步：先以当前版本实测 OpenClaw 稳定集成接口，再设计生命周期接入。
+- **标准 SSE 双通道与完整 streamable HTTP 会话语义、HTTP 工具执行路由**：未开放；`createMcpHttpTransport` 只有受限一次性 POST JSON-RPC 边界。下一步：按 MCP `2025-06-18` 会话语义逐项补齐并补红队测试。
+- **完整 MCP 管理**：只有受控注册骨架（默认禁用，不启动 Server、不调用工具）。下一步：在注册骨架上补管理面，仍须守住 allowlist、审批与配置漂移失效规则。
+- **公网隧道真实部署验证**：受控 CLI 适配器（cloudflare-quick/named、ngrok/ngrok-fixed，`shell:false`、Bearer 只放环境变量、随机路由路径）已实现，但真实 Cloudflare/ngrok 启动、域名绑定、TLS、设备配对和公网运维仍未验证。下一步：在受控环境实测一次完整公网部署后再改文档口径，验证前不称生产可用。

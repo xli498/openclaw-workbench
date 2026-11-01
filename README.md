@@ -116,7 +116,7 @@ Plan 会话支持 `POST /v1/sessions/:id/plan` 的多模型只读复核；传入
 
 事件可通过只读 `GET /v1/events` 轮询，或通过 Bearer 鉴权的 `GET /v1/events/stream?after=<sequence>` 使用 SSE 接收历史事件和后续事件（含 keep-alive）；事件流不是审批或执行入口。`createGatewayAdapter` 只提供显式调用的回环 WebSocket 传输边界，固定禁止公网地址，不自动连接、启动 Gateway、读取密钥或执行 MCP 工具；OpenClaw 私有协议、channel 生命周期、WebSocket 控制面和公网 Bridge 仍未实现。
 
-Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前已有本地 Web 控制台，但仍不包含桌面壳、MCP 管理、OpenClaw channel/Gateway 生命周期接入和公网 Bridge。
+Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前已有本地 Web 控制台与 Tauri 桌面壳；MCP 管理仍只有受控注册骨架（默认禁用），OpenClaw channel/Gateway 生命周期接入和作为产品能力的公网 Bridge 仍未实现。
 
 配置管理垂直切片提供 `GET /v1/config`、`POST /v1/config/import`、`POST /v1/config/rollback` 和 `POST /v1/config/:actionId/approve`。配置文件必须是工作区内的相对 `.json` 文件（默认 `openclaw.json`）；导入会先创建 `.openclaw-workbench/config-backups/` 下的备份，写入前和写入时都校验 `expectedHash`，冲突返回 `409 CONFIG_CONFLICT`。创建提案只返回相对路径、大小和哈希，原始配置内容不写入 proposals 快照、不返回 UI，也不进入审计；待审批提案只保存在当前进程，重启后必须重新创建。
 
