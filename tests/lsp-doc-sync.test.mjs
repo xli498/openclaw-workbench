@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { createLspClient, collectWorkspaceEditProposal } from '../runtime/lsp-client.mjs';
+import { createLspClient, collectWorkspaceEditProposal, convertLspPositionToUtf16, convertLspPositionFromUtf16 } from '../runtime/lsp-client.mjs';
 import { createLspServerRegistry } from '../runtime/lsp-server-registry.mjs';
 
 // NOTE ON THE EDIT PATH (read before touching it): an edit proposal is
@@ -269,10 +269,41 @@ test('collectWorkspaceEditProposal: normalization and rejection', async () => {
       changes: { [uri]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'x' }] },
       documentChanges: [{ textDocument: { uri, version: 1 }, edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'x' }] }],
     }, { root }), { code: 'LSP_EDIT_INVALID' });
-    // create/rename/delete documentChanges unsupported, not silently applied.
-    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'create', uri }] }, { root }), { code: 'LSP_EDIT_UNSUPPORTED' });
-    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'rename', oldUri: uri, newUri: other }] }, { root }), { code: 'LSP_EDIT_UNSUPPORTED' });
-    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'delete', uri }] }, { root }), { code: 'LSP_EDIT_UNSUPPORTED' });
+    // create/rename/delete documentChanges are proposalized (data only),
+    // never applied: the landing path still needs Patch approval.
+    const onlyOps = collectWorkspaceEditProposal({
+      documentChanges: [
+        { kind: 'create', uri, options: { overwrite: false } },
+        { kind: 'rename', oldUri: uri, newUri: other },
+        { kind: 'delete', uri: other, options: { recursive: true } },
+      ],
+    }, { root });
+    assert.deepEqual(onlyOps.files, []);
+    assert.deepEqual(onlyOps.fileOperations, [
+      { kind: 'create', uri, options: { overwrite: false } },
+      { kind: 'rename', oldUri: uri, newUri: other },
+      { kind: 'delete', uri: other, options: { recursive: true } },
+    ]);
+    assert.ok(Object.isFrozen(onlyOps) && Object.isFrozen(onlyOps.fileOperations));
+    // Unknown kinds stay rejected, never silently dropped or reinterpreted.
+    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'move', uri }] }, { root }), { code: 'LSP_EDIT_UNSUPPORTED' });
+    // File-operation URIs obey the same workspace-root boundary as edits.
+    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'create', uri: 'file:///etc/passwd' }] }, { root }), { code: 'LSP_URI_OUT_OF_ROOT' });
+    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'rename', oldUri: uri, newUri: 'file:///etc/passwd' }] }, { root }), { code: 'LSP_URI_OUT_OF_ROOT' });
+    // Non-boolean options and unknown option keys rejected.
+    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'create', uri, options: { overwrite: 'yes' } }] }, { root }), { code: 'LSP_EDIT_INVALID' });
+    assert.throws(() => collectWorkspaceEditProposal({ documentChanges: [{ kind: 'delete', uri, options: { force: true } }] }, { root }), { code: 'LSP_EDIT_INVALID' });
+    // Mixed text edits + file operations keep server order in one proposal.
+    const mixed = collectWorkspaceEditProposal({
+      label: 'mixed',
+      documentChanges: [
+        { textDocument: { uri, version: 2 }, edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'x' }] },
+        { kind: 'rename', oldUri: uri, newUri: other },
+      ],
+    }, { root });
+    assert.equal(mixed.label, 'mixed');
+    assert.equal(mixed.files.length, 1);
+    assert.deepEqual(mixed.fileOperations, [{ kind: 'rename', oldUri: uri, newUri: other }]);
     // Out-of-root, bad range, non-string newText rejected.
     assert.throws(() => collectWorkspaceEditProposal({ changes: { 'file:///etc/passwd': [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'x' }] } }, { root }), { code: 'LSP_URI_OUT_OF_ROOT' });
     assert.throws(() => collectWorkspaceEditProposal({ changes: { [uri]: [{ range: { start: { line: 1, character: 0 }, end: { line: 0, character: 0 } }, newText: 'x' }] } }, { root }), { code: 'LSP_EDIT_INVALID' });
@@ -317,6 +348,55 @@ test('server registry: config-only registration, lookup, and rejection', async (
       ],
     }), { code: 'LSP_SERVER_DUPLICATE' });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('position encoding: pure UTF-8/UTF-32/UTF-16 conversion aligns on code-point boundaries', () => {
+  // Line: 'a' + emoji (UTF-16: 2 units, UTF-8: 4 bytes, UTF-32: 1 unit) + 'b'.
+  const line = 'a\u{1F600}b';
+  assert.equal(convertLspPositionToUtf16(line, 5, 'utf-8'), 3);
+  assert.equal(convertLspPositionToUtf16(line, 2, 'utf-32'), 3);
+  assert.equal(convertLspPositionToUtf16(line, 3, 'utf-16'), 3);
+  assert.equal(convertLspPositionFromUtf16(line, 3, 'utf-8'), 5);
+  assert.equal(convertLspPositionFromUtf16(line, 3, 'utf-32'), 2);
+  // BMP non-ASCII: 'e-acute' is 1 UTF-16 unit, 2 UTF-8 bytes, 1 UTF-32 unit.
+  assert.equal(convertLspPositionToUtf16('éx', 2, 'utf-8'), 1);
+  assert.equal(convertLspPositionFromUtf16('éx', 1, 'utf-8'), 2);
+  // Mid-code-point positions have no alignment and are rejected.
+  assert.throws(() => convertLspPositionToUtf16(line, 2, 'utf-8'), { code: 'LSP_POSITION_INVALID' });
+  assert.throws(() => convertLspPositionToUtf16(line, 3, 'utf-8'), { code: 'LSP_POSITION_INVALID' });
+  assert.throws(() => convertLspPositionFromUtf16(line, 2, 'utf-8'), { code: 'LSP_POSITION_INVALID' });
+  assert.throws(() => convertLspPositionToUtf16(line, 99, 'utf-8'), { code: 'LSP_POSITION_INVALID' });
+  assert.throws(() => convertLspPositionToUtf16(line, 0, 'utf-7'), { code: 'LSP_POSITION_INVALID' });
+  // ASCII is identical in all three encodings.
+  assert.equal(convertLspPositionToUtf16('hello', 3, 'utf-8'), 3);
+  assert.equal(convertLspPositionToUtf16('hello', 3, 'utf-32'), 3);
+});
+
+test('position encoding: UTF-8 server negotiation converts didChange locally, forwards negotiated units', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-enc-'));
+  const uri = `file://${root}/a.txt`;
+  const fixture = new URL('./fixtures/mock-lsp-position-encoding-server.mjs', import.meta.url).pathname;
+  const client = createLspClient({ command: process.execPath, args: [fixture], root });
+  try {
+    await client.start();
+    assert.equal(client.getPositionEncoding(), 'utf-8');
+    client.didOpen(uri, 'plaintext', 'a\u{1F600}b');
+    // Mid-emoji UTF-8 offset (byte 2 of the 4-byte sequence) is rejected
+    // before any send or local update.
+    assert.throws(() => client.didChange(uri, [{ range: { start: { line: 0, character: 2 }, end: { line: 0, character: 3 } }, text: 'Y' }]), { code: 'LSP_POSITION_INVALID' });
+    assert.equal(client.getOpenDocument(uri).text, 'a\u{1F600}b');
+    // UTF-8 units: 'a' = 1 byte, emoji = 4 bytes, so 'b' starts at byte 5.
+    client.didChange(uri, [{ range: { start: { line: 0, character: 1 }, end: { line: 0, character: 5 } }, text: 'X' }]);
+    assert.equal(client.getOpenDocument(uri).text, 'aXb');
+    const report = JSON.parse((await client.request('textDocument/hover', { textDocument: { uri }, position: { line: 0, character: 0 } })).contents.value);
+    assert.equal(report.didChangeCount, 1);
+    // The server was told UTF-8 units, not the UTF-16 units used locally.
+    assert.deepEqual(report.lastContentChanges, [{ range: { start: { line: 0, character: 1 }, end: { line: 0, character: 5 } }, text: 'X' }]);
+    assert.deepEqual(await client.shutdown(), { status: 'closed' });
+  } finally {
+    await client.close().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });
