@@ -268,12 +268,13 @@ export async function applyPatchTransaction({ root, parsedPatch, declaredPaths, 
     const manifestPath = path.join(stateRoot, `${transactionId}.json`);
     for (const item of snapshots) item.snapshot = path.join(snapshotRoot, `${transactionId}-${item.relativePath.replaceAll('/', '__')}`);
     for (const item of staged) item.temp = `${item.target}.ocw-${transactionId}.tmp`;
+    const stagingPaths = staged.map((item) => path.relative(base, item.temp).replaceAll(path.sep, '/'));
     const manifestFiles = () => staged.map((x, index) => ({ relativePath: x.relativePath, target: x.target, temp: x.temp, snapshot: snapshots[index]?.snapshot, afterHash: x.afterHash, beforeHash: snapshots[index]?.beforeHash }));
     await writeManifest(base, manifestPath, { transactionId, state: 'prepared', files: manifestFiles() });
     if (audit) await audit.append({ type: 'transaction.prepared', actor: 'system', transactionId, files: manifestFiles().map((file) => file.relativePath) });
     for (const item of snapshots) await writeStableFile(base, item.snapshot, item.before, 'snapshot write');
     for (const item of staged) await writeStableFile(base, item.temp, item.next, 'staging write');
-    const revisionBeforeCommit = getCurrentRevision ? await getCurrentRevision() : currentRevision;
+    const revisionBeforeCommit = getCurrentRevision ? await getCurrentRevision({ ignoredPaths: stagingPaths }) : currentRevision;
     if (expectedRevision !== undefined && revisionBeforeCommit !== expectedRevision) throw new TransactionError('REVISION_MISMATCH', 'workspace changed during preflight');
     await writeManifest(base, manifestPath, { transactionId, state: 'committing', files: manifestFiles() });
     if (audit) await audit.append({ type: 'transaction.committing', actor: 'system', transactionId, files: manifestFiles().map((file) => file.relativePath) });

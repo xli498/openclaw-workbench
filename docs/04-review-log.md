@@ -419,3 +419,11 @@
 - `GET /v1/models/<id>/health` 继续保持非联网；新增 `POST` 连接测试，必须同时通过独立 approval token 和当前 `configHash`，配置漂移会阻断。
 - 红队覆盖错误 SecretRef、解析/读取超时与取消竞态、恶意 probe code、AbortSignal 被底层忽略、HTTP 错误、响应洪泛、回环/私网/metadata endpoint、重定向、快照/审计/响应泄露和旧 hash；修复后全量回归为 338 项测试中 318 pass、0 fail、20 个 Windows symlink 权限 skip。
 - 产品边界：当前只做连接健康探针，不执行聊天补全；Anthropic/Responses、系统密钥环实现、正式 OpenClaw Gateway/channel 和公网 Bridge 仍未开放。
+
+## 2026-09-21：Streamable HTTP MCP Bridge 红蓝复审
+
+- 新增独立本机 Bridge：固定 MCP `2025-06-18`，只允许 loopback 监听，Bearer 鉴权，session/protocol/request replay 防护，有限 JSON/SSE，GET SSE，DELETE close，空闲会话过期和优雅关闭。
+- 只读工具直接执行；Patch/Command 仅生成共享控制面的 `awaiting_approval` 提案，不直接修改文件或启动命令。可选 path token 只用于短时路由定位，不能代替 Bearer，也不进入错误响应。
+- 红队真实攻击覆盖：缺失/错误 Bearer、协议降级、session fixation、跨 session replay、超大 body、Origin 绕过、路径穿越、shell 注入、审批绕过、path token 泄露/过期和 claim 后失败卡死。修复后同一攻击重放全部拦截。
+- 定向 Bridge 测试 8/8 通过；全仓 `npm test` 386 项中 366 pass、0 fail、20 个仅因 Windows 符号链接权限不可用而跳过；`git diff --check`、`npm pack --dry-run` 通过。
+- 产品边界：公网隧道、设备配对/撤销、OpenClaw 私有协议、生产部署隔离仍未实现，不能把 loopback Bridge 宣称为公网产品能力。
