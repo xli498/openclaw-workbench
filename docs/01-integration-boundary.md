@@ -26,7 +26,7 @@ MCP runtime 控制面通过 `GET /v1/mcp/runtimes` 提供只读实例状态；`P
 - 任意版本的 WebSocket RPC 是否保持兼容。
 - 任意 MCP Server 的安全性、许可证和数据边界。
 - 现有 OpenClaw 配置是否能直接导入产品配置。
-- 外部 Bridge、隧道或公网反向代理的安全性。
+- 外部 Bridge、隧道或公网反向代理的第三方部署安全性；Workbench 仅提供显式启动、随机路由、Bearer 注入和 reset 失效的受控 CLI 适配器。
 - 所有模型都支持同等的工具调用、流式、视觉和推理能力。
 
 ## Adapter 原则
@@ -51,4 +51,4 @@ OpenClaw 已具备足够多的底层能力，可以作为产品基础；但 Work
 
 ## 产品核心验收边界
 
-核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用、会话关闭与空闲过期：它只能绑定 loopback，每次请求仍需 Bearer，path token 仅用于短时路由定位且不得记录，默认拒绝跨域 Origin。Cloudflare Tunnel、ngrok 和其他公网隧道未内置、未验证。LSP 未实现，持久 PTY 未实现，不能把 CLI 诊断或一次性命令执行称作这两项能力。
+核心闭环的验收顺序是：模型注册、真实模型请求、规范化 Chat 回合、只读工具调用、审批提案和审计验证。`Streamable HTTP MCP Bridge` 单独验收 MCP 初始化、工具目录、工具调用、会话关闭与空闲过期：它只能绑定 loopback，每次请求仍需 Bearer，path token 仅用于短时路由定位且不得记录，默认拒绝跨域 Origin。公网 Tunnel 仅有显式启动的受控 CLI 适配器，覆盖 Quick、Named 和固定域名命令参数校验；Cloudflare/ngrok 实际公网部署、设备配对、TLS、路径转发和运维仍未验证。LSP 未实现，持久 PTY 未实现，不能把 CLI 诊断或一次性命令执行称作这两项能力。
