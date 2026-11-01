@@ -161,6 +161,64 @@ function positionToOffset(text, starts, position) {
   return starts[position.line] + position.character;
 }
 
+// Position-encoding alignment (LSP 3.17 `general.positionEncodings`).
+// The server negotiates one encoding in its initialize capabilities;
+// positions in didChange notifications it receives are counted in that
+// encoding, while JavaScript strings are indexed in UTF-16 units. The
+// two helpers below convert a character offset within ONE line between
+// the negotiated encoding and UTF-16. A position that lands inside a
+// multi-unit code point (mid-surrogate-pair, mid-UTF-8-sequence) has no
+// valid alignment and throws LSP_POSITION_INVALID; callers must not
+// update local state or forward the change when this throws. Positions
+// are line-scoped: the caller supplies the line's text, not the whole
+// document, because line breaks are encoding-neutral.
+export const LSP_POSITION_ENCODINGS = Object.freeze(['utf-8', 'utf-32', 'utf-16']);
+
+function encodingUnitLength(codePoint, encoding) {
+  if (encoding === 'utf-32') return 1;
+  if (encoding === 'utf-16') return codePoint.length;
+  return Buffer.byteLength(codePoint, 'utf8');
+}
+
+export function convertLspPositionToUtf16(lineText, character, encoding = 'utf-16') {
+  if (typeof lineText !== 'string' || !Number.isSafeInteger(character) || character < 0) fail('LSP_POSITION_INVALID', 'LSP position is invalid');
+  if (!LSP_POSITION_ENCODINGS.includes(encoding)) fail('LSP_POSITION_INVALID', 'LSP position encoding is not supported');
+  if (encoding === 'utf-16') {
+    if (character > lineText.length) fail('LSP_POSITION_INVALID', 'LSP position is out of range');
+    return character;
+  }
+  let encoded = 0;
+  let utf16 = 0;
+  for (const codePoint of lineText) {
+    if (encoded === character) return utf16;
+    const step = encodingUnitLength(codePoint, encoding);
+    if (encoded + step > character) fail('LSP_POSITION_INVALID', 'LSP position lands inside a code point');
+    encoded += step;
+    utf16 += codePoint.length;
+  }
+  if (encoded === character) return utf16;
+  fail('LSP_POSITION_INVALID', 'LSP position is out of range');
+}
+
+export function convertLspPositionFromUtf16(lineText, utf16Character, encoding = 'utf-16') {
+  if (typeof lineText !== 'string' || !Number.isSafeInteger(utf16Character) || utf16Character < 0) fail('LSP_POSITION_INVALID', 'LSP position is invalid');
+  if (!LSP_POSITION_ENCODINGS.includes(encoding)) fail('LSP_POSITION_INVALID', 'LSP position encoding is not supported');
+  if (encoding === 'utf-16') {
+    if (utf16Character > lineText.length) fail('LSP_POSITION_INVALID', 'LSP position is out of range');
+    return utf16Character;
+  }
+  let encoded = 0;
+  let utf16 = 0;
+  for (const codePoint of lineText) {
+    if (utf16 === utf16Character) return encoded;
+    if (utf16 + codePoint.length > utf16Character) fail('LSP_POSITION_INVALID', 'LSP position lands inside a code point');
+    encoded += encodingUnitLength(codePoint, encoding);
+    utf16 += codePoint.length;
+  }
+  if (utf16 === utf16Character) return encoded;
+  fail('LSP_POSITION_INVALID', 'LSP position is out of range');
+}
+
 // Apply incremental {range, text} changes in order, each against the
 // document produced by the previous one. Throws LSP_DOCUMENT_INVALID on
 // any malformed range or out-of-range position; the caller must not
@@ -225,10 +283,17 @@ function validateTextEdit(edit) {
 // Pure function: no fs, no child_process, no network. It turns either a
 // workspace/applyEdit request frame (params.edit, optional params.label)
 // or a bare WorkspaceEdit ({changes} or {documentChanges}) into a frozen
-// {label?, files: [{uri, version|null, edits: [{range, newText}]}]}
-// proposal. The proposal is data only: landing it on disk must go
-// through the repository's Patch proposal + independent approval flow.
-// Writing a proposal straight to disk bypasses that gate and is a bug.
+// {label?, files: [{uri, version|null, edits: [{range, newText}]}],
+//  fileOperations?: [{kind, uri|oldUri|newUri, options?}]}
+// proposal. Text edits and file operations (create/rename/delete) are
+// BOTH proposal data only, in the order the server sent them: landing
+// any of them on disk must go through the repository's Patch proposal +
+// independent approval flow. Writing a proposal straight to disk
+// bypasses that gate and is a bug. Note on positions: text-edit ranges
+// are carried exactly as the server sent them, i.e. in the server's
+// negotiated position encoding; convert them with
+// convertLspPositionToUtf16/FromUtf16 before landing, never silently
+// reinterpret them as UTF-16.
 export function collectWorkspaceEditProposal(input, { root } = {}) {
   if (typeof root !== 'string' || !root) fail('LSP_ROOT_INVALID', 'LSP workspace root is required');
   const rootPath = path.resolve(root);
@@ -252,6 +317,7 @@ export function collectWorkspaceEditProposal(input, { root } = {}) {
   const hasDocumentChanges = edit.documentChanges !== undefined;
   if (hasChanges === hasDocumentChanges) fail('LSP_EDIT_INVALID', 'LSP workspace edit must carry exactly one of changes or documentChanges');
   const byUri = new Map();
+  const fileOperations = [];
   const addFile = (uri, version, edits) => {
     resolveLspUri(uri, rootPath);
     if (!Array.isArray(edits) || edits.length === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit file has no edits');
@@ -273,14 +339,12 @@ export function collectWorkspaceEditProposal(input, { root } = {}) {
     if (!Array.isArray(edit.documentChanges) || edit.documentChanges.length === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit documentChanges are invalid');
     for (const item of edit.documentChanges) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) fail('LSP_EDIT_INVALID', 'LSP workspace edit documentChange is invalid');
-      if (item.kind === 'create' || item.kind === 'rename' || item.kind === 'delete') {
-        fail('LSP_EDIT_UNSUPPORTED', 'LSP workspace edit documentChange kind is not supported');
-      }
+      // File operations are proposalized, never applied here. Every URI
+      // is resolved against the workspace root exactly like text edits.
+      const fileOp = normalizeFileOperation(item, rootPath);
+      if (fileOp) { fileOperations.push(fileOp); continue; }
       const doc = item.textDocument;
       if (!doc || typeof doc !== 'object' || typeof doc.uri !== 'string') {
-        if (typeof item.uri === 'string' && (item.kind !== undefined || item.newUri !== undefined || item.oldUri !== undefined)) {
-          fail('LSP_EDIT_UNSUPPORTED', 'LSP workspace edit documentChange kind is not supported');
-        }
         fail('LSP_EDIT_INVALID', 'LSP workspace edit documentChange is invalid');
       }
       let version = null;
@@ -291,14 +355,52 @@ export function collectWorkspaceEditProposal(input, { root } = {}) {
       addFile(doc.uri, version, item.edits);
     }
   }
-  if (byUri.size === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit is empty');
+  if (byUri.size === 0 && fileOperations.length === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit is empty');
   const files = Object.freeze([...byUri.values()].map((file) => Object.freeze({
     uri: file.uri,
     version: file.version,
     edits: Object.freeze(file.edits),
   })));
   const proposal = label === undefined ? { files } : { label, files };
+  if (fileOperations.length > 0) proposal.fileOperations = Object.freeze(fileOperations);
   return Object.freeze(proposal);
+}
+
+function validateFileOperationOptions(options, allowedKeys) {
+  if (options === undefined) return undefined;
+  if (!options || typeof options !== 'object' || Array.isArray(options)) fail('LSP_EDIT_INVALID', 'LSP file operation options are invalid');
+  for (const [key, value] of Object.entries(options)) {
+    if (!allowedKeys.includes(key) || typeof value !== 'boolean') fail('LSP_EDIT_INVALID', 'LSP file operation options are invalid');
+  }
+  return Object.freeze({ ...options });
+}
+
+// Returns a frozen file-operation record, or null when the item is a
+// TextDocumentEdit. Unknown kinds stay rejected: silently dropping or
+// reinterpreting an unknown operation would misrepresent the proposal.
+function normalizeFileOperation(item, rootPath) {
+  const kind = item.kind ?? (typeof item.oldUri === 'string' && typeof item.newUri === 'string' ? 'rename' : undefined);
+  if (kind === undefined) return null;
+  if (kind === 'create') {
+    if (typeof item.uri !== 'string') fail('LSP_EDIT_INVALID', 'LSP create file operation uri is invalid');
+    resolveLspUri(item.uri, rootPath);
+    const options = validateFileOperationOptions(item.options, ['overwrite', 'ignoreIfExists']);
+    return Object.freeze(options === undefined ? { kind, uri: item.uri } : { kind, uri: item.uri, options });
+  }
+  if (kind === 'rename') {
+    if (typeof item.oldUri !== 'string' || typeof item.newUri !== 'string') fail('LSP_EDIT_INVALID', 'LSP rename file operation uris are invalid');
+    resolveLspUri(item.oldUri, rootPath);
+    resolveLspUri(item.newUri, rootPath);
+    const options = validateFileOperationOptions(item.options, ['overwrite', 'ignoreIfExists']);
+    return Object.freeze(options === undefined ? { kind, oldUri: item.oldUri, newUri: item.newUri } : { kind, oldUri: item.oldUri, newUri: item.newUri, options });
+  }
+  if (kind === 'delete') {
+    if (typeof item.uri !== 'string') fail('LSP_EDIT_INVALID', 'LSP delete file operation uri is invalid');
+    resolveLspUri(item.uri, rootPath);
+    const options = validateFileOperationOptions(item.options, ['recursive', 'ignoreIfNotExists']);
+    return Object.freeze(options === undefined ? { kind, uri: item.uri } : { kind, uri: item.uri, options });
+  }
+  fail('LSP_EDIT_UNSUPPORTED', 'LSP workspace edit documentChange kind is not supported');
 }
 
 export function createLspClient({
@@ -332,6 +434,9 @@ export function createLspClient({
 
   let child = null;
   let state = 'disconnected';
+  // Negotiated position encoding; 'utf-16' until a server that reports
+  // one of LSP_POSITION_ENCODINGS says otherwise during initialize.
+  let positionEncoding = 'utf-16';
   let nextId = 1;
   let buffer = Buffer.alloc(0);
   const pending = new Map();
@@ -471,9 +576,11 @@ export function createLspClient({
       const initializeResult = await request('initialize', {
         processId: null,
         rootUri: `file://${rootPath}`,
-        capabilities: {},
+        capabilities: { general: { positionEncodings: [...LSP_POSITION_ENCODINGS] } },
         workspaceFolders: [{ uri: `file://${rootPath}`, name: path.basename(rootPath) || 'workspace' }],
       });
+      const negotiated = initializeResult?.capabilities?.positionEncoding;
+      if (typeof negotiated === 'string' && LSP_POSITION_ENCODINGS.includes(negotiated)) positionEncoding = negotiated;
       send({ jsonrpc: '2.0', method: 'initialized', params: {} });
       initialized = true;
       state = 'ready';
@@ -522,7 +629,34 @@ export function createLspClient({
       nextText = changes;
       contentChanges = [{ text: changes }];
     } else if (Array.isArray(changes) && changes.length > 0) {
-      nextText = applyIncrementalChanges(current.text, changes);
+      // Caller ranges are counted in the negotiated encoding. Convert
+      // them to UTF-16 for local application only; the notification
+      // forwarded to the server keeps the negotiated units untouched.
+      // Conversion throws before any send or state update on a
+      // mid-code-point position, so local text can never drift ahead
+      // of what the server was told.
+      let utf16Changes = changes;
+      if (positionEncoding !== 'utf-16') {
+        let working = current.text;
+        utf16Changes = changes.map((change) => {
+          const starts = computeLineStarts(working);
+          const convert = (position) => {
+            if (!isPosition(position) || position.line >= starts.length) fail('LSP_DOCUMENT_INVALID', 'LSP document change position is out of range');
+            const lineStart = starts[position.line];
+            const lineEnd = position.line + 1 < starts.length ? starts[position.line + 1] : working.length;
+            let lineText = working.slice(lineStart, lineEnd);
+            if (lineText.endsWith('\r\n')) lineText = lineText.slice(0, -2);
+            else if (lineText.endsWith('\n') || lineText.endsWith('\r')) lineText = lineText.slice(0, -1);
+            return { line: position.line, character: convertLspPositionToUtf16(lineText, position.character, positionEncoding) };
+          };
+          const converted = { range: { start: convert(change.range.start), end: convert(change.range.end) }, text: change.text };
+          // Advance the working text so multi-change batches convert
+          // each range against the document its predecessor produced.
+          working = applyIncrementalChanges(working, [converted]);
+          return converted;
+        });
+      }
+      nextText = applyIncrementalChanges(current.text, utf16Changes);
       contentChanges = changes.map((change) => ({ range: copyRange(change.range), text: change.text }));
     } else {
       fail('LSP_DOCUMENT_INVALID', 'LSP document changes must be a full string or a non-empty array of incremental changes');
@@ -594,6 +728,7 @@ export function createLspClient({
     getOpenDocument, listOpenDocuments,
     getDiagnostics, getAllDiagnostics,
     getState: () => state,
+    getPositionEncoding: () => positionEncoding,
     getRoot: () => rootPath,
     getAllowedMethods: () => Object.freeze([...allowed]),
   });
