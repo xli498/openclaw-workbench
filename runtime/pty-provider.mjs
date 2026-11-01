@@ -15,7 +15,20 @@ import { fileURLToPath } from 'node:url';
 // PTY_UNAVAILABLE instead of silently falling back to a non-pty runner
 // (that fallback is the session manager's default, and it reports
 // pty:false honestly).
+//
+// Resize channel: the helper is spawned with one extra pipe as its fd3.
+// resize(cols, rows) validates cols 1-500 and rows 1-200 (PTY_SIZE_INVALID
+// otherwise) and writes one "<cols> <rows>\n" line to that pipe; the
+// helper applies it with TIOCSWINSZ and signals the child with SIGWINCH.
+// The initial pty size is the kernel default until the first resize.
 const ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const MAX_PTY_COLS = 500;
+const MAX_PTY_ROWS = 200;
+
+export function safePtySize(cols, rows) {
+  if (!Number.isSafeInteger(cols) || cols < 1 || cols > MAX_PTY_COLS || !Number.isSafeInteger(rows) || rows < 1 || rows > MAX_PTY_ROWS) throw new PtyProviderError('PTY_SIZE_INVALID', 'PTY size is invalid');
+  return Object.freeze({ cols, rows });
+}
 
 export class PtyProviderError extends Error {
   constructor(code, message) {
@@ -63,14 +76,16 @@ export function createPosixPtyProvider({ pythonCommand = 'python3', env, helperP
       cwd: workdir,
       shell: false,
       detached: true,
-      stdio: ['pipe', 'pipe', 'ignore'],
+      stdio: ['pipe', 'pipe', 'ignore', 'pipe'],
       env: { PATH: process.env.PATH ?? '', TERM: 'xterm-256color', ...extraEnv },
     });
     let settled = false;
+    const control = child.stdio[3];
     const decoder = new TextDecoder();
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      try { control?.destroy(); } catch {}
       onExit(result);
     };
     child.stdout.on('data', (chunk) => {
@@ -95,6 +110,12 @@ export function createPosixPtyProvider({ pythonCommand = 'python3', env, helperP
         if (typeof input !== 'string' || !input) throw new PtyProviderError('PTY_INPUT_INVALID', 'PTY input is invalid');
         if (child.stdin.destroyed) throw new PtyProviderError('PTY_CLOSED', 'PTY session is closed');
         await new Promise((resolve, reject) => child.stdin.write(input, (error) => (error ? reject(new PtyProviderError('PTY_WRITE_FAILED', 'PTY write failed')) : resolve())));
+      },
+      resize: async (cols, rows) => {
+        const size = safePtySize(cols, rows);
+        if (settled || control?.destroyed) throw new PtyProviderError('PTY_CLOSED', 'PTY session is closed');
+        await new Promise((resolve, reject) => control.write(`${size.cols} ${size.rows}\n`, (error) => (error ? reject(new PtyProviderError('PTY_RESIZE_FAILED', 'PTY resize failed')) : resolve())));
+        return size;
       },
       cancel: async () => {
         try { process.kill(-child.pid, 'SIGTERM'); } catch {}

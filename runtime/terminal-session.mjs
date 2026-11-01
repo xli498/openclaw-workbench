@@ -335,6 +335,23 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     return Object.freeze({ id, acceptedBytes: Buffer.byteLength(input, 'utf8') });
   }
 
+  // Resize passthrough: only providers whose handle exposes resize() (the
+  // POSIX PTY provider) support it. The non-pty default runner and the
+  // Windows ConPTY provider (resize not wired in this slice) report
+  // PTY_UNAVAILABLE / PTY_RESIZE_UNSUPPORTED honestly instead of faking
+  // a size change. Size validation mirrors the POSIX provider limits.
+  async function resize(id, cols, rows) {
+    if (!records.has(id)) fail('SESSION_NOT_FOUND', 'terminal session not found');
+    if (!Number.isSafeInteger(cols) || cols < 1 || cols > 500 || !Number.isSafeInteger(rows) || rows < 1 || rows > 200) fail('SIZE_INVALID', 'terminal session size is invalid');
+    const record = records.get(id);
+    if (record.status === 'manual_review') fail('SESSION_MANUAL_REVIEW', 'terminal session requires manual review');
+    if (record.status !== 'running') fail('SESSION_NOT_RUNNING', 'terminal session is not running');
+    const runtime = runtimes.get(id);
+    if (!runtime?.handle || typeof runtime.handle.resize !== 'function') fail('PTY_UNAVAILABLE', 'terminal session resize is unavailable for this session');
+    const size = await runtime.handle.resize(cols, rows);
+    return Object.freeze({ id, cols: size.cols, rows: size.rows });
+  }
+
   async function cancel(id) {
     if (!records.has(id)) fail('SESSION_NOT_FOUND', 'terminal session not found');
     const record = records.get(id);
@@ -357,7 +374,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     await Promise.all([...records.values()].map((record) => persist(record).catch(() => {})));
   }
 
-  return Object.freeze({ restore, create, get, list, read, write, cancel, close });
+  return Object.freeze({ restore, create, get, list, read, write, cancel, close, resize });
 }
 
 export { DEFAULT_TIMEOUT_MS, DEFAULT_MAX_OUTPUT_BYTES, MAX_INPUT_BYTES };
