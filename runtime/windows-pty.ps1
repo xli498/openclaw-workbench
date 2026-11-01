@@ -253,19 +253,33 @@ public static class OcwConPty
         # are the same echo command; their handles are closed at once
         # and never waited on, and their console output is discarded
         # when the helper exits. No argv values are reported.
-        function Test-CreateProcess($envArg, $cwdArg) {
+        # Second-round probes (Win32 3 with cwd, 123 without): cwd is
+        # the only input that changes the error, yet Test-Path says it
+        # exists -- so this round also prints the cwd value itself and
+        # the helper's inherited location, and probes a guaranteed
+        # directory (SystemRoot) and a full-path application name, to
+        # separate "this temp path is the problem" from "cwd passing
+        # or module resolution is the problem".
+        function Test-CreateProcess($envArg, $cwdArg, $appArg) {
           $pi = New-Object OcwConPty+ProcessInformation
           $probeCmd = New-Object System.Text.StringBuilder($commandLine)
-          $ok = [OcwConPty]::CreateProcess($null, $probeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envArg, $cwdArg, [ref]$startup, [ref]$pi)
+          $ok = [OcwConPty]::CreateProcess($appArg, $probeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envArg, $cwdArg, [ref]$startup, [ref]$pi)
           $code = if ($ok) { 0 } else { [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() }
           if ($pi.hProcess -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($pi.hProcess) }
           if ($pi.hThread -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($pi.hThread) }
           return $code
         }
-        $probeNoEnvNoCwd = Test-CreateProcess $null $null
-        $probeEnvNoCwd = Test-CreateProcess $envBlock $null
-        $probeNoEnvCwd = Test-CreateProcess $null $cwd
-        throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb), cwdExists=$cwdExists, cmdExists=$cmdExists, envCount=$($envPairs.Count), hpc=$($hPC -ne [IntPtr]::Zero), attr=$($attrList -ne [IntPtr]::Zero), probeNoEnvNoCwd=$probeNoEnvNoCwd, probeEnvNoCwd=$probeEnvNoCwd, probeNoEnvCwd=$probeNoEnvCwd)"
+        $probeNoEnvNoCwd = Test-CreateProcess $null $null $null
+        $probeEnvNoCwd = Test-CreateProcess $envBlock $null $null
+        $probeNoEnvCwd = Test-CreateProcess $null $cwd $null
+        $probeSysRootCwd = $null
+        $probeFullApp = $null
+        if ($sysRoot) {
+          $probeSysRootCwd = Test-CreateProcess $null $sysRoot $null
+          $probeFullApp = Test-CreateProcess $null $cwd (Join-Path $sysRoot 'System32\cmd.exe')
+        }
+        $here = (Get-Location).Path
+        throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb), cwd=[$cwd], here=[$here], cwdExists=$cwdExists, cmdExists=$cmdExists, envCount=$($envPairs.Count), hpc=$($hPC -ne [IntPtr]::Zero), attr=$($attrList -ne [IntPtr]::Zero), probeNoEnvNoCwd=$probeNoEnvNoCwd, probeEnvNoCwd=$probeEnvNoCwd, probeNoEnvCwd=$probeNoEnvCwd, probeSysRootCwd=$probeSysRootCwd, probeFullApp=$probeFullApp)"
       }
     } finally {
       [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
