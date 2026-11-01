@@ -5,6 +5,9 @@ const TRANSITIONS = Object.freeze({
   proposed: new Set(['inspected', 'denied']),
   inspected: new Set(['awaiting_approval', 'denied']),
   awaiting_approval: new Set(['approved', 'denied', 'cancelled']),
+  // A durable proposal interrupted by a Runtime restart is intentionally
+  // non-executable, but the user must still be able to close it explicitly.
+  manual_review: new Set(['cancelled']),
   approved: new Set(['executing', 'denied']),
   executing: new Set(['verified', 'cancelled', 'timed_out', 'failed']),
   verified: new Set(['rolled_back']),

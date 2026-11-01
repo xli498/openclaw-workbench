@@ -68,3 +68,22 @@ test('模型 Chat 跨用户回合向 provider 发送字符串 assistant content'
     assert.equal(seen[1].find((message) => message.role === 'assistant').content, 'reply-1');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('single-model Plan uses the configured model runner and remains read-only', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-single-plan-'));
+  const calls = [];
+  const selected = profile({ id: 'primary-plan' });
+  const manager = createChatSessionManager({
+    root,
+    modelRunner: async (input) => { calls.push(input); return { text: '只读方案：先检查文件，再人工确认变更。', toolCalls: [], model: selected.model, protocol: selected.protocol }; },
+    modelResolver: { get: (id) => id === selected.id ? selected : null },
+  });
+  const session = manager.createSession({ mode: 'Plan' });
+  try {
+    const result = await manager.planReview({ sessionId: session.id, model: selected.id, question: '规划一次只读检查' });
+    assert.equal(result.analyses[0].model, selected.id);
+    assert.equal(result.synthesis.analysisCount, 1);
+    assert.equal(calls[0].profile.id, selected.id);
+    assert.equal(calls[0].mode, 'Plan');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { realpathSync } from 'node:fs';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { join } from 'node:path';
 import { startWorkbench } from './index.mjs';
 import { createPatchProposal, approveAndApplyPatch, createCommandProposal, approveAndRunCommand, WorkflowError } from './workflow.mjs';
 import { createChatSessionManager, SessionError } from './session.mjs';
@@ -22,6 +23,7 @@ import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-r
 import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 import { SecretResolverError, createSecretResolver } from './secret-resolver.mjs';
+import { SecretStoreError, createWindowsCredentialStore } from './secret-store.mjs';
 import { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 import { ModelRunnerError, createModelRunner } from './model-runner.mjs';
 import { createWorkspaceToolRegistry } from './workspace-tool-registry.mjs';
@@ -133,10 +135,11 @@ function errorResponse(error) {
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
-  if (error instanceof SecretResolverError) return { status: 400, body: safe(error.code, error.message) };
+  if (error instanceof SecretResolverError) return { status: error.code === 'SECRET_ALREADY_CONFIGURED' ? 409 : 400, body: safe(error.code, error.message) };
+  if (error instanceof SecretStoreError) return { status: ['SECRET_STORE_BACKEND_FAILED', 'SECRET_STORE_UNAVAILABLE'].includes(error.code) ? 503 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRunnerError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
-  if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
+  if (error instanceof ModelRegistryError) return { status: ['MODEL_CONFLICT', 'MODEL_DUPLICATE', 'MODEL_REGISTRY_BUSY', 'MODEL_ACTION_HASH_MISMATCH', 'MODEL_PROPOSAL_BUSY', 'MODEL_PROPOSAL_MANUAL_REVIEW'].includes(error.code) ? 409 : error.code === 'MODEL_NOT_FOUND' ? 404 : error.code === 'MODEL_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof TerminalSessionError) return { status: ['SESSION_MANUAL_REVIEW', 'SESSION_NOT_RUNNING', 'PTY_UNAVAILABLE', 'SESSION_STORE_BUSY', 'SESSION_STORE_CONFLICT'].includes(error.code) ? 409 : error.code === 'SESSION_NOT_FOUND' ? 404 : error.code === 'SESSION_LIMIT' ? 429 : error.code === 'OUTPUT_LIMIT' ? 413 : error.code === 'APPROVAL_REQUIRED' ? 403 : 400, body: safe(error.code, error.message) };
   const genericCode = ['BODY_TOO_LARGE', 'INVALID_JSON', 'INVALID_BODY', 'INVALID_QUERY_INTEGER', 'DUPLICATE_QUERY_PARAMETER'].includes(error?.code) ? error.code : 'INTERNAL_ERROR';
   return { status: genericCode === 'BODY_TOO_LARGE' ? 413 : genericCode === 'INTERNAL_ERROR' ? 500 : 400, body: { error: genericCode, message: 'request failed' } };
@@ -188,7 +191,13 @@ function publicMcpProposal(proposal) {
 }
 
 function publicModelProposal(proposal) {
-  return { action: proposal.action, profile: proposal.profile };
+  return { action: proposal.action, profile: proposal.profile, ...(proposal.operation ? { operation: proposal.operation } : {}) };
+}
+
+const MODEL_TERMINAL_STATUSES = new Set(['verified', 'failed', 'timed_out', 'cancelled', 'denied']);
+
+function publicStoredModelProposal(record) {
+  return { ...publicModelProposal(record.proposal), ...(record.recovery ? { recovery: record.recovery } : {}) };
 }
 
 function modelHealthSummary(result) {
@@ -199,7 +208,7 @@ function modelHealthSummary(result) {
 
 function publicAuditEvent(event) {
   const safe = {};
-  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'profileId', 'operation', 'status', 'code', 'state']) {
+  for (const field of ['id', 'timestamp', 'type', 'actor', 'sessionId', 'actionId', 'actionHash', 'transactionId', 'serverId', 'profileId', 'secretName', 'operation', 'status', 'code', 'state']) {
     if (typeof event?.[field] === 'string' && event[field].length <= 256) safe[field] = event[field];
   }
   if (Array.isArray(event?.files)) {
@@ -218,7 +227,7 @@ function createLazyAuditLog(root) {
   });
 }
 
-export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, terminalSessionManager, diagnosticsCollector, __testHooks } = {}) {
+export function createWorkbenchServer({ root, audit, token, approvalToken, host = '127.0.0.1', port = 0, runAgentFn, adapter, inspectOpenClawFn, inspectOpenClawMcpFn, inspectMcpServerFn, inspectModelProfileFn, modelHealthProbe, modelRunner, secretResolver, secretStore, secretService = 'openclaw-workbench', eventBus, mcpRuntime, mcpTransportFactory, proposalStore: proposalStoreOverride, terminalSessionManager, diagnosticsCollector, __testHooks } = {}) {
   if (!root) throw new Error('root is required');
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
@@ -234,6 +243,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const modelReservations = new Set();
   const MAX_MODEL_PROPOSALS = 64;
   const modelRegistry = createModelRegistry({ root });
+  // Model setup proposals are durable independently from the in-memory
+  // approval map.  A Runtime restart converts non-terminal records to
+  // `manual_review`; they remain visible and cancellable but never executable.
+  const modelProposalStore = createProposalStore({ root, storePath: join(root, '.openclaw-workbench', 'model-proposals.json') });
   const mcpRegistry = createMcpRegistry({ root });
   const runtime = mcpRuntime ?? createMcpServerRuntime({ registry: mcpRegistry, transportFactory: mcpTransportFactory });
   const effectiveAudit = audit ?? createLazyAuditLog(root);
@@ -244,7 +257,9 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const inspectMcp = inspectOpenClawMcpFn ?? ((options) => inspectOpenClawMcp(options));
   const inspectMcpServer = inspectMcpServerFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
   const inspectModelProfile = inspectModelProfileFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
-  const effectiveSecretResolver = secretResolver ?? createSecretResolver();
+  const effectiveSecretStore = secretStore ?? createWindowsCredentialStore({ service: secretService });
+  const hasSecret = async (name) => typeof effectiveSecretStore.has === 'function' ? effectiveSecretStore.has(name) : (await effectiveSecretStore.get(name)) !== null;
+  const effectiveSecretResolver = secretResolver ?? createSecretResolver({ keychainProvider: (name, options) => effectiveSecretStore.get(name, options) });
   const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: effectiveSecretResolver });
   const liveModelRunner = modelRunner ?? createModelRunner({ profileResolver: modelRegistry, secretResolver: effectiveSecretResolver });
   const approvePatch = __testHooks?.approvePatch ?? approveAndApplyPatch;
@@ -264,6 +279,25 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const sessions = createChatSessionManager({ root, runAgentFn: agentRunner, modelRunner: liveModelRunner, modelResolver: modelRegistry, modelFallbackFn: agentRunner, toolRegistry: workspaceTools });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async (options) => (await createWorkspace(root)).workspaceRevision(options);
+  async function cleanupModelProposalSecret(proposal) {
+    const secretRef = proposal?.profile?.secretRef;
+    if (typeof secretRef !== 'string' || !secretRef.startsWith('keychain:')) return 'not_needed';
+    const secretName = secretRef.slice('keychain:'.length);
+    const referencedByRegistry = modelRegistry.list().some((profile) => profile.secretRef === secretRef);
+    const referencedByPendingProposal = modelProposalStore.list().some((record) => {
+      const candidate = record?.proposal;
+      const candidateAction = candidate?.action;
+      return candidateAction?.id !== proposal?.action?.id
+        && typeof candidateAction?.status === 'string'
+        && !MODEL_TERMINAL_STATUSES.has(candidateAction.status)
+        && candidate?.profile?.secretRef === secretRef;
+    });
+    if (!secretName || referencedByRegistry || referencedByPendingProposal) return 'retained';
+    try {
+      const deleted = await effectiveSecretStore.delete(secretName);
+      return deleted === false ? 'not_found' : 'deleted';
+    } catch { return 'failed'; }
+  }
   const liveStreams = new Set();
   const bridges = new Set();
   const server = http.createServer(async (request, response) => {
@@ -281,9 +315,32 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/diagnostics') return json(response, 200, await inspect({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/openclaw/mcp') return json(response, 200, await inspectMcp({ command: adapterConfig?.command ?? 'openclaw' }));
       if (request.method === 'GET' && url.pathname === '/v1/diagnostics') return json(response, 200, normalizeDiagnostics(await diagnostics()));
+      if (request.method === 'POST' && url.pathname === '/v1/secrets') {
+        const input = await bodyOf(request);
+        if (typeof input.name !== 'string' || typeof input.value !== 'string') throw new SecretResolverError('SECRET_INPUT_INVALID', 'secret input is invalid');
+        const overwrite = input.overwrite === true;
+        if (overwrite && !requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        if (await hasSecret(input.name) && !overwrite) throw new SecretResolverError('SECRET_ALREADY_CONFIGURED', 'secret is already configured; rotate it explicitly');
+        await effectiveSecretStore.set(input.name, input.value);
+        if (effectiveAudit) await effectiveAudit.append({ type: 'secret.configured', actor: 'user', secretName: input.name, operation: overwrite ? 'overwrite' : 'create' });
+        return json(response, 200, { name: input.name, configured: true });
+      }
+      const secretPath = url.pathname.match(/^\/v1\/secrets\/([^/]+)$/);
+      if (request.method === 'GET' && secretPath) {
+        return json(response, 200, { name: secretPath[1], configured: await hasSecret(secretPath[1]) });
+      }
+      if (request.method === 'DELETE' && secretPath) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const deleted = await effectiveSecretStore.delete(secretPath[1]);
+        if (effectiveAudit) await effectiveAudit.append({ type: 'secret.deleted', actor: 'user', secretName: secretPath[1] });
+        return json(response, 200, { name: secretPath[1], deleted });
+      }
       if (request.method === 'GET' && url.pathname === '/v1/mcp/servers') return json(response, 200, { servers: mcpRegistry.list() });
       if (request.method === 'GET' && url.pathname === '/v1/mcp/runtimes') return json(response, 200, { runtimes: runtime.status() });
       if (request.method === 'GET' && url.pathname === '/v1/models') return json(response, 200, { models: modelRegistry.list() });
+      if (request.method === 'GET' && url.pathname === '/v1/models/proposals') {
+        return json(response, 200, { proposals: modelProposalStore.list({ status: url.searchParams.get('status') ?? undefined }).map(publicStoredModelProposal) });
+      }
       const modelHealth = url.pathname.match(/^\/v1\/models\/([^/]+)\/health$/);
       if (request.method === 'GET' && modelHealth) {
         const profile = modelRegistry.get(modelHealth[1]);
@@ -316,7 +373,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         const profile = normalizeModelProfile(input);
         const action = transition(transition(createAction({ type: 'model.register', sessionId: input.sessionId, workspaceRevision: profile.configHash, target: profile.id, preview: profile, risk: 'high' }), 'inspected'), 'awaiting_approval');
         const proposal = Object.freeze({ action, profile }); modelReservations.add(action.id);
-        try { if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: profile.id }); } catch (error) { modelReservations.delete(action.id); throw error; }
+        try {
+          if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: profile.id, operation: 'register' });
+          modelProposalStore.put(proposal);
+        } catch (error) { modelReservations.delete(action.id); throw error; }
         modelReservations.delete(action.id); modelProposals.set(action.id, proposal);
         return json(response, 201, { proposal: publicModelProposal(proposal) });
       }
@@ -330,11 +390,14 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         if (!current) throw new ModelRegistryError('MODEL_NOT_FOUND', 'model profile not found');
         if (input.configHash !== current.configHash) throw new ModelRegistryError('MODEL_CONFLICT', 'model configuration changed; refresh before proposing');
         const enabled = modelToggle[2] === 'enable';
-        const preview = { profileId: current.id, expectedConfigHash: input.configHash, enabled };
+        const preview = { profileId: current.id, provider: current.provider, protocol: current.protocol, model: current.model, endpoint: current.endpoint, capabilities: current.capabilities, secretRef: current.secretRef, expectedConfigHash: input.configHash, enabled };
         const action = transition(transition(createAction({ type: 'model.set_enabled', sessionId: input.sessionId, workspaceRevision: current.configHash, target: current.id, preview, risk: 'high' }), 'inspected'), 'awaiting_approval');
         const proposal = Object.freeze({ action, profile: current, operation: 'set_enabled', expectedConfigHash: input.configHash, enabled });
         modelReservations.add(action.id);
-        try { if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: current.id, operation: 'set_enabled', enabled }); }
+        try {
+          if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: current.id, operation: 'set_enabled', enabled });
+          modelProposalStore.put(proposal);
+        }
         catch (error) { modelReservations.delete(action.id); throw error; }
         modelReservations.delete(action.id); modelProposals.set(action.id, proposal);
         return json(response, 201, { proposal: publicModelProposal(proposal) });
@@ -342,11 +405,62 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       const modelApproval = url.pathname.match(/^\/v1\/models\/([^/]+)\/approve$/);
       if (request.method === 'POST' && modelApproval) {
         if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
-        const proposal = modelProposals.get(modelApproval[1]); if (!proposal) return json(response, 404, { error: 'MODEL_PROPOSAL_NOT_FOUND', message: 'model proposal not found' });
-        const input = await bodyOf(request); if (input.actionHash !== proposal.action.actionHash) throw new ModelRegistryError('MODEL_ACTION_HASH_MISMATCH', 'approval must bind the current model action hash');
-        const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
-        try { const profile = proposal.operation === 'set_enabled' ? modelRegistry.setEnabled(proposal.profile.id, proposal.enabled, proposal.expectedConfigHash) : modelRegistry.register(proposal.profile); const verified = transition(transition(approved, 'executing'), 'verified'); modelProposals.delete(proposal.action.id); if (effectiveAudit) await effectiveAudit.append({ type: 'model.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, profileId: profile.id, operation: proposal.operation ?? 'register', enabled: profile.enabled }); return json(response, 200, { action: verified, profile }); }
-        catch (error) { modelProposals.delete(proposal.action.id); if (effectiveAudit) await effectiveAudit.append({ type: 'model.failed', actor: 'system', actionId: proposal.action.id, sessionId: proposal.action.sessionId, actionHash: proposal.action.actionHash, profileId: proposal.profile.id, code: error.code ?? 'MODEL_FAILED' }); throw error; }
+        const stored = modelProposalStore.get(modelApproval[1]);
+        const proposal = modelProposals.get(modelApproval[1]);
+        if (!proposal) {
+          if (stored?.proposal.action.status === 'manual_review' || stored?.recovery?.state === 'manual_review') throw new ModelRegistryError('MODEL_PROPOSAL_MANUAL_REVIEW', 'model proposal was interrupted by restart; cancel it and create a fresh proposal');
+          return json(response, 404, { error: 'MODEL_PROPOSAL_NOT_FOUND', message: 'model proposal not found' });
+        }
+        const input = await bodyOf(request);
+        if (input.actionHash !== proposal.action.actionHash) throw new ModelRegistryError('MODEL_ACTION_HASH_MISMATCH', 'approval must bind the current model action hash');
+        let claim;
+        try { claim = modelProposalStore.claim(proposal.action.id, input.actionHash); }
+        catch (error) {
+          if (error instanceof ProposalStoreError && error.code === 'PROPOSAL_MANUAL_REVIEW') throw new ModelRegistryError('MODEL_PROPOSAL_MANUAL_REVIEW', 'model proposal was interrupted by restart; cancel it and create a fresh proposal');
+          if (error instanceof ProposalStoreError && error.code === 'PROPOSAL_BUSY') throw new ModelRegistryError('MODEL_PROPOSAL_BUSY', 'model proposal approval is already executing');
+          throw error;
+        }
+        const claimedProposal = claim.proposal;
+        const approved = transition(claimedProposal.action, 'approved', { expectedHash: claimedProposal.action.actionHash });
+        const executing = transition(approved, 'executing');
+        try {
+          const profile = claimedProposal.operation === 'set_enabled'
+            ? modelRegistry.setEnabled(claimedProposal.profile.id, claimedProposal.enabled, claimedProposal.expectedConfigHash)
+            : modelRegistry.register(claimedProposal.profile);
+          const verified = transition(executing, 'verified');
+          modelProposalStore.markTerminal(claimedProposal.action.id, verified, claim.claim.token);
+          modelProposals.delete(claimedProposal.action.id);
+          if (effectiveAudit) await effectiveAudit.append({ type: 'model.verified', actor: 'system', actionId: verified.id, sessionId: verified.sessionId, actionHash: verified.actionHash, profileId: profile.id, operation: claimedProposal.operation ?? 'register', enabled: profile.enabled });
+          return json(response, 200, { action: verified, profile });
+        } catch (error) {
+          modelProposals.delete(claimedProposal.action.id);
+          try {
+            const failed = transition(executing, 'failed');
+            modelProposalStore.markTerminal(claimedProposal.action.id, failed, claim.claim.token);
+          } catch { /* a failed durable terminal write will recover as manual_review on restart */ }
+          if (claimedProposal.operation !== 'set_enabled') await cleanupModelProposalSecret(claimedProposal);
+          if (effectiveAudit) await effectiveAudit.append({ type: 'model.failed', actor: 'system', actionId: claimedProposal.action.id, sessionId: claimedProposal.action.sessionId, actionHash: claimedProposal.action.actionHash, profileId: claimedProposal.profile.id, code: error.code ?? 'MODEL_FAILED' });
+          throw error;
+        }
+      }
+      const modelReject = url.pathname.match(/^\/v1\/models\/([^/]+)\/(deny|cancel)$/);
+      if (request.method === 'POST' && modelReject) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const stored = modelProposalStore.get(modelReject[1]);
+        if (!stored) return json(response, 404, { error: 'MODEL_PROPOSAL_NOT_FOUND', message: 'model proposal not found' });
+        const input = await bodyOf(request);
+        if (input.actionHash !== stored.proposal.action.actionHash) throw new ModelRegistryError('MODEL_ACTION_HASH_MISMATCH', 'rejection must bind the current model action hash');
+        const nextStatus = modelReject[2] === 'deny' ? 'denied' : 'cancelled';
+        let action;
+        try { action = transition(stored.proposal.action, nextStatus, { expectedHash: stored.proposal.action.actionHash }); }
+        catch (error) { throw new ModelRegistryError(error.message.startsWith('invalid_transition') ? 'MODEL_PROPOSAL_BUSY' : 'MODEL_ACTION_HASH_MISMATCH', error.message); }
+        const record = modelProposalStore.reject(stored.proposal.action.id, action);
+        modelProposals.delete(stored.proposal.action.id);
+        const secretCleanup = nextStatus === 'cancelled' && stored.proposal.operation !== 'set_enabled' ? await cleanupModelProposalSecret(stored.proposal) : 'not_needed';
+        const verb = modelReject[2] === 'deny' ? 'denied' : 'cancelled';
+        eventBus.publish({ type: `model.${verb}`, sessionId: action.sessionId, actionId: action.id, requestId, data: { profileId: stored.proposal.profile?.id, status: action.status, secretCleanup } });
+        if (effectiveAudit) await effectiveAudit.append({ type: `model.${verb}`, actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: stored.proposal.profile?.id, operation: stored.proposal.operation ?? 'register', secretCleanup });
+        return json(response, 200, { action: record.proposal.action, profile: stored.proposal.profile, secretCleanup });
       }
       const mcpHealth = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/health$/);
       if (request.method === 'GET' && mcpHealth) {
@@ -573,7 +687,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         return;
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') return json(response, 200, eventBus.list({ after: singleQueryInteger(url.searchParams, 'after', 0), limit: singleQueryInteger(url.searchParams, 'limit', 100) }));
-      if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
+      if (request.method === 'GET' && url.pathname === '/v1/status') return json(response, 200, { ...(await startupState), persistedState: { sessions: sessions.recoverySummary(), proposals: proposalStore.recoverySummary(), modelProposals: modelProposalStore.recoverySummary(), events: { recovered: eventBus.recovered, latestSequence: eventBus.list({ after: 0, limit: 1 }).latestSequence } } });
       if (request.method === 'GET' && url.pathname === '/v1/audit') {
         const records = typeof effectiveAudit?.list === 'function' ? await effectiveAudit.list() : [];
         const limit = Math.min(500, singleQueryInteger(url.searchParams, 'limit', 100));

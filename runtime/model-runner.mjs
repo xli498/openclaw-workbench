@@ -1,6 +1,7 @@
 import { isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 import { SecretResolverError } from './secret-resolver.mjs';
+import { createPinnedLookup, pinnedHttpsFetch } from './pinned-fetch.mjs';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 512 * 1024;
@@ -220,7 +221,7 @@ function abortError(timedOut, signal) {
   return new ModelRunnerError(timedOut ? 'MODEL_TIMEOUT' : signal?.aborted ? 'MODEL_ABORTED' : 'MODEL_REQUEST_FAILED', timedOut ? 'model request timed out' : signal?.aborted ? 'model request was cancelled' : 'model request failed');
 }
 
-export function createModelRunner({ profileResolver, secretResolver, fetchImpl = globalThis.fetch, lookupImpl = fetchImpl === globalThis.fetch ? lookup : async () => [], requestTimeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES } = {}) {
+export function createModelRunner({ profileResolver, secretResolver, fetchImpl = pinnedHttpsFetch, lookupImpl = fetchImpl === pinnedHttpsFetch ? lookup : async () => [], requestTimeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES } = {}) {
   if (!secretResolver || typeof secretResolver.resolve !== 'function') throw new ModelRunnerError('MODEL_SECRET_RESOLVER_INVALID', 'secret resolver is unavailable');
   if (typeof fetchImpl !== 'function') throw new ModelRunnerError('MODEL_FETCH_INVALID', 'fetch implementation is unavailable');
   if (typeof lookupImpl !== 'function') throw new ModelRunnerError('MODEL_LOOKUP_INVALID', 'endpoint lookup implementation is unavailable');
@@ -265,7 +266,7 @@ export function createModelRunner({ profileResolver, secretResolver, fetchImpl =
       const resolved = await raceAbort(lookupImpl(endpointUrl.hostname, { all: true, verbatim: true }), controller.signal, onAbort);
       const addresses = Array.isArray(resolved) ? resolved : [resolved];
       if (addresses.some((entry) => blockedHost(entry?.address ?? entry))) fail('MODEL_ENDPOINT_BLOCKED', 'model endpoint is not allowed');
-      const response = await raceAbort(fetchImpl(target, { method: 'POST', headers: { accept: 'application/json, text/event-stream', 'content-type': 'application/json', authorization: `Bearer ${secret}` }, body: encodedBody, redirect: 'error', signal: controller.signal }), controller.signal, onAbort);
+      const response = await raceAbort(fetchImpl(target, { method: 'POST', headers: { accept: 'application/json, text/event-stream', 'content-type': 'application/json', authorization: `Bearer ${secret}` }, body: encodedBody, redirect: 'error', lookup: createPinnedLookup(addresses), signal: controller.signal }), controller.signal, onAbort);
       if (!response?.ok) throw new ModelRunnerError('MODEL_HTTP_STATUS', 'model provider returned an HTTP error', { status: Number.isSafeInteger(response?.status) ? response.status : undefined });
       const text = await readBoundedText(response, maxResponseBytes, controller.signal, onAbort);
       let result;
