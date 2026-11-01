@@ -149,7 +149,13 @@ export function createMcpHttpTransport({
     const controller = new AbortController();
     activeControllers.add(controller);
     let timedOut = false;
-    const abortExternal = () => controller.abort();
+    // An explicit caller abort must win over the timeout timer: under
+    // parallel load the fetch rejection from an abort can be processed
+    // after the timer fires, and mapping timeout first then misreports
+    // a user abort as a timeout. The timer sets timedOut directly and
+    // never goes through abortExternal, so this flag is caller-only.
+    let abortedByCaller = false;
+    const abortExternal = () => { abortedByCaller = true; controller.abort(); };
     const timer = setTimeout(() => { timedOut = true; controller.abort(); }, requestTimeoutMs);
     if (signal?.aborted) abortExternal();
     else signal?.addEventListener('abort', abortExternal, { once: true });
@@ -168,6 +174,7 @@ export function createMcpHttpTransport({
     } catch (error) {
       if (error instanceof McpHttpTransportError) { if (error.code === 'MCP_FRAME_INVALID' || error.code === 'MCP_FRAME_LIMIT') state = 'failed'; throw error; }
       if (generation !== lifecycleGeneration) throw new McpHttpTransportError('MCP_TRANSPORT_CLOSED', 'MCP transport was closed');
+      if (abortedByCaller) throw new McpHttpTransportError('MCP_REQUEST_ABORTED', 'MCP request was cancelled');
       if (timedOut) throw new McpHttpTransportError('MCP_REQUEST_TIMEOUT', 'MCP request timed out');
       if (signal?.aborted) throw new McpHttpTransportError('MCP_REQUEST_ABORTED', 'MCP request was cancelled');
       throw new McpHttpTransportError('MCP_REQUEST_FAILED', 'MCP request failed');

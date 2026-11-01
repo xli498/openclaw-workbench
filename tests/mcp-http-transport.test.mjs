@@ -66,7 +66,11 @@ test('MCP HTTP transport parses an SSE response without exposing raw event data'
 test('MCP HTTP transport enforces timeout, abort, status, and frame limits', async () => {
   await withServer(async (request, response) => {
     const body = JSON.parse(await readBody(request));
-    if (body.method === 'slow') return setTimeout(() => response.end(), 100);
+    // Deterministic timeout driving: 'slow' never responds, so the 20ms
+    // request timeout always wins regardless of event-loop stalls under
+    // parallel runs. (A fixed 100ms server delay raced the 20ms timeout
+    // whenever the loop stalled by more than 80ms.)
+    if (body.method === 'slow') return; // hang: never end the response
     if (body.method === 'bad-status') { response.statusCode = 503; return response.end('unavailable'); }
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { text: 'x'.repeat(1_000) } }));
@@ -78,8 +82,15 @@ test('MCP HTTP transport enforces timeout, abort, status, and frame limits', asy
     const aborted = transport.request('slow', {}, { signal: controller.signal });
     controller.abort();
     await assert.rejects(aborted, (error) => error.code === 'MCP_REQUEST_ABORTED');
-    await assert.rejects(transport.request('bad-status'), (error) => error.code === 'MCP_HTTP_STATUS');
-    await assert.rejects(transport.request('large'), (error) => error.code === 'MCP_FRAME_LIMIT');
+    // Non-timeout assertions must not share the 20ms timeout: under
+    // parallel runs any 20ms event-loop stall turned a status/frame
+    // assertion into a spurious timeout. Use a generous timeout here;
+    // the tight timeout is only under test for the 'slow' cases above.
+    const generous = createMcpHttpTransport({ endpoint, requestTimeoutMs: 5000, maxFrameBytes: 256 });
+    await generous.start();
+    await assert.rejects(generous.request('bad-status'), (error) => error.code === 'MCP_HTTP_STATUS');
+    await assert.rejects(generous.request('large'), (error) => error.code === 'MCP_FRAME_LIMIT');
+    await generous.close();
     await transport.close();
   });
 });
