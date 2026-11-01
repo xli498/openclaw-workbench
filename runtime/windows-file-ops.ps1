@@ -1,11 +1,11 @@
 param(
-  [Parameter(Mandatory = $true)]
   [string]$Payload
 )
 
 $ErrorActionPreference = 'Stop'
 
 try {
+  if ([string]::IsNullOrEmpty($Payload)) { $Payload = [Console]::In.ReadToEnd() }
   $inputObject = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Payload)) | ConvertFrom-Json
 
   Add-Type -TypeDefinition @'

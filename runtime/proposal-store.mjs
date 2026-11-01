@@ -87,7 +87,8 @@ export function createProposalStore({ root, storePath = join(root ?? '', '.openc
   function reject(id, action) {
     const record = records.get(id);
     if (!record) throw new ProposalStoreError('PROPOSAL_NOT_FOUND', 'proposal not found');
-    if (record.proposal.action.status !== 'awaiting_approval' || record.claim) throw new ProposalStoreError('PROPOSAL_BUSY', 'only an awaiting approval proposal can be rejected');
+    const interrupted = record.proposal.action.status === MANUAL_REVIEW;
+    if (!['awaiting_approval', MANUAL_REVIEW].includes(record.proposal.action.status) || (!interrupted && record.claim)) throw new ProposalStoreError('PROPOSAL_BUSY', 'only an unclaimed proposal can be rejected');
     if (!TERMINAL.has(action?.status) || !['denied', 'cancelled'].includes(action.status)) throw new ProposalStoreError('INVALID_TERMINAL_ACTION', 'rejection must end in denied or cancelled');
     if (action.actionHash !== record.proposal.action.actionHash || action.id !== record.proposal.action.id) throw new ProposalStoreError('ACTION_HASH_MISMATCH', 'rejection must preserve the current action identity');
     return publicRecord(replace(id, { proposal: Object.freeze({ ...record.proposal, action: Object.freeze(action) }) }));
