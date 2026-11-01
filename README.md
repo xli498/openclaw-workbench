@@ -136,7 +136,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 聚合诊断 API | 已实现；只返回状态、哈希、计数和脱敏审计 |
 | Durable terminal session 合同 | 已实现；审批、游标、输出上限、取消/超时和 manual review；默认 `pty:false` |
 | MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具；管理面 API 与桌面面板已实现（见 MCP 章节） |
-| 本机 Streamable HTTP MCP Bridge | 已实现；回环绑定、Bearer、会话、SSE、回放保护和审批提案边界；服务端 Last-Event-ID 断线回放已实现（进程内缓冲，重启后丢失） |
+| 本机 Streamable HTTP MCP Bridge | 已实现；回环绑定、Bearer、会话、SSE、回放保护和审批提案边界；服务端 Last-Event-ID 断线回放已实现（默认进程内缓冲，重启后丢失；传 `replayStorePath` 后缓冲与游标持久化，快照只含事件内容与游标、不含 Bearer 与原始会话 id，重启后旧会话 id 仍按过期处理、已关闭会话不复活，续接须由调用方显式 `resumeSession` 接入新会话） |
 | 公网 Bridge / 隧道 | 受控 CLI 适配器已实现；真实公网启动、部署与第三方 CLI 仍未验证 |
 | 生产部署承诺 | 不承诺 |
 
@@ -180,7 +180,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 `GET /v1/mcp/servers` 查看 Workbench 自己的本地注册表；`POST /v1/mcp/servers` 创建注册提案，必须使用独立 `x-approval-token` 调用 `/v1/mcp/servers/<actionId>/approve` 才会写入。注册记录只保存 Server 名称、transport、命令/端点、环境变量名称、工具 allowlist 和布尔权限；不会保存环境变量值、token 或 URL 用户密码。所有新 Server 默认 `enabled:false`。
 
-`POST /v1/mcp/servers/<serverId>/authorize` 以当前 `configHash` 创建工具授权提案，审批时再次校验哈希，防止并发修改覆盖授权。`GET /v1/mcp/servers/<serverId>/health` 只调用调用方显式注入的只读探针；默认返回 `NOT_CONFIGURED`。所有新 Server 默认 `enabled:false`，必须由后续显式启用流程打开；`createMcpServerRuntime` 还会在每次 start/call 校验 `enabled:true`、当前 `configHash` 和独立审批标记，配置漂移会使旧实例失效。`createMcpStdioTransport` 提供显式启动的 `shell:false` stdio JSON-RPC 传输边界，command/args 同样拒绝 shell 元字符、凭据标签和 URL userinfo，支持请求关联、超时、取消、关闭清理和帧大小门禁。`createMcpHttpTransport` 提供 MCP 2025-06-18 双通道客户端：initialize 协商（仅接受 2025-06-18）、notify、GET SSE 订阅（含 Last-Event-ID 续接）与 DELETE 会话终止，并具备 endpoint 校验、header 控制字符注入防护、超时、取消和流式帧大小门禁；调用方传入的认证 header 不会被 Workbench 持久化或记录。它们不读取 SecretRef、不自动重连、不替代审批、allowlist 或工具编排。OpenClaw 私有协议仍未实现；桥接服务端的 Last-Event-ID 回放仅限进程内缓冲。
+`POST /v1/mcp/servers/<serverId>/authorize` 以当前 `configHash` 创建工具授权提案，审批时再次校验哈希，防止并发修改覆盖授权。`GET /v1/mcp/servers/<serverId>/health` 只调用调用方显式注入的只读探针；默认返回 `NOT_CONFIGURED`。所有新 Server 默认 `enabled:false`，必须由后续显式启用流程打开；`createMcpServerRuntime` 还会在每次 start/call 校验 `enabled:true`、当前 `configHash` 和独立审批标记，配置漂移会使旧实例失效。`createMcpStdioTransport` 提供显式启动的 `shell:false` stdio JSON-RPC 传输边界，command/args 同样拒绝 shell 元字符、凭据标签和 URL userinfo，支持请求关联、超时、取消、关闭清理和帧大小门禁。`createMcpHttpTransport` 提供 MCP 2025-06-18 双通道客户端：initialize 协商（仅接受 2025-06-18）、notify、GET SSE 订阅（含 Last-Event-ID 续接）与 DELETE 会话终止，并具备 endpoint 校验、header 控制字符注入防护、超时、取消和流式帧大小门禁；调用方传入的认证 header 不会被 Workbench 持久化或记录。它们不读取 SecretRef、不自动重连、不替代审批、allowlist 或工具编排。OpenClaw 私有协议仍未实现；桥接服务端的 Last-Event-ID 回放默认仅限进程内缓冲，`replayStorePath` 启用后才持久化（见上表）。
 
 控制面现在提供 `GET /v1/mcp/runtimes` 查看已启动实例，以及 `POST /v1/mcp/servers/<serverId>/start|stop|call` 创建 runtime 操作提案。每个操作都必须使用独立 approval token 审批，并在执行时重新校验当前 `configHash`；Server 必须先启用，工具调用必须命中 allowlist。call 提案只返回工具名、输入字节数和输入哈希，不返回输入内容；runtime 关闭时会清理所有活动传输。
 

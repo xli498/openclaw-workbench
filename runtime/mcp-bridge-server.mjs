@@ -1,5 +1,7 @@
 import http from 'node:http';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { createToolRegistry } from './tool-registry.mjs';
 import { boundedJson, redactValue } from './redaction.mjs';
 
@@ -145,6 +147,18 @@ export function createMcpBridgeServer({
   idleSessionMs = DEFAULT_IDLE_SESSION_MS,
   allowedOrigins = [],
   clock = () => Date.now(),
+  // Persistent replay (opt-in). When set, every broadcast is also
+  // appended to an atomic JSON snapshot file, so the replay buffer
+  // survives a bridge restart. A snapshot holds ONLY event content
+  // (the broadcast notification JSON) and the cursor (next sequence);
+  // it never holds the bridge Bearer <redacted> the session id itself is
+  // stored only as its SHA-256 hash, so the file contains no usable
+  // credential or session capability. Callers must not broadcast secret
+  // material: broadcast params are persisted verbatim, exactly as they
+  // were already buffered in memory. A relative path resolves against
+  // the workspace root. The store is single-owner: two live bridges
+  // sharing one path will overwrite each other (last writer wins).
+  replayStorePath,
 } = {}) {
   if (!root) throw new McpBridgeError('MCP_ROOT_REQUIRED', 'workspace root is required');
   if (typeof token !== 'string' || token.length < 16) throw new McpBridgeError('MCP_AUTH_CONFIG_INVALID', 'bridge bearer token must be at least 16 characters');
@@ -166,14 +180,103 @@ export function createMcpBridgeServer({
   let stopping = false;
   let sessionExpiryTimer;
 
+  // --- Persistent replay snapshots (see option comment above) ---
+  // In-memory index of the snapshot file, keyed by SHA-256(sessionId).
+  // Live sessions are never seeded from it automatically: after a
+  // restart, an old session id is expired (HTTP 404, exactly as an
+  // unknown session), and only an explicit resumeSession(oldId) call —
+  // by the embedding application, never by an HTTP request — seeds a
+  // NEW session id with the persisted buffer. A session closed with
+  // DELETE leaves a tombstone ({closed:true}, events dropped) so it can
+  // never be silently revived by a later restart + resume.
+  const replayStoreFile = replayStorePath === undefined ? null
+    : path.isAbsolute(replayStorePath) ? replayStorePath : path.join(root, replayStorePath);
+  if (replayStorePath !== undefined && typeof replayStorePath !== 'string') throw new McpBridgeError('MCP_CONFIG_INVALID', 'replay store path is invalid');
+  const replaySnapshots = new Map();
+  function snapshotKey(sessionId) {
+    return createHash('sha256').update(sessionId).digest('hex');
+  }
+  function validSnapshotEntry(entry) {
+    if (!plainObject(entry) || typeof entry.key !== 'string' || !/^[0-9a-f]{64}$/.test(entry.key)) return false;
+    if (!Number.isSafeInteger(entry.nextEventSequence) || entry.nextEventSequence < 1) return false;
+    if (!Number.isSafeInteger(entry.lastActivity) || entry.lastActivity < 0) return false;
+    if (typeof entry.closed !== 'boolean' || !Array.isArray(entry.events) || entry.events.length > maxReplayEvents) return false;
+    if (entry.closed && entry.events.length !== 0) return false;
+    for (const event of entry.events) {
+      if (!plainObject(event) || typeof event.id !== 'string' || !EVENT_ID_PATTERN.test(event.id)
+        || !Number.isSafeInteger(event.sequence) || event.sequence < 1
+        || typeof event.encoded !== 'string' || event.encoded.length > maxResponseBytes) return false;
+      try {
+        const parsed = JSON.parse(event.encoded);
+        if (!plainObject(parsed) || typeof parsed.method !== 'string') return false;
+      } catch { return false; }
+    }
+    return true;
+  }
+  function loadReplaySnapshots() {
+    if (!replayStoreFile) return;
+    let parsed;
+    try { parsed = JSON.parse(readFileSync(replayStoreFile, 'utf8')); } catch { return; }
+    if (!plainObject(parsed) || parsed.version !== 1 || !Array.isArray(parsed.snapshots)) return;
+    for (const entry of parsed.snapshots) {
+      if (validSnapshotEntry(entry)) replaySnapshots.set(entry.key, entry);
+    }
+  }
+  // Best-effort by design: persistence must never break broadcasting or
+  // shutdown. A failed write leaves the in-memory buffer intact, and the
+  // next broadcast retries.
+  function persistReplaySnapshots() {
+    if (!replayStoreFile) return;
+    try {
+      mkdirSync(path.dirname(replayStoreFile), { recursive: true });
+      const payload = JSON.stringify({ version: 1, snapshots: [...replaySnapshots.values()] });
+      const tmp = `${replayStoreFile}.tmp-${process.pid}`;
+      writeFileSync(tmp, payload, 'utf8');
+      renameSync(tmp, replayStoreFile);
+    } catch {}
+  }
+  function snapshotSession(session, closed) {
+    if (!replayStoreFile) return;
+    if (closed) {
+      replaySnapshots.set(snapshotKey(session.id), { key: snapshotKey(session.id), nextEventSequence: session.nextEventSequence, lastActivity: clock(), closed: true, events: [] });
+    } else {
+      replaySnapshots.set(snapshotKey(session.id), { key: snapshotKey(session.id), nextEventSequence: session.nextEventSequence, lastActivity: session.lastActivity, closed: false, events: session.eventBuffer.map((event) => ({ ...event })) });
+    }
+    persistReplaySnapshots();
+  }
+  loadReplaySnapshots();
+
+  function resumeSession(oldSessionId) {
+    if (typeof oldSessionId !== 'string' || !oldSessionId) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
+    if (sessions.has(oldSessionId)) fail('MCP_SESSION_ACTIVE', 'MCP session is still live; resume is only for dormant snapshots');
+    const snapshot = replaySnapshots.get(snapshotKey(oldSessionId));
+    if (!snapshot) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
+    if (snapshot.closed) fail('MCP_SESSION_CLOSED', 'MCP session was closed and cannot be resumed');
+    if (clock() - snapshot.lastActivity > idleSessionMs) {
+      replaySnapshots.delete(snapshotKey(oldSessionId));
+      persistReplaySnapshots();
+      fail('MCP_SESSION_EXPIRED', 'MCP session snapshot is past the idle window');
+    }
+    const id = randomUUID();
+    const session = { id, lastActivity: clock(), requestIds: new Set(), streams: new Set(), eventBuffer: snapshot.events.map((event) => ({ ...event })), nextEventSequence: snapshot.nextEventSequence };
+    sessions.set(id, session);
+    replaySnapshots.delete(snapshotKey(oldSessionId));
+    persistReplaySnapshots();
+    return Object.freeze({ sessionId: id, replayedEvents: snapshot.events.length, lastEventId: snapshot.events.length ? snapshot.events[snapshot.events.length - 1].id : null });
+  }
+
   function expireSessions() {
     const now = clock();
     for (const session of [...sessions.values()]) if (now - session.lastActivity > idleSessionMs) closeSession(session.id);
   }
 
-  function closeSession(id) {
+  function closeSession(id, { closed = false } = {}) {
     const session = sessions.get(id);
     if (!session) return;
+    // Persist the buffer (or, for a client DELETE, a tombstone) before
+    // dropping the live session, so a restart can tell a resumable
+    // interruption apart from a deliberately closed session.
+    snapshotSession(session, closed);
     sessions.delete(id);
     for (const requestIdValue of session.requestIds) requestOwners.delete(requestIdValue);
     for (const response of session.streams) {
@@ -280,6 +383,22 @@ export function createMcpBridgeServer({
   // DELETE                               -> close session, 204; the
   //                                         session's buffer and claimed
   //                                         request ids are dropped with it
+  //                                         (with replayStorePath, a closed
+  //                                         tombstone is persisted instead
+  //                                         of the buffer, so resume can
+  //                                         never revive it)
+  // Persistent replay (replayStorePath only; otherwise buffers stay
+  // in-memory and are lost on restart, as before):
+  //   broadcast persists the buffer + cursor atomically; stop/expiry
+  //     persist the buffer as-is; a restart loads snapshots as DORMANT
+  //     only — the old session id still gets 404 SESSION_NOT_FOUND,
+  //     exactly like an expired session, and is never silently revived
+  //   resumeSession(oldId) (programmatic, not HTTP) seeds a NEW session
+  //     id with the persisted buffer, one-shot; it fails for closed
+  //     sessions (MCP_SESSION_CLOSED), idle-expired snapshots
+  //     (MCP_SESSION_EXPIRED), and unknown ids (MCP_SESSION_NOT_FOUND)
+  //   snapshots hold only event content + cursor; session ids appear
+  //     only as SHA-256 hashes, and the Bearer <redacted> never persisted
   async function dispatch(session, rpc, signal) {
     if (rpc.method === 'notifications/initialized') return null;
     if (rpc.method === 'ping') return {};
@@ -321,7 +440,7 @@ export function createMcpBridgeServer({
       }
       if (request.method === 'DELETE') {
         const session = requireSession(request);
-        closeSession(session.id);
+        closeSession(session.id, { closed: true });
         response.writeHead(204, { 'cache-control': 'no-store' });
         return response.end();
       }
@@ -430,8 +549,9 @@ export function createMcpBridgeServer({
       catch { session.streams.delete(response); }
     }
     session.lastActivity = clock();
+    snapshotSession(session, false);
     return Object.freeze({ sessionId, delivered, eventId });
   }
 
-  return Object.freeze({ start, stop, address, endpointPath: () => endpoint, protocolVersion: PROTOCOL_VERSION, broadcast, sessionCount: () => sessions.size, streamCount: (sessionId) => sessions.get(sessionId)?.streams.size ?? 0 });
+  return Object.freeze({ start, stop, address, endpointPath: () => endpoint, protocolVersion: PROTOCOL_VERSION, broadcast, resumeSession, replaySnapshotCount: () => replaySnapshots.size, sessionCount: () => sessions.size, streamCount: (sessionId) => sessions.get(sessionId)?.streams.size ?? 0 });
 }

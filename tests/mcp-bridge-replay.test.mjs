@@ -356,3 +356,123 @@ test('MCP replay: the HTTP transport resumes a live stream from its last event i
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('MCP persistent replay: buffer survives restart, old id stays expired, explicit resume seeds a new session', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-persist-'));
+  const store = path.join(root, '.openclaw-workbench', 'replay-snapshots.json');
+  try {
+    const bridge = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), replayStorePath: store });
+    const address = await bridge.start();
+    let oldId;
+    let firstId;
+    try {
+      oldId = (await initialize(address)).response.headers.get('mcp-session-id');
+      firstId = bridge.broadcast(oldId, { method: 'notifications/persist-one', params: { note: 'persist-one' } }).eventId;
+      bridge.broadcast(oldId, { method: 'notifications/persist-two', params: { note: 'persist-two' } });
+      assert.equal(bridge.replaySnapshotCount(), 1);
+    } finally {
+      await bridge.stop();
+    }
+    // The snapshot file holds event content + cursor, but neither the
+    // Bearer <redacted> the raw old session id (only its SHA-256 hash).
+    const stored = await readFile(store, 'utf8');
+    assert.match(stored, /persist-one/);
+    assert.equal(stored.includes(TOKEN), false);
+    assert.equal(stored.includes(oldId), false);
+    // Restart: the old session id is expired, not silently revived.
+    const bridge2 = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), replayStorePath: store });
+    const address2 = await bridge2.start();
+    try {
+      const stale = await openStream(address2, oldId);
+      assert.equal(stale.status, 404);
+      assert.equal((await stale.json()).error, 'MCP_SESSION_NOT_FOUND');
+      // Explicit resume seeds a NEW session id with the persisted buffer.
+      const resumed = bridge2.resumeSession(oldId);
+      assert.notEqual(resumed.sessionId, oldId);
+      assert.equal(resumed.replayedEvents, 2);
+      assert.equal(resumed.lastEventId, 'evt-2');
+      const replayed = await openStream(address2, resumed.sessionId, { 'last-event-id': firstId });
+      assert.equal(replayed.status, 200);
+      const text = await collectSse(replayed, (t) => t.includes('persist-two'));
+      assert.match(text, /id: evt-2/);
+      assert.equal(text.includes('persist-one'), false);
+      // Resume is one-shot: the same old id cannot resume twice.
+      assert.throws(() => bridge2.resumeSession(oldId), { code: 'MCP_SESSION_NOT_FOUND' });
+      // The resumed session is a normal live session afterwards.
+      const listed = await post(address2, { jsonrpc: '2.0', id: 'list-1', method: 'tools/list', params: {} }, sessionHeaders(resumed.sessionId));
+      assert.equal(listed.response.status, 200);
+    } finally {
+      await bridge2.stop();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP persistent replay: DELETE-closed sessions are never revived by resume', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-persist-closed-'));
+  const store = path.join(root, 'replay.json');
+  try {
+    const bridge = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), replayStorePath: store });
+    const address = await bridge.start();
+    let oldId;
+    try {
+      oldId = (await initialize(address)).response.headers.get('mcp-session-id');
+      bridge.broadcast(oldId, { method: 'notifications/closed-one', params: { note: 'closed-one' } });
+      const closed = await fetch(endpoint(address), { method: 'DELETE', headers: headers(sessionHeaders(oldId)) });
+      assert.equal(closed.status, 204);
+    } finally {
+      await bridge.stop();
+    }
+    const stored = await readFile(store, 'utf8');
+    assert.equal(stored.includes('closed-one'), false, 'closed session events must be dropped, not persisted');
+    const bridge2 = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), replayStorePath: store });
+    await bridge2.start();
+    try {
+      assert.throws(() => bridge2.resumeSession(oldId), { code: 'MCP_SESSION_CLOSED' });
+    } finally {
+      await bridge2.stop();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP persistent replay: idle-expired snapshots and malformed store files fail closed', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-persist-expire-'));
+  const store = path.join(root, 'replay.json');
+  try {
+    let now = 1_000_000;
+    const bridge = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), replayStorePath: store, idleSessionMs: 1000, clock: () => now });
+    const address = await bridge.start();
+    let oldId;
+    try {
+      oldId = (await initialize(address)).response.headers.get('mcp-session-id');
+      bridge.broadcast(oldId, { method: 'notifications/expire-one', params: { note: 'expire-one' } });
+    } finally {
+      await bridge.stop();
+    }
+    // Restart past the idle window: the snapshot is expired, not resumed.
+    now += 5000;
+    const bridge2 = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), replayStorePath: store, idleSessionMs: 1000, clock: () => now });
+    await bridge2.start();
+    try {
+      assert.throws(() => bridge2.resumeSession(oldId), { code: 'MCP_SESSION_EXPIRED' });
+    } finally {
+      await bridge2.stop();
+    }
+    // A malformed store file never breaks startup; resume finds nothing.
+    await writeFile(store, '{not json', 'utf8');
+    const bridge3 = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), replayStorePath: store });
+    const address3 = await bridge3.start();
+    try {
+      assert.throws(() => bridge3.resumeSession(oldId), { code: 'MCP_SESSION_NOT_FOUND' });
+      const fresh = await initialize(address3);
+      assert.equal(fresh.response.status, 200);
+    } finally {
+      await bridge3.stop();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
