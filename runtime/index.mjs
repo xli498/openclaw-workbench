@@ -26,6 +26,8 @@ export { McpHttpTransportError, createMcpHttpTransport } from './mcp-http-transp
 export { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 export { McpBridgeError, createMcpBridgeServer } from './mcp-bridge-server.mjs';
 export { BridgeTunnelError, BRIDGE_TUNNEL_PROVIDERS, createBridgeTunnelAdapter } from './bridge-tunnel.mjs';
+export { TerminalSessionError, createTerminalSessionManager } from './terminal-session.mjs';
+export { collectDiagnostics } from './diagnostics.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {
   if (!root) throw new Error('root is required');

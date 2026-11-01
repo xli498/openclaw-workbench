@@ -427,3 +427,19 @@
 - 红队真实攻击覆盖：缺失/错误 Bearer、协议降级、session fixation、跨 session replay、超大 body、Origin 绕过、路径穿越、shell 注入、审批绕过、path token 泄露/过期和 claim 后失败卡死。修复后同一攻击重放全部拦截。
 - 定向 Bridge 测试 8/8 通过；全仓 `npm test` 386 项中 366 pass、0 fail、20 个仅因 Windows 符号链接权限不可用而跳过；`git diff --check`、`npm pack --dry-run` 通过。
 - 产品边界：公网隧道、设备配对/撤销、OpenClaw 私有协议、生产部署隔离仍未实现，不能把 loopback Bridge 宣称为公网产品能力。
+
+## 2026-09-21：Durable Terminal 与 Diagnostics 红蓝复审
+
+- 新增工作区内持久会话清单：状态、增量输出游标、取消、超时、输出预算和重启后的 `manual_review` 语义；不会自动重放中断进程。
+- 非 PTY 环境使用既有 `runControlledCommand` 作为 fallback，并明确返回 `pty:false`、`input:false`、`incrementalOutput:false`；输入不会被伪装成可用交互终端。
+- 创建前使用进程内 reservation 绑定 session ID 和容量；输出超限会取消 provider，避免进程继续运行。
+- 新增只读 `GET /v1/diagnostics` 聚合 OpenClaw CLI、MCP、模型档案、工作区 revision 和脱敏审计状态；组件异常映射为 `unavailable`，不返回 command、endpoint、SecretRef、环境变量或绝对路径。
+- 红队覆盖审批绕过、shell/路径逃逸、输出洪泛、超时、重放、并发容量/重复 ID、环境变量注入、PTY 能力伪造和诊断秘密泄露；修复后同一攻击重放全部拒绝。
+- 定向终端/诊断测试 13/13 通过；控制面相关测试 56 pass、0 fail、1 个既有 Windows symlink 权限 skip。
+
+## 2026-09-22：Durable Terminal 与 Diagnostics 修复重放
+
+- 修复诊断 HTTP 出口缺少 `normalizeDiagnostics` 导出的问题；注入的 collector 现在也经过统一状态、revision、标签、审计和时间戳归一化，未知异常不回显原文。
+- 修复终端 manager 的关闭竞态：创建流程使用真正的 deferred completion，`close()` 会等待进行中的创建完成后再取消运行时；同时保留结束会话可复用容量和 provider capability 的显式声明。
+- 终端/诊断定向测试 17/17 通过；HTTP 控制定向测试 64 pass、0 fail、1 个既有 Windows symlink 权限 skip；`node --check` 与 `git diff --check` 通过。
+- 全量回归第一次出现 1 个既有 MCP HTTP timeout 断言抖动；该测试单独连续重跑 20/20 通过，提交前仍需以最终全量回归为准，不把一次抖动当作修复证据。
