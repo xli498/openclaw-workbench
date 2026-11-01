@@ -29,7 +29,8 @@ export { McpBridgeError, createMcpBridgeServer } from './mcp-bridge-server.mjs';
 export { BridgeTunnelError, BRIDGE_TUNNEL_PROVIDERS, createBridgeTunnelAdapter } from './bridge-tunnel.mjs';
 export { TerminalSessionError, createTerminalSessionManager } from './terminal-session.mjs';
 export { PtyProviderError, createPosixPtyProvider, ptyAvailable } from './pty-provider.mjs';
-export { LspClientError, LSP_READ_ONLY_METHODS, createLspClient } from './lsp-client.mjs';
+export { LspClientError, LSP_READ_ONLY_METHODS, createLspClient, collectWorkspaceEditProposal } from './lsp-client.mjs';
+export { createLspServerRegistry } from './lsp-server-registry.mjs';
 export { collectDiagnostics } from './diagnostics.mjs';
 
 export async function startWorkbench({ root, audit, onStartupRecoveryAlert, onStartupScanError } = {}) {

@@ -1,19 +1,32 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 
-// First LSP slice: a read-only, workspace-bounded stdio client. It is NOT a
-// full language-server integration. Only the methods below are ever sent;
-// anything that could mutate a file, run a command, or install anything on
-// the host is refused before it reaches the server process. The server is
-// started with shell:false, a workspace cwd, and an explicitly allowlisted
-// environment (names only in the public record; values are never logged,
-// never stored in snapshots, and never included in error text).
+// Second LSP slice: document sync, diagnostics intake, an approval-gated
+// edit-proposal path, and a multi-server registry live in companion modules.
+// This client stays read-only on disk: it never writes a file itself.
+// The first slice's guarantees still hold: only allowlisted methods are
+// ever sent; server-initiated requests are never auto-executed; commands
+// and arguments are refused when they contain shell or credential material;
+// environment values are never logged, never stored in snapshots, and
+// never included in error text.
+//
+// Edit proposals produced here are NOT applied by this client. A proposal
+// is data for the repository's existing Patch proposal + independent
+// approval flow. Any code path that takes a proposal from
+// collectWorkspaceEditProposal / editProposalHandler and writes it
+// straight to disk is a bug: it bypasses the approval gate.
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
+const DEFAULT_MAX_DOCUMENT_BYTES = 1024 * 1024;
+const DEFAULT_MAX_DIAGNOSTICS_PER_URI = 256;
+const DEFAULT_MAX_DIAGNOSTIC_MESSAGE_CHARS = 4096;
 const SHELL_PATTERN = /[;&|<>`$()\r\n]/;
 const SECRET_PATTERN = /(?:bearer|token|password|secret|api[_ -]?key)\s*[:=]|:\/\/[^/\s:]+:[^@\s]+@/i;
 const SECRET_FLAG_PATTERN = /(?:^|\s)(?:--?|\/)(?:token|password|secret|api[-_ ]?key)(?:\s|=|$)/i;
 const ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const URL_USERINFO_PATTERN = /:\/\/[^/\s:]+:[^@\s]+@/g;
+const BEARER_TOKEN_PATTERN = /bearer\s+[A-Za-z0-9._\-~+/=]+/gi;
+const CREDENTIAL_ASSIGN_PATTERN = /([A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[ _-]?key)[A-Za-z0-9_.\-]*\s*[:=]\s*)[^\s,;]+/gi;
 
 export const LSP_READ_ONLY_METHODS = Object.freeze([
   'initialize',
@@ -66,9 +79,226 @@ function safeEnv(value) {
   return env;
 }
 
+// Re-exported under public names so the server registry (and any other
+// module) validates commands, args, and env with exactly the same rules
+// as this client instead of re-implementing them.
+export function validateLspCommand(value) { return safeCommand(value); }
+export function validateLspArgs(value) { return safeArgs(value); }
+export function validateLspEnv(value) { return safeEnv(value); }
+
 function encodeFrame(value) {
   const body = Buffer.from(JSON.stringify(value), 'utf8');
   return Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'ascii'), body]);
+}
+
+// Resolve a file:// URI (empty host or localhost only) against the
+// workspace root. decodeURIComponent runs before path.resolve so an
+// encoded ".." cannot smuggle a path out, and the resolved path must
+// equal the root or live under it. Anything else is out of root.
+function resolveLspUri(uri, rootPath) {
+  if (typeof uri !== 'string' || !uri || uri.includes('\0')) fail('LSP_URI_OUT_OF_ROOT', 'LSP URI is outside the workspace root');
+  const match = uri.match(/^file:\/\/([^/]*)(\/.*)$/);
+  if (!match) fail('LSP_URI_OUT_OF_ROOT', 'LSP URI is outside the workspace root');
+  const host = match[1];
+  if (host !== '' && host !== 'localhost') fail('LSP_URI_OUT_OF_ROOT', 'LSP URI is outside the workspace root');
+  const rawPath = match[2];
+  if (/[?#]/.test(rawPath)) fail('LSP_URI_OUT_OF_ROOT', 'LSP URI is outside the workspace root');
+  let decoded;
+  try { decoded = decodeURIComponent(rawPath); } catch { fail('LSP_URI_OUT_OF_ROOT', 'LSP URI is outside the workspace root'); }
+  if (decoded.includes('\0')) fail('LSP_URI_OUT_OF_ROOT', 'LSP URI is outside the workspace root');
+  const resolved = path.resolve(decoded);
+  if (resolved !== rootPath && !resolved.startsWith(rootPath + path.sep)) fail('LSP_URI_OUT_OF_ROOT', 'LSP URI is outside the workspace root');
+  return resolved;
+}
+
+function isPosition(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Number.isSafeInteger(value.line) && value.line >= 0
+    && Number.isSafeInteger(value.character) && value.character >= 0;
+}
+
+function comparePositions(a, b) {
+  if (a.line !== b.line) return a.line - b.line;
+  return a.character - b.character;
+}
+
+function copyPosition(value) {
+  return Object.freeze({ line: value.line, character: value.character });
+}
+
+function copyRange(range) {
+  return Object.freeze({ start: copyPosition(range.start), end: copyPosition(range.end) });
+}
+
+// LSP positions count UTF-16 code units, which is exactly how JavaScript
+// strings are indexed, so offsets below are plain string indices. A
+// surrogate pair (e.g. an emoji) occupies two character columns.
+function computeLineStarts(text) {
+  const starts = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\r') {
+      if (text[i + 1] === '\n') i++;
+      starts.push(i + 1);
+    } else if (text[i] === '\n') {
+      starts.push(i + 1);
+    }
+  }
+  return starts;
+}
+
+function lineContentLength(text, starts, line) {
+  const start = starts[line];
+  const next = line + 1 < starts.length ? starts[line + 1] : text.length;
+  let end = next;
+  if (text[end - 1] === '\n') end--;
+  if (text[end - 1] === '\r') end--;
+  return end - start;
+}
+
+function positionToOffset(text, starts, position) {
+  if (position.line >= starts.length) fail('LSP_DOCUMENT_INVALID', 'LSP document change position is out of range');
+  if (position.character > lineContentLength(text, starts, position.line)) fail('LSP_DOCUMENT_INVALID', 'LSP document change position is out of range');
+  return starts[position.line] + position.character;
+}
+
+// Apply incremental {range, text} changes in order, each against the
+// document produced by the previous one. Throws LSP_DOCUMENT_INVALID on
+// any malformed range or out-of-range position; the caller must not
+// update local state when this throws.
+function applyIncrementalChanges(text, changes) {
+  let current = text;
+  for (const change of changes) {
+    if (!change || typeof change !== 'object' || Array.isArray(change) || typeof change.text !== 'string'
+      || !isPosition(change.range?.start) || !isPosition(change.range?.end)
+      || comparePositions(change.range.start, change.range.end) > 0) {
+      fail('LSP_DOCUMENT_INVALID', 'LSP incremental document change is invalid');
+    }
+    const starts = computeLineStarts(current);
+    const start = positionToOffset(current, starts, change.range.start);
+    const end = positionToOffset(current, starts, change.range.end);
+    if (start > end) fail('LSP_DOCUMENT_INVALID', 'LSP incremental document change range is invalid');
+    current = current.slice(0, start) + change.text + current.slice(end);
+  }
+  return current;
+}
+
+function redactDiagnosticMessage(message) {
+  return message
+    .replace(URL_USERINFO_PATTERN, '://[redacted]@')
+    .replace(BEARER_TOKEN_PATTERN, '[redacted]')
+    .replace(CREDENTIAL_ASSIGN_PATTERN, '$1[redacted]');
+}
+
+// Keep only the allowlisted diagnostic fields; drop everything else the
+// server sent. Returns a frozen record, or null when the entry has no
+// usable string message.
+function sanitizeDiagnostic(diagnostic, maxMessageChars) {
+  if (!diagnostic || typeof diagnostic !== 'object' || Array.isArray(diagnostic) || typeof diagnostic.message !== 'string') return null;
+  const record = { message: redactDiagnosticMessage(diagnostic.message).slice(0, maxMessageChars) };
+  if (diagnostic.range && typeof diagnostic.range === 'object'
+    && isPosition(diagnostic.range.start) && isPosition(diagnostic.range.end)
+    && comparePositions(diagnostic.range.start, diagnostic.range.end) <= 0) {
+    record.range = copyRange(diagnostic.range);
+  }
+  if (Number.isSafeInteger(diagnostic.severity)) record.severity = diagnostic.severity;
+  if (typeof diagnostic.code === 'string' || Number.isSafeInteger(diagnostic.code)) record.code = diagnostic.code;
+  if (typeof diagnostic.source === 'string') record.source = diagnostic.source;
+  return Object.freeze(record);
+}
+
+function validateEditRange(range) {
+  if (!range || typeof range !== 'object' || Array.isArray(range)
+    || !isPosition(range.start) || !isPosition(range.end)
+    || comparePositions(range.start, range.end) > 0) {
+    fail('LSP_EDIT_INVALID', 'LSP workspace edit range is invalid');
+  }
+  return copyRange(range);
+}
+
+function validateTextEdit(edit) {
+  if (!edit || typeof edit !== 'object' || Array.isArray(edit) || typeof edit.newText !== 'string') {
+    fail('LSP_EDIT_INVALID', 'LSP workspace edit is invalid');
+  }
+  return Object.freeze({ range: validateEditRange(edit.range), newText: edit.newText });
+}
+
+// Pure function: no fs, no child_process, no network. It turns either a
+// workspace/applyEdit request frame (params.edit, optional params.label)
+// or a bare WorkspaceEdit ({changes} or {documentChanges}) into a frozen
+// {label?, files: [{uri, version|null, edits: [{range, newText}]}]}
+// proposal. The proposal is data only: landing it on disk must go
+// through the repository's Patch proposal + independent approval flow.
+// Writing a proposal straight to disk bypasses that gate and is a bug.
+export function collectWorkspaceEditProposal(input, { root } = {}) {
+  if (typeof root !== 'string' || !root) fail('LSP_ROOT_INVALID', 'LSP workspace root is required');
+  const rootPath = path.resolve(root);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) fail('LSP_EDIT_INVALID', 'LSP workspace edit is invalid');
+  const params = input.params && typeof input.params === 'object' && !Array.isArray(input.params) ? input.params : null;
+  let edit;
+  let label;
+  if (params && params.edit !== undefined) {
+    edit = params.edit;
+    label = params.label;
+  } else if (input.edit !== undefined) {
+    edit = input.edit;
+    label = input.label;
+  } else {
+    edit = input;
+    label = input.label;
+  }
+  if (!edit || typeof edit !== 'object' || Array.isArray(edit)) fail('LSP_EDIT_INVALID', 'LSP workspace edit is invalid');
+  if (label !== undefined && typeof label !== 'string') fail('LSP_EDIT_INVALID', 'LSP workspace edit label is invalid');
+  const hasChanges = edit.changes !== undefined;
+  const hasDocumentChanges = edit.documentChanges !== undefined;
+  if (hasChanges === hasDocumentChanges) fail('LSP_EDIT_INVALID', 'LSP workspace edit must carry exactly one of changes or documentChanges');
+  const byUri = new Map();
+  const addFile = (uri, version, edits) => {
+    resolveLspUri(uri, rootPath);
+    if (!Array.isArray(edits) || edits.length === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit file has no edits');
+    const normalized = edits.map(validateTextEdit);
+    const existing = byUri.get(uri);
+    if (existing) {
+      if (existing.version === null) existing.version = version;
+      existing.edits.push(...normalized);
+    } else {
+      byUri.set(uri, { uri, version, edits: [...normalized] });
+    }
+  };
+  if (hasChanges) {
+    if (!edit.changes || typeof edit.changes !== 'object' || Array.isArray(edit.changes)) fail('LSP_EDIT_INVALID', 'LSP workspace edit changes are invalid');
+    const entries = Object.entries(edit.changes);
+    if (entries.length === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit is empty');
+    for (const [uri, edits] of entries) addFile(uri, null, edits);
+  } else {
+    if (!Array.isArray(edit.documentChanges) || edit.documentChanges.length === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit documentChanges are invalid');
+    for (const item of edit.documentChanges) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) fail('LSP_EDIT_INVALID', 'LSP workspace edit documentChange is invalid');
+      if (item.kind === 'create' || item.kind === 'rename' || item.kind === 'delete') {
+        fail('LSP_EDIT_UNSUPPORTED', 'LSP workspace edit documentChange kind is not supported');
+      }
+      const doc = item.textDocument;
+      if (!doc || typeof doc !== 'object' || typeof doc.uri !== 'string') {
+        if (typeof item.uri === 'string' && (item.kind !== undefined || item.newUri !== undefined || item.oldUri !== undefined)) {
+          fail('LSP_EDIT_UNSUPPORTED', 'LSP workspace edit documentChange kind is not supported');
+        }
+        fail('LSP_EDIT_INVALID', 'LSP workspace edit documentChange is invalid');
+      }
+      let version = null;
+      if (doc.version !== undefined && doc.version !== null) {
+        if (!Number.isSafeInteger(doc.version) || doc.version < 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit document version is invalid');
+        version = doc.version;
+      }
+      addFile(doc.uri, version, item.edits);
+    }
+  }
+  if (byUri.size === 0) fail('LSP_EDIT_INVALID', 'LSP workspace edit is empty');
+  const files = Object.freeze([...byUri.values()].map((file) => Object.freeze({
+    uri: file.uri,
+    version: file.version,
+    edits: Object.freeze(file.edits),
+  })));
+  const proposal = label === undefined ? { files } : { label, files };
+  return Object.freeze(proposal);
 }
 
 export function createLspClient({
@@ -79,8 +309,12 @@ export function createLspClient({
   allowedMethods = LSP_READ_ONLY_METHODS,
   requestTimeoutMs = DEFAULT_TIMEOUT_MS,
   maxFrameBytes = DEFAULT_MAX_FRAME_BYTES,
+  maxDocumentBytes = DEFAULT_MAX_DOCUMENT_BYTES,
+  maxDiagnosticsPerUri = DEFAULT_MAX_DIAGNOSTICS_PER_URI,
+  maxDiagnosticMessageChars = DEFAULT_MAX_DIAGNOSTIC_MESSAGE_CHARS,
   onNotification,
   onServerRequest,
+  editProposalHandler,
 } = {}) {
   const serverCommand = safeCommand(command);
   const serverArgs = safeArgs(args);
@@ -89,9 +323,12 @@ export function createLspClient({
   const serverEnv = safeEnv(env);
   if (!Array.isArray(allowedMethods) || allowedMethods.length === 0 || allowedMethods.some((m) => typeof m !== 'string')) fail('LSP_METHODS_INVALID', 'LSP allowed methods are invalid');
   const allowed = new Set(allowedMethods);
-  for (const [name, value] of [['requestTimeoutMs', requestTimeoutMs], ['maxFrameBytes', maxFrameBytes]]) if (!Number.isSafeInteger(value) || value < 1) fail('LSP_CONFIG_INVALID', `${name} must be a positive safe integer`);
+  for (const [name, value] of [['requestTimeoutMs', requestTimeoutMs], ['maxFrameBytes', maxFrameBytes], ['maxDocumentBytes', maxDocumentBytes], ['maxDiagnosticsPerUri', maxDiagnosticsPerUri], ['maxDiagnosticMessageChars', maxDiagnosticMessageChars]]) {
+    if (!Number.isSafeInteger(value) || value < 1) fail('LSP_CONFIG_INVALID', `${name} must be a positive safe integer`);
+  }
   if (onNotification !== undefined && typeof onNotification !== 'function') fail('LSP_CALLBACK_INVALID', 'onNotification must be a function');
   if (onServerRequest !== undefined && typeof onServerRequest !== 'function') fail('LSP_CALLBACK_INVALID', 'onServerRequest must be a function');
+  if (editProposalHandler !== undefined && typeof editProposalHandler !== 'function') fail('LSP_CALLBACK_INVALID', 'editProposalHandler must be a function');
 
   let child = null;
   let state = 'disconnected';
@@ -100,14 +337,42 @@ export function createLspClient({
   const pending = new Map();
   let initialized = false;
   let closing = false;
+  // Open-document table: uri -> {uri, languageId, version, text}. Only
+  // updated after a notification frame has been sent successfully, so a
+  // send failure can never leave local state ahead of the server.
+  const openDocuments = new Map();
+  // Diagnostics table: uri -> frozen sanitized diagnostic records.
+  // publishDiagnostics replaces (never appends) the entries for its URI.
+  const diagnostics = new Map();
 
   function send(value) {
     if (!child || child.stdin.destroyed) fail('LSP_NOT_STARTED', 'LSP server is not started');
     child.stdin.write(encodeFrame(value));
   }
 
+  // Notifications get the same frame-size check as requests; a frame
+  // that fails the check is never written, and callers must not update
+  // local state after this throws.
+  function sendNotification(value) {
+    const frame = encodeFrame(value);
+    if (frame.length > maxFrameBytes) fail('LSP_FRAME_LIMIT', 'LSP frame exceeded the configured limit');
+    send(value);
+  }
+
   function sendResponse(id, result, error) {
     try { send(error ? { jsonrpc: '2.0', id, error } : { jsonrpc: '2.0', id, result: result ?? null }); } catch {}
+  }
+
+  function handlePublishDiagnostics(params) {
+    if (!params || typeof params !== 'object' || Array.isArray(params) || typeof params.uri !== 'string' || !Array.isArray(params.diagnostics)) return;
+    try { resolveLspUri(params.uri, rootPath); } catch { return; } // Out-of-root diagnostics are discarded, never stored.
+    const stored = [];
+    for (const diagnostic of params.diagnostics) {
+      if (stored.length >= maxDiagnosticsPerUri) break;
+      const clean = sanitizeDiagnostic(diagnostic, maxDiagnosticMessageChars);
+      if (clean) stored.push(clean);
+    }
+    diagnostics.set(params.uri, Object.freeze(stored));
   }
 
   function handleFrame(frame) {
@@ -122,10 +387,30 @@ export function createLspClient({
       return;
     }
     if (typeof frame.method === 'string' && frame.id !== undefined) {
-      // Server-initiated requests are never auto-executed. An explicit
-      // caller handler may answer with data it already holds; otherwise the
-      // client answers with "method not found" so the server cannot drive
-      // the host through this client.
+      // Server-initiated requests are never auto-executed. workspace/
+      // applyEdit is special-cased: only an explicit editProposalHandler
+      // may see a normalized proposal, and even then the handler only
+      // returns data -- it does not write anything. Without that handler
+      // the answer is method-not-found, exactly as for any other
+      // unhandled server request, so the server cannot drive the host
+      // through this client.
+      if (frame.method === 'workspace/applyEdit') {
+        if (editProposalHandler) {
+          let proposal;
+          try {
+            proposal = collectWorkspaceEditProposal(frame, { root: rootPath });
+          } catch {
+            sendResponse(frame.id, null, { code: -32602, message: 'Invalid params' });
+            return;
+          }
+          Promise.resolve().then(() => editProposalHandler(proposal))
+            .then((result) => sendResponse(frame.id, result === undefined ? { applied: false } : result))
+            .catch(() => sendResponse(frame.id, null, { code: -32603, message: 'Internal error' }));
+        } else {
+          sendResponse(frame.id, null, { code: -32601, message: 'Method not found' });
+        }
+        return;
+      }
       if (onServerRequest) {
         Promise.resolve().then(() => onServerRequest(frame)).then((result) => sendResponse(frame.id, result ?? null)).catch(() => sendResponse(frame.id, null, { code: -32603, message: 'Internal error' }));
       } else {
@@ -133,7 +418,10 @@ export function createLspClient({
       }
       return;
     }
-    if (typeof frame.method === 'string') onNotification?.(frame);
+    if (typeof frame.method === 'string') {
+      if (frame.method === 'textDocument/publishDiagnostics') handlePublishDiagnostics(frame.params);
+      onNotification?.(frame);
+    }
   }
 
   function onData(chunk) {
@@ -213,6 +501,68 @@ export function createLspClient({
     });
   }
 
+  function didOpen(uri, languageId, text, version = 0) {
+    resolveLspUri(uri, rootPath);
+    if (typeof languageId !== 'string' || !languageId || languageId.length > 128) fail('LSP_DOCUMENT_INVALID', 'LSP document languageId is invalid');
+    if (typeof text !== 'string') fail('LSP_DOCUMENT_INVALID', 'LSP document text must be a string');
+    if (openDocuments.has(uri)) fail('LSP_DOCUMENT_ALREADY_OPEN', 'LSP document is already open');
+    if (!Number.isSafeInteger(version) || version < 0) fail('LSP_DOCUMENT_VERSION_INVALID', 'LSP document version is invalid');
+    if (Buffer.byteLength(text, 'utf8') > maxDocumentBytes) fail('LSP_DOCUMENT_LIMIT', 'LSP document exceeds the configured size limit');
+    sendNotification({ jsonrpc: '2.0', method: 'textDocument/didOpen', params: { textDocument: { uri, languageId, version, text } } });
+    openDocuments.set(uri, { uri, languageId, version, text });
+  }
+
+  function didChange(uri, changes, version) {
+    resolveLspUri(uri, rootPath);
+    const current = openDocuments.get(uri);
+    if (!current) fail('LSP_DOCUMENT_NOT_OPEN', 'LSP document is not open');
+    let nextText;
+    let contentChanges;
+    if (typeof changes === 'string') {
+      nextText = changes;
+      contentChanges = [{ text: changes }];
+    } else if (Array.isArray(changes) && changes.length > 0) {
+      nextText = applyIncrementalChanges(current.text, changes);
+      contentChanges = changes.map((change) => ({ range: copyRange(change.range), text: change.text }));
+    } else {
+      fail('LSP_DOCUMENT_INVALID', 'LSP document changes must be a full string or a non-empty array of incremental changes');
+    }
+    const nextVersion = version === undefined ? current.version + 1 : version;
+    if (!Number.isSafeInteger(nextVersion) || nextVersion <= current.version) fail('LSP_DOCUMENT_VERSION_INVALID', 'LSP document version must strictly increase');
+    if (Buffer.byteLength(nextText, 'utf8') > maxDocumentBytes) fail('LSP_DOCUMENT_LIMIT', 'LSP document exceeds the configured size limit');
+    sendNotification({ jsonrpc: '2.0', method: 'textDocument/didChange', params: { textDocument: { uri, version: nextVersion }, contentChanges } });
+    openDocuments.set(uri, { uri, languageId: current.languageId, version: nextVersion, text: nextText });
+  }
+
+  function didClose(uri) {
+    resolveLspUri(uri, rootPath);
+    if (!openDocuments.has(uri)) fail('LSP_DOCUMENT_NOT_OPEN', 'LSP document is not open');
+    sendNotification({ jsonrpc: '2.0', method: 'textDocument/didClose', params: { textDocument: { uri } } });
+    openDocuments.delete(uri);
+  }
+
+  function getOpenDocument(uri) {
+    resolveLspUri(uri, rootPath);
+    const doc = openDocuments.get(uri);
+    return doc ? Object.freeze({ ...doc }) : null;
+  }
+
+  function listOpenDocuments() {
+    return Object.freeze([...openDocuments.values()].map((doc) => Object.freeze({ ...doc })));
+  }
+
+  function getDiagnostics(uri) {
+    resolveLspUri(uri, rootPath);
+    const stored = diagnostics.get(uri);
+    return stored ? Object.freeze([...stored]) : Object.freeze([]);
+  }
+
+  function getAllDiagnostics() {
+    const out = {};
+    for (const [uri, stored] of diagnostics) out[uri] = Object.freeze([...stored]);
+    return Object.freeze(out);
+  }
+
   async function shutdown() {
     if (state !== 'ready' && !initialized) return Object.freeze({ status: 'not-started' });
     try { await request('shutdown', {}); } catch {}
@@ -226,6 +576,7 @@ export function createLspClient({
     const current = child;
     child = null;
     state = 'disconnected';
+    openDocuments.clear();
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new LspClientError('LSP_CLOSED', 'LSP client was closed')); }
     pending.clear();
     if (current && !current.killed) {
@@ -239,6 +590,9 @@ export function createLspClient({
 
   return Object.freeze({
     start, request, shutdown, close,
+    didOpen, didChange, didClose,
+    getOpenDocument, listOpenDocuments,
+    getDiagnostics, getAllDiagnostics,
     getState: () => state,
     getRoot: () => rootPath,
     getAllowedMethods: () => Object.freeze([...allowed]),
