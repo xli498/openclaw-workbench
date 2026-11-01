@@ -68,7 +68,7 @@
 - **LSP（只读客户端切片已完成，全量 LSP 未闭合）**：`createLspClient` 为工作区内 stdio 客户端，仅允许只读方法（initialize、hover、definition、references、documentSymbol、completion、workspace/symbol、shutdown）；服务端请求绝不自动执行（默认回 -32601），命令/参数拒绝 shell 与凭据材料，环境值绝不进错误与日志，applyEdit/executeCommand 在送达前即被拒绝。
 - **真正 PTY provider（POSIX 显式注入切片已完成，默认仍 pty:false）**：`createPosixPtyProvider` 经 Python pty 桥接 helper 实现交互输入、增量输出与进程组取消（cancel 杀整个进程组），环境最小化且绝不进记录；Windows 与无 python3 时明确报 PTY_UNAVAILABLE，绝不伪造 PTY。未实现：窗口尺寸调整（resize）、Windows PTY。
 
-## 仍未闭合项（截至第二轮闭环，2026-11-01，写明原因与下一步，不冒充完成）
+## 仍未闭合项（截至第二轮闭环，2026-11-01，历史快照；以文末第三轮清单为准）
 
 - **LSP 全量**：未实现。下一步：在只读切片上补文档同步（didOpen/didChange/didClose）、诊断接入与经审批的编辑路径（applyEdit 仍须走 Patch 审批），并支持多语言服务器配置。
 - **PTY 窗口尺寸与 Windows PTY**：未实现。下一步：仅在明确需要时做 resize 协议（宿主注入的尺寸通道）与 Windows ConPTY 方案，默认仍保持 pty:false。
@@ -76,3 +76,22 @@
 - **完整 streamable HTTP 会话语义的剩余项**：未全部开放。下一步：按 MCP `2025-06-18` 补服务端对客户端请求的断线续接（Last-Event-ID 回放）与 HTTP 工具执行路由的完整语义，仍须守住审批与 allowlist。
 - **MCP 管理桌面面板**：未实现。下一步：在已完成的管理面 API 上补桌面控制台面板，仍须守住审批与配置漂移失效。
 - **公网隧道真实部署验证**：未验证，已按受控规则停下（不是漏做）。核查：本机与 CI 均无 cloudflared/ngrok CLI；真实验证需要下载第三方隧道二进制，且 named/fixed 模式需要账号凭证与域名绑定，超出受控范围；适配器本身已用 mock CLI 验过（shell:false、Bearer 仅放环境变量、随机路由、reset 失效旧路由、状态/审计不含 URL 与 token）。下一步：仅在已安装 cloudflared 且操作者明确批准的前提下，对哑元回环服务做一次短时 quick-tunnel 试验、立即关闭、只记录通过/失败（不记录 URL），验证前不称生产可用。
+
+## 第三轮闭环已完成（2026-11-01，PR #35–#40）
+
+- **streamable HTTP 剩余语义（已完成，进程内回放）**：桥接服务端新增每会话有界回放缓冲（默认 100 条，`evt-N` 递增 id），GET SSE 订阅带 Last-Event-ID 时只重放缓冲内该 id 之后的事件；过期/截断/超前/非法 id 返回 410 `MCP_EVENT_EXPIRED` 或 400 `MCP_EVENT_ID_INVALID` 且不含事件内容；跨会话回放隔离、Bearer/会话检查优先于回放；broadcast 仍只来自显式调用，工具执行不自动产生广播；patch/command 仍只返回待审批提案。限制：缓冲仅进程内内存，桥接重启、会话过期或 DELETE 关闭后无法续接；POST SSE 单帧响应不可续接；410 后客户端须自行用 tools/list/call 重查状态。
+- **LSP 全量切片（文档同步、诊断、经审批编辑、多语言配置已完成）**：didOpen/didChange/didClose（含版本追踪、UTF-16 增量变更、workspace-root URI  enforcement、内容上限）、publishDiagnostics 收集（白名单字段、脱敏、每 URI 封顶）、`collectWorkspaceEditProposal`（只产冻结提案数据，create/rename/delete 拒绝，落盘仍走 Patch 提案＋独立审批）、多语言服务器注册表（配置-only，复用命令/参数/环境校验）。未验证：真实语言服务器与 Windows。
+- **PTY（POSIX resize 已完成；Windows ConPTY 代码已合但未验证）**：POSIX helper 经 fd3 控制通道接受 `cols rows` 行并用 TIOCSWINSZ + SIGWINCH 生效，provider 句柄与 terminal-session 均透传 resize（cols 1–500、rows 1–200）；Windows ConPTY provider 与 PowerShell P/Invoke helper 已合入，文件头标 WINDOWS_PTY_STATUS: UNVERIFIED，Windows 测试在 Windows CI 上按设计跳过，故 ConPTY 生成、输入/输出 pump、cancel、退出码均未验证；Windows resize 明确为 PTY_RESIZE_UNSUPPORTED，留待后续切片（需持久控制通道）。
+- **MCP 管理桌面面板（已完成，后端 0 改动）**：桌面控制台新增 MCP 面板，复用已合管理面 API：只显示名称/启用状态/工具名与 authorized 标记，不显示配置原文、命令参数与密钥引用；update/remove 只生成提案，批准后需重新启用。收窄口径：面板更新目前只改显示名称；后端无拒绝入口，面板只提供批准；漂移失效依赖面板见过的旧 configHash 或提案返回 MCP_CONFLICT。
+- **Gateway（探针测试加强与帮助面实测已完成；生命周期仍未闭合）**：官方 openclaw CLI 2026.10.9 已在受控 VM 家目录装上（605M，含 344 个包），只读 --help 实测确认 gateway/channels/顶层命令名存在；但未实测到稳定、公开的集成接口输出（无运行网关时无法观测 --json 形态与 RPC 协议），故未编写任何生命周期接入代码，start() 无显式注入适配器时仍拒绝。新增探针测试 6 项与调研纪要 docs/gateway-lifecycle-wb3-research.md。
+- **公网隧道真实部署验证（未闭合，已按受控规则停下）**：cloudflared 已从官方渠道下载到 /tmp（约 40.3MB），哑元回环服务本身可达；但 quick-tunnel 两次建链均失败（TLS 握手异常类别，带代理与直连均同），未建立可用隧道，试验后进程均已确认退出、无长期 endpoint 残留。下一步：仅在隧道建链端点 TLS 握手能正常通过的环境中重跑哑元 quick 试验，或由操作者明确批准其他受控路径；不改 named/fixed、不接真实工作区。
+- **并行时序 flaky（已确定性修复，非阈值蒙混）**：MCP HTTP 超时测试的 slow 服务改为永不响应（超时必赢）、非超时断言改用 generous-timeout 传输、洪泛测试改为轮询等服务端观测到关闭；运行时修了显式调用方 abort 优先于超时计时器的错误映射（abortedByCaller 标志）。全量本地（代理变量清空）：542 项、527 通过、0 失败、15 跳过（Windows-only）。
+
+## 仍未闭合项（截至第三轮闭环，2026-11-01，写明原因与下一步，不冒充完成）
+
+- **LSP 全量剩余**：真实语言服务器接入未验证；`documentChanges` 的 create/rename/delete 类编辑仍被拒绝而非提案化；didChange 编码对齐（UTF-8/UTF-32 服务器）未验证。下一步：接真实语言服务器实测后再切片。
+- **PTY 剩余**：Windows ConPTY 生成、输入/输出 pump、cancel、退出码未验证（Windows 测试按设计跳过）；Windows resize 未接线（PTY_RESIZE_UNSUPPORTED）。下一步：在 Windows CI/受控 Windows 环境实测 ConPTY 路径后，再补命名管道控制通道做 Windows resize。
+- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针与帮助面实测）。下一步：在受控隔离环境以隔离 profile 起本地回环网关，实测 gateway status/probe/health 的裸跑输出（尤其 --json 形态）与 channels list/status 的空配置行为，拿到真实输出样本后才设计生命周期接入；凡涉及登录、配对、token、写真实配置的验证，须用户明确授权后另行受控验证。
+- **streamable HTTP 剩余**：进程内回放缓冲重启即失；无服务端状态快照端点。下一步：如需跨重启续接，设计持久化回放缓冲与快照语义（仍守审批与 allowlist）。
+- **MCP 管理剩余**：面板全量配置编辑器未实现；提案拒绝/撤销入口缺失（后端无 deny/cancel 路由）；更新后重新启用无面板入口。下一步：在管理面 API 上补上述入口。
+- **公网隧道真实部署验证**：未验证（见上）。下一步：仅在 TLS 建链可通的环境重跑哑元 quick 试验，验证前不称生产可用。
