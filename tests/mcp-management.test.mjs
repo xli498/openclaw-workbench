@@ -86,3 +86,96 @@ test('MCP control plane proposes, approves, and removes a server only when stopp
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('MCP proposals can be denied or cancelled only with approval token + actionHash, and then never approved', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-reject-'));
+  try {
+    const TOKEN = 'mgmt-reject-token-987654';
+    const APPROVAL = 'mgmt-reject-approve-987654';
+    const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL });
+    const address = await app.listen();
+    const call = async (pathname, options = {}) => {
+      const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}`, ...(options.headers ?? {}) } });
+      return { status: response.status, body: await response.json() };
+    };
+    try {
+      const proposed = await call('/v1/mcp/servers', { method: 'POST', body: JSON.stringify({ sessionId: 's1', ...serverInput() }) });
+      assert.equal(proposed.status, 201);
+      const action = proposed.body.proposal.action;
+      // No approval token -> 403, proposal stays.
+      const noToken = await call(`/v1/mcp/servers/${action.id}/deny`, { method: 'POST', body: JSON.stringify({ actionHash: action.actionHash }) });
+      assert.equal(noToken.status, 403);
+      // Wrong actionHash -> rejected, proposal stays.
+      const wrongHash = await call(`/v1/mcp/servers/${action.id}/deny`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: 'stale-hash' }) });
+      assert.notEqual(wrongHash.status, 200);
+      // Correct deny -> 200 denied; approving afterwards is a 404, not a
+      // second chance to execute.
+      const denied = await call(`/v1/mcp/servers/${action.id}/deny`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: action.actionHash }) });
+      assert.equal(denied.status, 200);
+      assert.equal(denied.body.action.status, 'denied');
+      const approveAfterDeny = await call(`/v1/mcp/servers/${action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: action.actionHash }) });
+      assert.equal(approveAfterDeny.status, 404);
+      // Cancel path behaves the same for a fresh proposal.
+      const proposed2 = await call('/v1/mcp/servers', { method: 'POST', body: JSON.stringify({ sessionId: 's1', ...serverInput({ id: 'demo2', name: 'demo2' }) }) });
+      assert.equal(proposed2.status, 201);
+      const action2 = proposed2.body.proposal.action;
+      const cancelled = await call(`/v1/mcp/servers/${action2.id}/cancel`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: action2.actionHash }) });
+      assert.equal(cancelled.status, 200);
+      assert.equal(cancelled.body.action.status, 'cancelled');
+      const approveAfterCancel = await call(`/v1/mcp/servers/${action2.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: action2.actionHash }) });
+      assert.equal(approveAfterCancel.status, 404);
+      assert.equal((await call('/v1/mcp/servers')).body.servers.length, 0);
+    } finally {
+      await app.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP update approval resets enablement and an enable proposal re-enables it', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-reenable-'));
+  try {
+    const TOKEN = 'mgmt-reenable-token-987654';
+    const APPROVAL = 'mgmt-reenable-approve-987654';
+    const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL });
+    const address = await app.listen();
+    const call = async (pathname, options = {}) => {
+      const response = await fetch(`http://${address.address}:${address.port}${pathname}`, { ...options, headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}`, ...(options.headers ?? {}) } });
+      return { status: response.status, body: await response.json() };
+    };
+    try {
+      const proposed = await call('/v1/mcp/servers', { method: 'POST', body: JSON.stringify({ sessionId: 's1', ...serverInput() }) });
+      const regAction = proposed.body.proposal.action;
+      await call(`/v1/mcp/servers/${regAction.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: regAction.actionHash }) });
+      let current = (await call('/v1/mcp/servers')).body.servers[0];
+      const enableProposal = await call('/v1/mcp/servers/demo/enable', { method: 'POST', body: JSON.stringify({ sessionId: 's1', configHash: current.configHash }) });
+      assert.equal(enableProposal.status, 201);
+      const enAction = enableProposal.body.proposal.action;
+      const enabled = await call(`/v1/mcp/servers/${enAction.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: enAction.actionHash }) });
+      assert.equal(enabled.status, 200);
+      assert.equal(enabled.body.server.enabled, true);
+      current = (await call('/v1/mcp/servers')).body.servers[0];
+      // Full-config update (not just the name) via proposal, then approval
+      // resets enablement; a fresh enable proposal restores it.
+      const updateProposal = await call('/v1/mcp/servers/demo/update', { method: 'POST', body: JSON.stringify({ sessionId: 's1', configHash: current.configHash, server: { ...current, name: 'demo-renamed', args: ['server3.mjs'] } }) });
+      assert.equal(updateProposal.status, 201);
+      const upAction = updateProposal.body.proposal.action;
+      const updated = await call(`/v1/mcp/servers/${upAction.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: upAction.actionHash }) });
+      assert.equal(updated.status, 200);
+      assert.equal(updated.body.server.name, 'demo-renamed');
+      assert.deepEqual(updated.body.server.args, ['server3.mjs']);
+      assert.equal(updated.body.server.enabled, false);
+      current = (await call('/v1/mcp/servers')).body.servers[0];
+      const reenableProposal = await call('/v1/mcp/servers/demo/enable', { method: 'POST', body: JSON.stringify({ sessionId: 's1', configHash: current.configHash }) });
+      const reAction = reenableProposal.body.proposal.action;
+      const reenabled = await call(`/v1/mcp/servers/${reAction.id}/approve`, { method: 'POST', headers: { 'x-approval-token': APPROVAL }, body: JSON.stringify({ actionHash: reAction.actionHash }) });
+      assert.equal(reenabled.status, 200);
+      assert.equal(reenabled.body.server.enabled, true);
+    } finally {
+      await app.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

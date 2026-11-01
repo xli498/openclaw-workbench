@@ -595,7 +595,9 @@ fn approval_header_allowed(method: &str, pathname: &str) -> bool {
         ["v1", "models", id, operation] => {
             !id.is_empty() && matches!(*operation, "health" | "approve")
         }
-        ["v1", "mcp", "servers", id, "approve"] => !id.is_empty(),
+        ["v1", "mcp", "servers", id, operation] => {
+            !id.is_empty() && matches!(*operation, "approve" | "deny" | "cancel")
+        }
         ["v1", "config", id, "approve"] => !id.is_empty(),
         ["v1", "terminal", "sessions"] => true,
         ["v1", "terminal", "sessions", id, operation] => {
@@ -732,6 +734,8 @@ mod request_tests {
             "/v1/models/primary/health",
             "/v1/models/primary/approve",
             "/v1/mcp/servers/local/approve",
+            "/v1/mcp/servers/local/deny",
+            "/v1/mcp/servers/local/cancel",
             "/v1/config/action-123/approve",
             "/v1/terminal/sessions",
             "/v1/terminal/sessions/01234567-89ab-cdef-0123-456789abcdef/input",

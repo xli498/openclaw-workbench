@@ -720,6 +720,21 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           mcpClaims.delete(proposal.action.id);
         }
       }
+      const mcpReject = url.pathname.match(/^\/v1\/mcp\/servers\/([^/]+)\/(deny|cancel)$/);
+      if (request.method === 'POST' && mcpReject) {
+        if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
+        const proposal = mcpProposals.get(mcpReject[1]);
+        if (!proposal) return json(response, 404, { error: 'MCP_PROPOSAL_NOT_FOUND', message: 'MCP proposal not found' });
+        const input = await bodyOf(request);
+        if (input.actionHash !== proposal.action.actionHash) throw new McpRegistryError('MCP_ACTION_HASH_MISMATCH', 'rejection must bind the current MCP action hash');
+        if (mcpClaims.has(proposal.action.id)) throw new McpRegistryError('MCP_PROPOSAL_BUSY', 'MCP proposal is already executing');
+        const nextStatus = mcpReject[2] === 'deny' ? 'denied' : 'cancelled';
+        const action = transition(proposal.action, nextStatus, { expectedHash: proposal.action.actionHash });
+        mcpProposals.delete(proposal.action.id);
+        const verb = mcpReject[2] === 'deny' ? 'denied' : 'cancelled';
+        if (effectiveAudit) await effectiveAudit.append({ type: `mcp.${verb}`, actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, serverId: proposal.server.id, operation: proposal.operation });
+        return json(response, 200, { action, server: publicMcpProposal(proposal).server });
+      }
       if (request.method === 'GET' && url.pathname === '/v1/config') return json(response, 200, { config: await readConfig({ root }) });
       if (request.method === 'POST' && (url.pathname === '/v1/config/import' || url.pathname === '/v1/config/rollback')) {
         const input = await bodyOf(request);
