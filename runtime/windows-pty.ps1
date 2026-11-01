@@ -200,7 +200,13 @@ public static class OcwConPty
       # cb is the size of STARTUPINFO, not STARTUPINFOEX: CreateProcess
       # validates cb against the base structure, and the attribute list
       # is read only because EXTENDED_STARTUPINFO_PRESENT is set.
-      $startup.StartupInfo.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf([OcwConPty+StartupInfo])
+      # NOTE: SizeOf must be given a structure INSTANCE here. Passing
+      # the type literal ([OcwConPty+StartupInfo]) binds PowerShell to
+      # the SizeOf(object) overload, which throws "Type
+      # 'System.RuntimeType' cannot be marshaled" -- that one-line
+      # mistake killed the helper before CreateProcess in every earlier
+      # Windows run, which is why the failure never got past startup.
+      $startup.StartupInfo.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf((New-Object OcwConPty+StartupInfo))
       $startup.lpAttributeList = $attrList
       $procInfo = New-Object OcwConPty+ProcessInformation
       $flags = [OcwConPty]::ExtendedStartupinfoPresent -bor [OcwConPty]::CreateUnicodeEnvironment
