@@ -197,12 +197,20 @@ public static class OcwConPty
     try {
       if (-not [OcwConPty]::UpdateProcThreadAttribute($attrList, 0, [OcwConPty]::ProcThreadAttributePseudoConsole, $pcPtr, [IntPtr][IntPtr]::Size, [IntPtr]::Zero, [IntPtr]::Zero)) { throw 'UpdateProcThreadAttribute failed' }
       $startup = New-Object OcwConPty+StartupInfoEx
-      $startup.StartupInfo.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf([OcwConPty+StartupInfoEx])
+      # cb is the size of STARTUPINFO, not STARTUPINFOEX: CreateProcess
+      # validates cb against the base structure, and the attribute list
+      # is read only because EXTENDED_STARTUPINFO_PRESENT is set.
+      $startup.StartupInfo.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf([OcwConPty+StartupInfo])
       $startup.lpAttributeList = $attrList
       $procInfo = New-Object OcwConPty+ProcessInformation
       $flags = [OcwConPty]::ExtendedStartupinfoPresent -bor [OcwConPty]::CreateUnicodeEnvironment
       $cmd = New-Object System.Text.StringBuilder($commandLine)
-      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) { throw 'CreateProcess failed' }
+      # bInheritHandles must be TRUE: the pseudoconsole handle travels to
+      # the child through the attribute list, which is only applied to
+      # inheritable handles. FALSE leaves the child without a console
+      # (or fails CreateProcess outright), which is the classic ConPTY
+      # P/Invoke failure mode.
+      if (-not [OcwConPty]::CreateProcess($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) { throw 'CreateProcess failed' }
     } finally {
       [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
     }

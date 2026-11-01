@@ -92,10 +92,20 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       cwd: workdir,
       shell: false,
       windowsHide: true,
-      stdio: ['pipe', 'pipe', 'ignore'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
     let settled = false;
     const decoder = new TextDecoder();
+    const stderrDecoder = new TextDecoder();
+    // The helper prints only child output on stdout; its own failures
+    // print a single PTY_FAILED line on stderr with no argv values, so
+    // capturing bounded stderr here is safe and makes the next Windows
+    // CI failure self-diagnosing instead of a bare PTY_FAILED code.
+    let stderrText = '';
+    child.stderr.on('data', (chunk) => {
+      stderrText += stderrDecoder.decode(chunk, { stream: true });
+      if (stderrText.length > 4096) stderrText = stderrText.slice(0, 4096);
+    });
     const finish = (result) => {
       if (settled) return;
       settled = true;
@@ -114,7 +124,7 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       const tail = decoder.decode();
       if (tail) onOutput({ stream: 'stdout', text: tail });
       if (code === 0) finish({ status: 'exited', code: 0 });
-      else finish({ status: 'failed', error: { code: 'PTY_FAILED' } });
+      else finish({ status: 'failed', error: { code: 'PTY_FAILED', message: stderrText.trim() || 'PTY failed' } });
     });
     if (signal?.aborted) killTree();
     else signal?.addEventListener('abort', killTree, { once: true });

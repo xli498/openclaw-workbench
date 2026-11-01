@@ -69,7 +69,7 @@ test('Windows PTY ConPTY spawns cmd, pumps output, and exits zero', { skip: SKIP
   try {
     const { handle, outputs, result } = await runConPty(root, ['cmd.exe', '/c', 'echo', 'hello-conpty']);
     assert.deepEqual(handle.capabilities, { pty: true, input: true, incrementalOutput: true });
-    assert.equal(result.status, 'exited');
+    assert.equal(result.status, 'exited', JSON.stringify(result));
     assert.equal(result.code, 0);
     assert.match(outputs.join(''), /hello-conpty/);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -79,7 +79,7 @@ test('Windows PTY ConPTY propagates a non-zero child exit as failed', { skip: SK
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
     const { result } = await runConPty(root, ['cmd.exe', '/c', 'exit', '42']);
-    assert.equal(result.status, 'failed');
+    assert.equal(result.status, 'failed', JSON.stringify(result));
     assert.equal(result.error.code, 'PTY_FAILED');
     // Known contract gap, shared with the POSIX provider: the child's
     // numeric exit code is not carried on the failed result (only the
@@ -93,7 +93,7 @@ test('Windows PTY ConPTY pumps input to a child reading a line', { skip: SKIP_OF
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
     const { outputs, result } = await runConPty(root, ['cmd.exe', '/v:on', '/c', 'set /p v= && echo got-!v!'], { writeInput: 'hello-input\r\n' });
-    assert.equal(result.status, 'exited');
+    assert.equal(result.status, 'exited', JSON.stringify(result));
     assert.match(outputs.join(''), /got-hello-input/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

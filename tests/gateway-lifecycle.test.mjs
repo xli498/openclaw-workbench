@@ -53,7 +53,10 @@ async function makeMockCli(body) {
   // which is exactly the regression this helper used to carry into
   // Windows CI (WB3-gw): the mock must be a .cmd shim that runs the same
   // Node body, because the lifecycle probe spawns one command path with
-  // shell:false on every platform.
+  // shell:false on every platform. On Windows the mock is a .cmd shim
+  // (Node docs: .bat/.cmd files cannot be launched with spawn() and
+  // shell:false; defaultSpawn therefore routes .cmd/.bat commands
+  // through cmd.exe explicitly, still with shell:false).
   if (process.platform === 'win32') {
     const scriptPath = join(dir, 'openclaw-mock.mjs');
     await writeFile(scriptPath, `${body}\n`, 'utf8');
