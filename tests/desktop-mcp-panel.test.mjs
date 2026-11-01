@@ -13,24 +13,35 @@ test('desktop MCP panel exposes list, proposal entries, and re-enable notice wit
   const app = await readFile(path.join(frontendRoot, 'app.js'), 'utf8');
   for (const marker of [
     'mcp-title', 'refresh-mcp', 'mcp-state', 'mcp-list', 'mcp-feedback',
-    'mcp-proposal', 'mcp-proposal-summary', 'approve-mcp',
-    'mcp-update-form', 'mcp-update-target', 'mcp-update-name', 'submit-mcp-update'
+    'mcp-proposal', 'mcp-proposal-summary', 'approve-mcp', 'deny-mcp', 'cancel-mcp',
+    'mcp-update-form', 'mcp-update-target', 'mcp-update-name', 'submit-mcp-update',
+    'mcp-update-transport', 'mcp-update-command', 'mcp-update-args', 'mcp-update-endpoint',
+    'mcp-update-envkeys', 'mcp-update-tools', 'mcp-update-perm-fs', 'mcp-update-perm-net'
   ]) assert.match(html, new RegExp(`id="${marker}"`), `missing ${marker}`);
   for (const endpoint of ['/v1/mcp/servers', '/v1/mcp/runtimes', '/tools', '/update', '/remove', '/approve']) {
     assert.ok(app.includes(endpoint), `missing ${endpoint}`);
   }
+  // Deny/cancel reach the server as the verb of the shared reject helper.
+  assert.ok(app.includes("rejectMcpProposal('deny')") && app.includes("rejectMcpProposal('cancel')"), 'missing deny/cancel proposal actions');
+  // Enable/disable reach the server only as proposal submissions built
+  // from the action name, never as literal direct-effect routes.
+  assert.ok(app.includes("action === 'enable'") && app.includes("action === 'disable'"), 'missing enable/disable proposal actions');
   assert.match(html, /列出不等于授权/);
+  assert.match(html, /拒绝\/撤销的提案不得再被批准/);
   assert.match(app, /批准后需重新启用/);
   assert.match(app, /renderMcpProposal\(result\.proposal\)/);
   assert.match(app, /escapeHtml\(server\.name/);
-  // The renderer must never read transport details, even though the registry
-  // record carries them. Binding the current config hash for a proposal and
-  // carrying a new configuration to the proposal endpoint are not display.
-  assert.doesNotMatch(app, /server\.(command|args|envKeys|endpoint)/);
+  // Boundary, narrowed by the full-config editor: the LIST renderer must
+  // never interpolate transport details, but the editor may read them
+  // into form inputs for a new proposal. The proposal summary must never
+  // carry them either (it shows only target name/id and status).
   assert.doesNotMatch(app, /proposal\.server\.(command|args|envKeys|endpoint)/);
-  // No direct-effect MCP route: enable/disable/start/stop/call never appear
-  // as desktop MCP actions; only proposal submission and approval do.
-  assert.doesNotMatch(app, /\/v1\/mcp\/servers\/.*\/(enable|disable|start|stop|call)/);
+  // No direct-effect MCP route: start/stop/call never appear as desktop
+  // MCP actions. Enable/disable appear only as proposal submissions
+  // (approval=false on submit; approval=true only on approve/deny/cancel
+  // of the resulting proposal action id).
+  assert.doesNotMatch(app, /\/v1\/mcp\/servers\/.*\/(start|stop|call)/);
+  assert.match(app, /rejectMcpProposal/);
 });
 
 test('MCP list hides config material, update/remove stay proposals, and hash drift shows stale', async () => {
@@ -64,6 +75,14 @@ test('MCP list hides config material, update/remove stay proposals, and hash dri
       }
       if (request.method === 'POST' && request.path === '/v1/mcp/servers/srv-a/remove') {
         return result(201, { proposal: { action: { id: 'rm-action', actionHash: 'rm-hash', status: 'awaiting_approval', type: 'mcp.remove' }, server: { id: 'srv-a', name: 'Alpha New' }, operation: 'remove' } });
+      }
+      if (request.method === 'POST' && request.path === '/v1/mcp/servers/srv-a/enable') {
+        if (request.approval !== false) throw new Error('enable submission must be a proposal, not an approval');
+        return result(201, { proposal: { action: { id: 'en-action', actionHash: 'en-hash', status: 'awaiting_approval', type: 'mcp.set_enabled' }, server: { id: 'srv-a', name: 'Alpha New' }, operation: 'set_enabled' } });
+      }
+      if (request.method === 'POST' && (request.path.endsWith('/deny') || request.path.endsWith('/cancel'))) {
+        if (request.approval !== true) throw new Error('approval token required');
+        return result(200, { action: { id: 'denied', status: request.path.endsWith('/deny') ? 'denied' : 'cancelled' } });
       }
       if (request.method === 'POST' && request.path.endsWith('/approve')) {
         if (request.approval !== true) throw new Error('approval token required');
@@ -100,12 +119,16 @@ test('MCP list hides config material, update/remove stay proposals, and hash dri
   assert.ok(requests.some((request) => request.method === 'GET' && request.path === '/v1/mcp/runtimes'));
   assert.ok(requests.some((request) => request.method === 'GET' && request.path === '/v1/mcp/servers/srv-a/tools'));
 
-  // Update entry opens the rename form; submitting only creates a proposal.
+  // Update entry opens the full-config editor, prefilled from the record;
+  // submitting only creates a proposal.
   const listClick = elements.get('#mcp-list').listeners.get('click');
   listClick({ target: { closest: (selector) => selector === '[data-mcp-action]' ? { dataset: { mcpAction: 'update', serverId: 'srv-a' }, disabled: false } : null } });
   assert.equal(elements.get('#mcp-update-form').hidden, false);
   assert.match(elements.get('#mcp-update-target').textContent, /Alpha/);
   assert.equal(elements.get('#mcp-update-name').value, 'Alpha');
+  assert.equal(elements.get('#mcp-update-command').value, '/bin/secret-cmd');
+  assert.equal(elements.get('#mcp-update-args').value, '--api-key\nSECRET-VALUE');
+  assert.equal(elements.get('#mcp-update-envkeys').value, 'API_KEY');
   elements.get('#mcp-update-name').value = 'Alpha New';
   elements.get('#submit-mcp-update').listeners.get('click')();
   await flush();
@@ -120,7 +143,7 @@ test('MCP list hides config material, update/remove stay proposals, and hash dri
   assert.match(summary, /Alpha New/);
   assert.match(summary, /批准后需重新启用/);
   assert.equal(summary.includes('/bin/secret-cmd'), false, 'proposal summary leaked config material');
-  assert.equal(requests.some((request) => /\/enable|\/disable|\/start|\/stop|\/call/.test(request.path ?? '')), false, 'a direct-effect MCP route was called');
+  assert.equal(requests.some((request) => /\/start|\/stop|\/call/.test(request.path ?? '')), false, 'a direct-effect MCP route was called');
 
   // Approving the update refreshes to the disabled, hash-changed record:
   // the panel must show the stale instance notice and the re-enable prompt.
@@ -146,4 +169,23 @@ test('MCP list hides config material, update/remove stay proposals, and hash dri
   assert.ok(approveRemove, 'remove approval was not submitted');
   assert.equal(approveRemove.approval, true);
   assert.match(elements.get('#mcp-feedback').textContent, /MCP 变更已批准/);
+
+  // Re-enable entry after the update approval: submitting an enable
+  // proposal (approval=false), then denying it (approval=true + hash).
+  // A denied proposal is cleared, so it cannot be approved afterwards.
+  listClick({ target: { closest: (selector) => selector === '[data-mcp-action]' ? { dataset: { mcpAction: 'enable', serverId: 'srv-a' }, disabled: false } : null } });
+  await flush();
+  const enableRequest = requests.find((request) => request.method === 'POST' && request.path === '/v1/mcp/servers/srv-a/enable');
+  assert.ok(enableRequest, 'enable proposal was not submitted');
+  assert.equal(enableRequest.approval, false);
+  assert.equal(enableRequest.body.configHash, 'hash-2');
+  assert.match(elements.get('#mcp-feedback').textContent, /启用提案已提交/);
+  elements.get('#deny-mcp').listeners.get('click')();
+  await flush();
+  const denyRequest = requests.find((request) => request.method === 'POST' && request.path === '/v1/mcp/servers/en-action/deny');
+  assert.ok(denyRequest, 'deny was not submitted');
+  assert.equal(denyRequest.approval, true);
+  assert.equal(denyRequest.body.actionHash, 'en-hash');
+  assert.match(elements.get('#mcp-feedback').textContent, /已拒绝，不会执行/);
+  assert.equal(elements.get('#mcp-proposal').hidden, true);
 });

@@ -72,9 +72,19 @@ const refreshMcpButton = document.querySelector('#refresh-mcp');
 const mcpProposalPanel = document.querySelector('#mcp-proposal');
 const mcpProposalSummary = document.querySelector('#mcp-proposal-summary');
 const approveMcp = document.querySelector('#approve-mcp');
+const denyMcp = document.querySelector('#deny-mcp');
+const cancelMcp = document.querySelector('#cancel-mcp');
 const mcpUpdateForm = document.querySelector('#mcp-update-form');
 const mcpUpdateTarget = document.querySelector('#mcp-update-target');
 const mcpUpdateName = document.querySelector('#mcp-update-name');
+const mcpUpdateTransport = document.querySelector('#mcp-update-transport');
+const mcpUpdateCommand = document.querySelector('#mcp-update-command');
+const mcpUpdateArgs = document.querySelector('#mcp-update-args');
+const mcpUpdateEndpoint = document.querySelector('#mcp-update-endpoint');
+const mcpUpdateEnvKeys = document.querySelector('#mcp-update-envkeys');
+const mcpUpdateTools = document.querySelector('#mcp-update-tools');
+const mcpUpdatePermFs = document.querySelector('#mcp-update-perm-fs');
+const mcpUpdatePermNet = document.querySelector('#mcp-update-perm-net');
 const submitMcpUpdate = document.querySelector('#submit-mcp-update');
 const invoke = window.__TAURI__?.core?.invoke;
 const openDialog = window.__TAURI__?.dialog?.open;
@@ -318,15 +328,19 @@ function mcpHealthLabel(status) {
 function updateMcpActionState() {
   refreshMcpButton.disabled = !runtimeReady || mcpBusy;
   approveMcp.disabled = !runtimeReady || !mcpPendingProposal?.action;
+  denyMcp.disabled = !runtimeReady || !mcpPendingProposal?.action;
+  cancelMcp.disabled = !runtimeReady || !mcpPendingProposal?.action;
 }
 
-// Display boundary: this renderer only ever reads a server's display name,
-// id, enabled flag, health status, and authorized tool names. The registry
-// record also carries transport details, but those fields are never read
-// here and never interpolated into panel markup. The full record is kept in
-// memory only so update/remove proposals can bind the current config hash
-// and so an update proposal can carry the new configuration to the
-// control-plane proposal endpoint; that transmission is not a display.
+// Display boundary: the list renderer only ever reads a server's display
+// name, id, enabled flag, health status, and authorized tool names. The
+// full-config editor (below) does read transport/command/endpoint/env-key
+// fields, but only into form inputs for a new proposal — never into list
+// markup — and the registry record carries no secret values at all (only
+// env key names), so the editor cannot display or submit one. The full
+// record is kept in memory so update/remove/enable proposals can bind
+// the current config hash and carry the new configuration to the
+// control-plane proposal endpoint.
 function renderMcpServers(payload) {
   const servers = Array.isArray(payload?.servers) ? payload.servers : [];
   const runtimes = Array.isArray(payload?.runtimes) ? payload.runtimes : mcpRuntimes;
@@ -351,7 +365,7 @@ function renderMcpServers(payload) {
       ? (liveTools.length ? liveTools.map((tool) => `${tool.name} · ${tool.authorized ? '已授权' : '未授权'}`).join('、') : '运行时未列出工具')
       : (Array.isArray(server.tools) && server.tools.length ? server.tools.map((name) => `${name} · 已授权`).join('、') : '暂无已授权工具');
     const running = runningIds.has(server.id) ? '运行中' : '未运行';
-    return `<article class="mcp-server"><div class="mcp-server__heading"><strong>${escapeHtml(server.name ?? server.id)}</strong><span class="badge badge--${server.enabled ? 'success' : 'muted'}">${server.enabled ? '已启用' : '未启用'}</span><span>${escapeHtml(running)} · ${escapeHtml(mcpHealthLabel(server.health?.status))}</span></div>${stale ? '<p class="mcp-stale">配置已变化，旧实例已失效，需重新启用。</p>' : ''}<p class="mcp-tools">工具：${escapeHtml(toolText)}</p><div class="mcp-actions"><button class="button button--small button--secondary" type="button" data-mcp-action="update" data-server-id="${escapeHtml(server.id)}">申请更新</button><button class="button button--small button--secondary" type="button" data-mcp-action="remove" data-server-id="${escapeHtml(server.id)}">申请移除</button></div></article>`;
+    return `<article class="mcp-server"><div class="mcp-server__heading"><strong>${escapeHtml(server.name ?? server.id)}</strong><span class="badge badge--${server.enabled ? 'success' : 'muted'}">${server.enabled ? '已启用' : '未启用'}</span><span>${escapeHtml(running)} · ${escapeHtml(mcpHealthLabel(server.health?.status))}</span></div>${stale ? '<p class="mcp-stale">配置已变化，旧实例已失效，需重新启用。</p>' : ''}<p class="mcp-tools">工具：${escapeHtml(toolText)}</p><div class="mcp-actions"><button class="button button--small button--secondary" type="button" data-mcp-action="update" data-server-id="${escapeHtml(server.id)}">申请更新</button><button class="button button--small button--secondary" type="button" data-mcp-action="remove" data-server-id="${escapeHtml(server.id)}">申请移除</button><button class="button button--small button--secondary" type="button" data-mcp-action="${server.enabled ? 'disable' : 'enable'}" data-server-id="${escapeHtml(server.id)}">申请${server.enabled ? '停用' : '启用'}</button></div></article>`;
   }).join('');
   updateMcpActionState();
 }
@@ -394,6 +408,14 @@ function clearMcp() {
   mcpUpdateForm.hidden = true;
   mcpUpdateTarget.textContent = '';
   mcpUpdateName.value = '';
+  mcpUpdateTransport.value = 'stdio';
+  mcpUpdateCommand.value = '';
+  mcpUpdateArgs.value = '';
+  mcpUpdateEndpoint.value = '';
+  mcpUpdateEnvKeys.value = '';
+  mcpUpdateTools.value = '';
+  mcpUpdatePermFs.checked = false;
+  mcpUpdatePermNet.checked = false;
   updateMcpActionState();
 }
 
@@ -449,8 +471,37 @@ async function handleMcpAction(button) {
     mcpUpdateTargetId = server.id;
     mcpUpdateTarget.textContent = `服务器：${server.name ?? server.id}`;
     mcpUpdateName.value = server.name ?? server.id;
+    mcpUpdateTransport.value = server.transport ?? 'stdio';
+    mcpUpdateCommand.value = server.command ?? '';
+    mcpUpdateArgs.value = Array.isArray(server.args) ? server.args.join('\n') : '';
+    mcpUpdateEndpoint.value = server.endpoint ?? '';
+    mcpUpdateEnvKeys.value = Array.isArray(server.envKeys) ? server.envKeys.join(', ') : '';
+    mcpUpdateTools.value = Array.isArray(server.tools) ? server.tools.join(', ') : '';
+    mcpUpdatePermFs.checked = server.permissions?.filesystem === true;
+    mcpUpdatePermNet.checked = server.permissions?.network === true;
     mcpUpdateForm.hidden = false;
     mcpUpdateName.focus();
+    return;
+  }
+  if (action === 'enable' || action === 'disable') {
+    button.disabled = true;
+    try {
+      // Proposal only: enablement changes only after independent approval.
+      // This is the re-enable entry after an update approval (which resets
+      // enabled server-side), and the matching disable entry.
+      const result = await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(server.id)}/${action}`, { sessionId: 'desktop-mcp', configHash: server.configHash }, false, { recoverRuntime: false });
+      renderMcpProposal(result.proposal);
+      setFeedback(mcpFeedback, `${action === 'enable' ? '启用' : '停用'}提案已提交，等待独立审批；批准前启用状态保持不变。`, 'success');
+    } catch (error) {
+      if ((error.message || '').includes('MCP_CONFLICT')) {
+        markMcpStale(server.id);
+        setFeedback(mcpFeedback, '配置已变化，旧实例已失效；请刷新列表后重试。', 'error');
+      } else {
+        setFeedback(mcpFeedback, error.message || `${action === 'enable' ? '启用' : '停用'}提案提交失败。`, 'error');
+      }
+    } finally {
+      button.disabled = false;
+    }
     return;
   }
   if (action === 'remove') {
@@ -474,6 +525,10 @@ async function handleMcpAction(button) {
   }
 }
 
+function splitMcpList(value) {
+  return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
 async function submitMcpUpdateProposal() {
   const server = mcpServers.find((item) => item.id === mcpUpdateTargetId);
   const newName = mcpUpdateName.value.trim();
@@ -488,12 +543,26 @@ async function submitMcpUpdateProposal() {
   }
   submitMcpUpdate.disabled = true;
   try {
-    // Proposal only: the panel changes nothing itself. Only the display
-    // name is edited here; the rest of the configuration is carried through
-    // untouched to the proposal endpoint, and the update takes effect only
-    // after independent approval. Approval resets enablement server-side,
-    // so the operator must re-enable afterwards.
-    const result = await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(server.id)}/update`, { sessionId: 'desktop-mcp', configHash: server.configHash, server: { ...server, name: newName } }, false, { recoverRuntime: false });
+    // Proposal only: the panel changes nothing itself. The editor builds
+    // a full candidate configuration; it takes effect only after
+    // independent approval, and approval resets enablement server-side,
+    // so the operator must re-enable afterwards (see the per-server
+    // 申请启用 entry). No secret value is ever read or submitted here:
+    // envKeys are names only, and the server rejects credential material
+    // in command/args/endpoint server-side.
+    const transport = mcpUpdateTransport.value;
+    const next = {
+      ...server,
+      name: newName,
+      transport,
+      command: transport === 'stdio' ? mcpUpdateCommand.value.trim() : undefined,
+      args: transport === 'stdio' ? mcpUpdateArgs.value.split('\n').map((item) => item.trim()).filter(Boolean) : [],
+      endpoint: transport === 'stdio' ? undefined : (mcpUpdateEndpoint.value.trim() || undefined),
+      envKeys: splitMcpList(mcpUpdateEnvKeys.value),
+      tools: splitMcpList(mcpUpdateTools.value),
+      permissions: { filesystem: mcpUpdatePermFs.checked, network: mcpUpdatePermNet.checked },
+    };
+    const result = await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(server.id)}/update`, { sessionId: 'desktop-mcp', configHash: server.configHash, server: next }, false, { recoverRuntime: false });
     renderMcpProposal(result.proposal);
     setFeedback(mcpFeedback, '更新提案已提交，等待独立审批；批准前原配置保持不变，批准后需重新启用。', 'success');
   } catch (error) {
@@ -1125,6 +1194,26 @@ approveMcp.addEventListener('click', async () => {
     updateMcpActionState();
   }
 });
+async function rejectMcpProposal(verb) {
+  const action = mcpPendingProposal?.action;
+  if (!action || !runtimeReady) return;
+  denyMcp.disabled = true;
+  cancelMcp.disabled = true;
+  try {
+    // Deny/cancel go through the same independent approval token and
+    // actionHash binding as approval; afterwards the proposal is gone
+    // from the server map, so a later approve gets MCP_PROPOSAL_NOT_FOUND.
+    await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(action.id)}/${verb}`, { actionHash: action.actionHash }, true, { recoverRuntime: false });
+    renderMcpProposal(null);
+    setFeedback(mcpFeedback, verb === 'deny' ? 'MCP 提案已拒绝，不会执行。' : 'MCP 提案已撤销，不会执行。', 'success');
+  } catch (error) {
+    setFeedback(mcpFeedback, error.message || 'MCP 提案拒绝/撤销失败。', 'error');
+  } finally {
+    updateMcpActionState();
+  }
+}
+denyMcp.addEventListener('click', () => { void rejectMcpProposal('deny'); });
+cancelMcp.addEventListener('click', () => { void rejectMcpProposal('cancel'); });
 recoveryList.addEventListener('click', (event) => {
   const showMore = event.target.closest('[data-recovery-show-more]');
   if (showMore) {
