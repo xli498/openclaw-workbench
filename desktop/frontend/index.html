@@ -176,6 +176,27 @@
           </div>
           <p id="operations-feedback" class="feedback" role="status" aria-live="polite"></p>
         </section>
+
+        <section class="panel mcp-panel" aria-labelledby="mcp-title">
+          <div class="panel-heading">
+            <div><p class="section-kicker">07 / MCP</p><h2 id="mcp-title">MCP 管理</h2></div>
+            <button id="refresh-mcp" class="button button--secondary" type="button" disabled>刷新状态</button>
+          </div>
+          <p class="field-help">只显示服务器名称、启用状态与工具名及授权标记；不显示配置原文、命令参数、环境变量与密钥引用。工具列出不等于授权。更新与移除只生成提案，批准前不生效；更新批准后需重新启用。</p>
+          <div><span id="mcp-state" class="badge badge--muted">Runtime 未运行</span></div>
+          <div id="mcp-list" class="operations-list" role="status" aria-live="polite"></div>
+          <section id="mcp-update-form" class="model-proposal" aria-live="polite" hidden>
+            <div><strong>更新服务器显示名称</strong><p id="mcp-update-target"></p></div>
+            <label class="field-label" for="mcp-update-name">新显示名称</label>
+            <input id="mcp-update-name" autocomplete="off" />
+            <button id="submit-mcp-update" class="button button--primary" type="button">提交更新提案</button>
+          </section>
+          <section id="mcp-proposal" class="model-proposal" aria-live="polite" hidden>
+            <div><strong>待独立审批</strong><p id="mcp-proposal-summary"></p></div>
+            <button id="approve-mcp" class="button button--primary" type="button">批准</button>
+          </section>
+          <p id="mcp-feedback" class="feedback" role="status" aria-live="polite"></p>
+        </section>
       </main>
 
       <footer class="footer"><span>OpenClaw Workbench 0.1.0</span><span>本地优先 · 审批优先</span></footer>
