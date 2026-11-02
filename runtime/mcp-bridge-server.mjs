@@ -202,14 +202,39 @@ export function createMcpBridgeServer({
     if (!Number.isSafeInteger(entry.lastActivity) || entry.lastActivity < 0) return false;
     if (typeof entry.closed !== 'boolean' || !Array.isArray(entry.events) || entry.events.length > maxReplayEvents) return false;
     if (entry.closed && entry.events.length !== 0) return false;
+    // A snapshot is only the writer's own shape, checked end to end:
+    // event ids must match their sequence (evt-N <=> sequence N), the
+    // buffer must be contiguous (a gap means a lost or forged event, and
+    // resolveReplay would otherwise treat a never-buffered sequence as
+    // a valid resume cursor), and the cursor must follow the last event
+    // (or be 1 for an open session that never broadcast). A closed
+    // tombstone keeps its cursor with an empty buffer, so it is exempt
+    // from the open-session cursor rule, but never from the other rules.
+    // The encoded frame must be exactly a broadcast notification:
+    // jsonrpc 2.0, a method, an object params (when present), and no
+    // id/result/error keys, so a corrupted snapshot cannot smuggle a
+    // JSON-RPC response — or a request a client would answer — into a
+    // replay stream. Anything failing any of these checks drops the
+    // whole entry; a valid entry in the same file is unaffected.
+    let previousSequence = null;
     for (const event of entry.events) {
       if (!plainObject(event) || typeof event.id !== 'string' || !EVENT_ID_PATTERN.test(event.id)
         || !Number.isSafeInteger(event.sequence) || event.sequence < 1
+        || event.id !== `evt-${event.sequence}`
+        || (previousSequence !== null && event.sequence !== previousSequence + 1)
         || typeof event.encoded !== 'string' || event.encoded.length > maxResponseBytes) return false;
+      previousSequence = event.sequence;
       try {
         const parsed = JSON.parse(event.encoded);
-        if (!plainObject(parsed) || typeof parsed.method !== 'string') return false;
+        if (!plainObject(parsed) || parsed.jsonrpc !== '2.0' || typeof parsed.method !== 'string' || !parsed.method || parsed.method.length > 128 || /[\0\r\n]/.test(parsed.method)
+          || (parsed.params !== undefined && !plainObject(parsed.params))
+          || parsed.id !== undefined || parsed.result !== undefined || parsed.error !== undefined) return false;
       } catch { return false; }
+    }
+    if (entry.events.length === 0) {
+      if (!entry.closed && entry.nextEventSequence !== 1) return false;
+    } else if (entry.nextEventSequence !== previousSequence + 1) {
+      return false;
     }
     return true;
   }
@@ -219,7 +244,9 @@ export function createMcpBridgeServer({
     try { parsed = JSON.parse(readFileSync(replayStoreFile, 'utf8')); } catch { return; }
     if (!plainObject(parsed) || parsed.version !== 1 || !Array.isArray(parsed.snapshots)) return;
     for (const entry of parsed.snapshots) {
-      if (validSnapshotEntry(entry)) replaySnapshots.set(entry.key, entry);
+      // First valid entry for a key wins: a later duplicate must never
+      // silently shadow an earlier snapshot for the same session hash.
+      if (validSnapshotEntry(entry) && !replaySnapshots.has(entry.key)) replaySnapshots.set(entry.key, entry);
     }
   }
   // Best-effort by design: persistence must never break broadcasting or
