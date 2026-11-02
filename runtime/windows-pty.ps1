@@ -365,7 +365,11 @@ public static class OcwConPty
         $state.connected = $true
         try { [Console]::Error.WriteLine('PTY_CONTROL: connected') } catch { }
         $reader = New-Object System.IO.StreamReader($server, [System.Text.Encoding]::UTF8)
-        $writer = New-Object System.IO.StreamWriter($server, [System.Text.Encoding]::UTF8)
+        # No-BOM UTF-8: [Text.Encoding]::UTF8 emits a BOM before the
+        # first frame, and the provider's JSON.parse rejects a
+        # BOM-prefixed line, which silently dropped every first ack
+        # (resize timeout, never a nack) in the first Windows CI run.
+        $writer = New-Object System.IO.StreamWriter($server, (New-Object System.Text.UTF8Encoding($false)))
         $writer.AutoFlush = $true
         while ($true) {
           $line = $null
@@ -464,11 +468,18 @@ public static class OcwConPty
 
   # Readiness line, flushed BEFORE the output pump starts, so it is
   # strictly the first stdout line and the provider can strip exactly
-  # this line. (Console.WriteLine emits CRLF; the provider accepts
-  # READY modulo a trailing CR.) No READY in the legacy path.
+  # this line. It is written through $consoleOut -- the SAME stream
+  # object the output pump writes through -- not through
+  # [Console]::Out, which is a separate TextWriter over the same
+  # handle: two writers can reorder bytes across their independent
+  # buffers, letting child output beat READY to the provider (the
+  # first Windows CI run's readiness failures). One stream means
+  # READY-then-pump order is strict by construction. The provider
+  # accepts READY modulo a trailing CR. No READY in the legacy path.
   if ($null -ne $controlServer) {
-    [Console]::Out.WriteLine('READY')
-    [Console]::Out.Flush()
+    $readyBytes = [System.Text.Encoding]::ASCII.GetBytes("READY`r`n")
+    $consoleOut.Write($readyBytes, 0, $readyBytes.Length)
+    $consoleOut.Flush()
   }
 
   # Pump diagnostics, shared with both runspaces. The input pump used

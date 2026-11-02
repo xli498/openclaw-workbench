@@ -61,6 +61,7 @@ async function runSizeLoop(root) {
   let resolveExit;
   const exited = new Promise((resolve) => { resolveExit = resolve; });
   const controller = new AbortController();
+  const t0 = Date.now();
   const handle = await provider({
     root,
     argv: ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "while ($true) { $w=$Host.UI.RawUI.WindowSize; $b=$Host.UI.RawUI.BufferSize; Write-Output ('SIZE:{0}x{1}/{2}x{3}' -f $w.Width,$w.Height,$b.Width,$b.Height); Start-Sleep -Milliseconds 200 }"],
@@ -69,6 +70,10 @@ async function runSizeLoop(root) {
     onOutput: (value) => { outputs.push(value.text); },
     onExit: (result) => resolveExit(result),
   });
+  // Stage timings: the first Windows CI run showed ~26 s before the
+  // resize stage with no breakdown. These lines split provider
+  // (READY + pipe connect) from the child's first SIZE line.
+  console.error(`PTY_RESIZE_TIMING: provider-ms=${Date.now() - t0}`);
   const logDiagnostics = () => {
     try {
       const d = handle.diagnostics?.();
@@ -76,7 +81,20 @@ async function runSizeLoop(root) {
     } catch {}
   };
   await waitForOutput(outputs, /SIZE:80x24\//, 30_000, logDiagnostics);
+  console.error(`PTY_RESIZE_TIMING: size-initial-ms=${Date.now() - t0}`);
   return { handle, outputs, exited, controller, logDiagnostics };
+}
+
+// Resize with diagnostics on failure: a bare resize timeout says
+// nothing about whether the control channel was ever connected
+// (helper stderr carries the PTY_CONTROL lines either way).
+async function resizeOrDiagnose(session, cols, rows) {
+  try {
+    return await session.handle.resize(cols, rows);
+  } catch (error) {
+    session.logDiagnostics();
+    throw error;
+  }
 }
 
 test('Windows ConPTY resize changes RawUI WindowSize observed by the child', { skip: SKIP_OFF_WINDOWS }, async () => {
@@ -84,12 +102,12 @@ test('Windows ConPTY resize changes RawUI WindowSize observed by the child', { s
   let session;
   try {
     session = await runSizeLoop(root);
-    const size = await session.handle.resize(120, 40);
+    const size = await resizeOrDiagnose(session, 120, 40);
     assert.deepEqual(size, { cols: 120, rows: 40 });
     // The ack above only proves the helper answered. This wait proves
     // the child itself observes the new console size afterwards.
     await waitForOutput(session.outputs, /SIZE:120x40\//, 30_000, session.logDiagnostics);
-    const back = await session.handle.resize(80, 24);
+    const back = await resizeOrDiagnose(session, 80, 24);
     assert.deepEqual(back, { cols: 80, rows: 24 });
     await waitForOutput(session.outputs, /SIZE:80x24\//, 30_000, session.logDiagnostics);
     await session.handle.cancel();
@@ -115,7 +133,7 @@ test('Windows ConPTY resize rejects invalid sizes and the session survives', { s
     }
     // Invalid resizes must not poison the channel: a valid resize
     // afterwards still acks and still takes effect observably.
-    const size = await session.handle.resize(100, 30);
+    const size = await resizeOrDiagnose(session, 100, 30);
     assert.deepEqual(size, { cols: 100, rows: 30 });
     await waitForOutput(session.outputs, /SIZE:100x30\//, 30_000, session.logDiagnostics);
     await session.handle.cancel();

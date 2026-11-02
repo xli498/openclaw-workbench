@@ -241,9 +241,15 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
         controlBuffer += chunk.toString('utf8');
         let newline;
         while ((newline = controlBuffer.indexOf('\n')) !== -1) {
-          const line = controlBuffer.slice(0, newline);
+          let line = controlBuffer.slice(0, newline);
           controlBuffer = controlBuffer.slice(newline + 1);
           if (!line.trim()) continue;
+          // Defensive: a writer that emits a UTF-8 BOM prefixes its
+          // first frame with U+FEFF, which JSON.parse rejects. The
+          // helper now writes no BOM (see windows-pty.ps1); strip
+          // one here so a future writer regression degrades to a
+          // working ack instead of a silent resize timeout.
+          if (line.startsWith('\uFEFF')) line = line.slice(1);
           let frame;
           try { frame = JSON.parse(line); } catch { continue; }
           const entry = controlPending.get(String(frame?.id));
@@ -345,25 +351,31 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
         // output pump starts, so no child output can precede it.
         // Buffer until the first newline (the line may split across
         // chunks); strip it only when it is exactly READY (modulo
-        // the CRLF the console writer emits). Any other first line
-        // means the control contract is broken: reject the spawn
-        // wait instead of forwarding child output into a session
-        // whose resize channel never existed.
+        // the CRLF the console writer emits, and a defensive strip
+        // of a leading BOM should a writer ever emit one). Any other
+        // first line means the control contract is broken: reject
+        // the spawn wait instead of forwarding child output into a
+        // session whose resize channel never existed. The offending
+        // line (escaped, bounded) and the helper's captured stderr
+        // ride along in the error: a bare "invalid" told the last
+        // Windows CI run nothing about WHAT the first line was.
         readyLineBuffer += text;
         const newline = readyLineBuffer.indexOf('\n');
         if (newline === -1) {
           if (readyLineBuffer.length > 128) {
             readyDone = true;
-            readyReject(new WindowsPtyProviderError('PTY_FAILED', 'PTY control channel readiness line is invalid'));
+            readyReject(new WindowsPtyProviderError('PTY_FAILED', `PTY control channel readiness line is invalid (no newline within 128 bytes; helper stderr: ${stderrText.trim().slice(0, 512) || 'none'})`));
           }
           return;
         }
         let line = readyLineBuffer.slice(0, newline);
         if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line.startsWith('\uFEFF')) line = line.slice(1);
         const rest = readyLineBuffer.slice(newline + 1);
         readyDone = true;
         if (line !== 'READY') {
-          readyReject(new WindowsPtyProviderError('PTY_FAILED', 'PTY control channel readiness line is invalid'));
+          const shown = JSON.stringify(line.slice(0, 128));
+          readyReject(new WindowsPtyProviderError('PTY_FAILED', `PTY control channel readiness line is invalid (first line: ${shown}; helper stderr: ${stderrText.trim().slice(0, 512) || 'none'})`));
           return;
         }
         readyResolve();
@@ -485,8 +497,14 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
         // while the close verb is still in flight.
         controlCloseBestEffort();
         if (exitCode === null) {
+          // The close-verb wait must cover the helper's own bounded
+          // cleanup (output pump up to 5 s, input pump up to 2 s,
+          // plus margin): the previous 2 s bound mislabeled a
+          // working close as a taskkill fallback whenever cleanup
+          // ran long (PR #47 Windows CI, cancel test). 10 s still
+          // bounds cancel; taskkill remains the fallback after it.
           await new Promise((resolve) => {
-            const timer = setTimeout(resolve, 2000);
+            const timer = setTimeout(resolve, 10000);
             child.once('exit', () => { clearTimeout(timer); resolve(); });
           });
         }
