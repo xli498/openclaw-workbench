@@ -28,7 +28,7 @@ Content-Type: application/json
 
 - API 默认仅监听 `127.0.0.1`。
 - 配置 Bearer Token 后所有接口都需要认证。
-- Chat 会话当前保存在进程内，服务重启后会话历史不恢复。
+- Chat 会话快照见下文“会话安全恢复”：历史、`active` 与 `closed` 会话在启动时恢复，快照记录为 `running` 的会话降级为 `manual_review`，不会重放中断回合。
 - `Code` 模式不会绕过 Patch 审批；文件修改必须走已有的 `createPatchProposal` → `approveAndApplyPatch`。
 - 当前不实现公网 Bridge、MCP Server 管理或自动修改 OpenClaw 配置。
 
@@ -69,6 +69,8 @@ Content-Type: application/json
 
 提案快照写入 `.openclaw-workbench/proposals.json`，同样采用原子 rename。进程重启前未进入终态的提案将只恢复为可查看记录，并标记 `recovery.state: manual_review`；它们不重新进入审批或执行内存队列，`POST /v1/proposals/:id/approve` 会返回 `409 PROPOSAL_MANUAL_REVIEW`。已完成的 `verified`、`failed`、`timed_out`、`cancelled` 提案仅作为历史保留。要继续未完成操作，需经人工复核后创建新的提案，重新计算当前 revision、策略和 action hash。
 
+重启语义按对象分别说明，不笼统说“重启降级 `manual_review`”：持久化普通提案非终态重启后进 `manual_review`；恢复审批提案只存内存，重启后消失，操作者必须重新检查并创建新的提案；事务清单已完成状态可自动收敛为 `committed`（仅清单状态收敛，不是重新执行 `resume`/`rollback`）。
+
 ## 事件恢复语义
 
 本地事件快照位于 `.openclaw-workbench/events.json`，按 `sequence` 保存并原子更新。重启后，已恢复事件会带 `recovered: true`，`GET /v1/events` 响应也会带 `recovered: true`；这表示它们是历史审计记录，不能被 UI 当作本进程的实时执行流。新发布事件保持递增 sequence，但不带该标记。事件 API 仍是 Bearer 鉴权的只读接口；轮询和 SSE 均不提供恢复、审批或执行能力，当前未开放 WebSocket。
@@ -88,7 +90,7 @@ Content-Type: application/json
 {"mode":"resume"}
 ```
 
-`mode` 只能是 `resume` 或 `rollback`。响应中的 `proposal.impact.files` 逐项列出相对路径、当前状态（`before` / `after` / `unknown`）及将要发生的效果（`apply_after`、`keep_after`、`restore_before` 或 `keep_before`）。提案绑定创建时的清单字节 SHA-256、恢复报告摘要和 `actionHash`；最多同时保留 32 个待审批提案，超过上限返回 `429 RECOVERY_PROPOSAL_LIMIT`。
+`mode` 只能是 `resume` 或 `rollback`。响应中的 `proposal.impact.files` 逐项列出相对路径、当前状态（`before` / `after` / `unknown`）及将要发生的效果（`apply_after`、`keep_after`、`restore_before` 或 `keep_before`）。提案绑定创建时的清单字节 SHA-256、恢复报告摘要和 `actionHash`；32 上限的计数口径为每 server 实例已保留提案＋创建中 reservation 之和，同一事务多个提案分别计数，该和达到 32 时新建提案返回 `429 RECOVERY_PROPOSAL_LIMIT`。
 
 客户端必须向操作者展示影响并明确批准，随后使用独立于普通 API Bearer 的审批凭据执行：
 
@@ -100,9 +102,9 @@ Content-Type: application/json
 {"actionHash":"<proposal.action.actionHash>"}
 ```
 
-批准时 Runtime 会重新扫描事务、复核清单字节哈希和逐文件报告，并在现有恢复写锁内再次校验清单；目标文件、报告、清单、action hash 或并发锁/执行 claim 任一发生冲突都会返回 `409`，不覆盖变化后的文件。缺少独立审批凭据返回 `403 APPROVAL_AUTH_REQUIRED`；事务或提案不存在返回 `404`；超过 32 个待审批提案返回 `429 RECOVERY_PROPOSAL_LIMIT`。服务端恢复应用失败、部分补偿失败、最终状态清单持久化失败或恢复扫描失败返回 `500`（分别使用 `RECOVERY_APPLY_FAILED`、`ROLLBACK_PARTIAL`、`FINALIZE_FAILED` 或相应扫描错误码）。
+批准时 Runtime 会重新扫描事务、复核清单字节哈希和逐文件报告，并在现有恢复写锁内再次校验清单；目标文件、报告、清单、action hash 或并发锁/执行 claim 任一发生冲突都会返回 `409`，不覆盖变化后的文件。缺少独立审批凭据返回 `403 APPROVAL_AUTH_REQUIRED`；事务或提案不存在返回 `404`；每 server 实例已保留提案＋创建中 reservation 之和达到 32 时，新建提案返回 `429 RECOVERY_PROPOSAL_LIMIT`（同一事务多个提案分别计数）。服务端恢复应用失败、部分补偿失败、最终状态清单持久化失败或恢复扫描失败返回 `500`（分别使用 `RECOVERY_APPLY_FAILED`、`ROLLBACK_PARTIAL`、`FINALIZE_FAILED` 或相应扫描错误码）。
 
-提案在成功、失败或冲突后被消费；提案只存在于内存，Runtime 重启后不会自动恢复、批准或重放，操作者必须重新检查并创建新的提案。恢复成功、失败和部分补偿审计仅保留安全错误码、相对文件路径、模式、ID、摘要哈希与状态；失败说明使用受控通用文案，不持久化或回显原始 provider/OS 错误、绝对路径或凭据。恢复失败清单同样只保存安全错误码和相对路径，不保存原始错误文本。文件内容和审批凭据不会写入审计。
+提案消费语义：前置拒绝保留提案——错误 `actionHash` 或事务已 busy 时尚未取得 claim，提案保留；取得 claim 后失败消费当前提案（同事务其他提案不受影响）；成功时清理同事务全部提案。提案只存在于内存，Runtime 重启后不会自动恢复、批准或重放，操作者必须重新检查并创建新的提案。恢复成功、失败和部分补偿审计仅保留安全错误码、相对文件路径、模式、ID、摘要哈希与状态；失败说明使用受控通用文案，不持久化或回显原始 provider/OS 错误、绝对路径或凭据。恢复失败清单同样只保存安全错误码和相对路径，不保存原始错误文本。文件内容和审批凭据不会写入审计。
 
 会话、提案和事件快照仅接受位于已解析工作区根目录内的普通文件；快照文件或其 `.openclaw-workbench` 上级目录为符号链接时，恢复和写入都会以各自的 `*_STORE_INVALID` 错误拒绝。原子写入后的文件权限固定为 `0600`，目录以 `0700` 创建。该措施用于阻断配置错误或本地替换造成的路径逃逸；它不替代操作系统账户隔离，也不承诺对拥有同等本机文件系统权限的对手提供竞争条件防护。
 

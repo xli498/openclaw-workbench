@@ -32,7 +32,10 @@ test('模型设置 API 只保存 keychain 引用并支持连接测试', async ()
     assert.equal(approved.body.profile.secretRef, 'keychain:workbench.model.primary');
     const enabled = await request(address, `/v1/models/primary/enable`, { method: 'POST', body: JSON.stringify({ sessionId: 'settings', configHash: approved.body.profile.configHash }) });
     assert.equal(enabled.status, 201);
-    await request(address, `/v1/models/${enabled.body.proposal.action.target}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: enabled.body.proposal.action.actionHash }) });
+    const enableApproved = await request(address, `/v1/models/${enabled.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: enabled.body.proposal.action.actionHash }) });
+    assert.equal(enableApproved.status, 200);
+    assert.equal(enableApproved.body.profile.enabled, true);
+    assert.equal((await request(address, '/v1/models')).body.models.find((item) => item.id === 'primary').enabled, true);
     const health = await request(address, '/v1/models/primary/health', { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: (await request(address, '/v1/models')).body.models[0].configHash }) });
     assert.equal(health.status, 200);
     assert.equal(health.body.health.status, 'ready');

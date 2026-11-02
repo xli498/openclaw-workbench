@@ -13,6 +13,8 @@ function headersForRequest(headers) {
 }
 
 /**
+ * DNS 地址固定并保留 TLS 验证：本文件固定的是已检查的 DNS 地址，
+ * HTTPS 保留原 hostname/SNI 与通常证书验证，无证书指纹或 SPKI 校验逻辑。
  * Turn the result of dns.lookup(..., { all: true }) into a lookup callback
  * backed only by the already checked addresses. It never performs another DNS
  * query, which closes the lookup/fetch rebinding window.
@@ -42,7 +44,9 @@ export function createPinnedLookup(resolved = []) {
 /**
  * Minimal fetch-compatible HTTPS transport. The URL hostname remains intact
  * for TLS SNI/certificate validation, while node:https connects through the
- * caller-supplied pinned lookup callback.
+ * caller-supplied DNS-address-pinned lookup callback. This is DNS address
+ * pinning with TLS verification retained; it does not check certificate
+ * fingerprints or SPKI values.
  */
 export function createPinnedHttpsFetch() {
   return function pinnedHttpsFetch(input, options = {}) {

@@ -50,6 +50,8 @@ function blockedHost(hostname) {
   return false;
 }
 
+// runner 执行层校验（非配置保存层）：实际发起请求时才要求 HTTPS 并检查主机与 DNS；
+// 配置保存层允许保存 HTTP 与私网地址，本函数不改变该分层口径。
 function endpointFor(profile) {
   if (!profile || typeof profile !== 'object' || typeof profile.endpoint !== 'string' || typeof profile.model !== 'string') fail('MODEL_PROFILE_INVALID', 'model profile is invalid');
   if (!['openai-compatible', 'openai-responses'].includes(profile.protocol)) fail('MODEL_PROTOCOL_UNSUPPORTED', 'model protocol is not supported by this runner');

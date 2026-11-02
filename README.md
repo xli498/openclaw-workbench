@@ -106,7 +106,7 @@ const { endpoint } = await tunnel.start(); // 不要记录或持久化 endpoint
 
 ## 本地控制面 API
 
-`createWorkbenchServer` 提供默认仅监听 `127.0.0.1` 的本地 HTTP 控制面：`GET /health`、`GET /v1/status`、创建 Patch/Command 提案以及明确批准执行提案。请求体限制为 256 KiB；配置 `token` 后所有请求必须携带 `Authorization: Bearer <token>`。该 API 不绑定公网地址、不接管 Gateway，也不把状态持久化到网络数据库；会话、提案和本地事件分别写入工作区的原子 JSON 快照。服务重启后未完成会话/提案只进入 `manual_review`，不会自动调用模型或执行命令。
+`createWorkbenchServer` 提供默认仅监听 `127.0.0.1` 的本地 HTTP 控制面：`GET /health`、`GET /v1/status`、创建 Patch/Command 提案以及明确批准执行提案。请求体限制为 256 KiB；配置 `token` 后所有请求必须携带 `Authorization: Bearer <token>`。该 API 不绑定公网地址、不接管 Gateway，也不把状态持久化到网络数据库；会话、提案和本地事件分别写入工作区的原子 JSON 快照。服务重启后按对象分别处理，不笼统降级：持久化普通提案非终态只进入 `manual_review`；恢复审批提案只存内存、重启后消失；事务清单已完成状态可自动收敛为 `committed`（仅清单状态收敛，不重新执行 `resume`/`rollback`）；不会自动调用模型或执行命令。
 
 启动入口只扫描并报告未完成事务；仅对文件已全部达到 `afterHash` 的事务自动标记为 `committed`，不会自动执行 `resume` 或 `rollback`。非法清单会被隔离为结构化错误，其他事务继续扫描。控制面还提供只读 `GET /v1/recovery`，返回每个未完成事务的检查报告与 `requires_approval`、`mark_committed` 或 `blocked` 判定；该接口不会执行恢复或审批。审批时冲突返回 `409`，缺少独立凭据/事务或提案不存在/提案超限分别返回 `403`、`404`、`429`；服务端应用、部分补偿、最终状态落盘或扫描失败返回 `500`。恢复失败审计和清单只含安全错误码、受控通用说明与相对文件路径，不包含绝对路径、审批凭据或原始 provider/OS 错误。工作区可通过只读 `GET /v1/workspace/tree` 浏览、`GET /v1/workspace/read?path=<relativePath>` 读取单个文件，越界、敏感路径和符号链接逃逸都会被拒绝。
 
@@ -188,7 +188,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 `GET /v1/models` 查看 Workbench 的本地模型档案；`POST /v1/models` 创建档案提案，使用独立 `x-approval-token` 调用 `/v1/models/<actionId>/approve` 才会登记。档案只保存 provider、protocol、model、能力列表、无密钥的 `env:`/`keychain:` SecretRef 引用和健康摘要；新档案默认 `enabled:false`，不会保存 API key 或 SecretRef 解析值。
 
-`GET /v1/models/<profileId>/health` 是只读、非联网健康摘要，默认返回 `NOT_CONFIGURED`。需要真实连接测试时，调用 `POST /v1/models/<profileId>/health`，请求必须带独立 `x-approval-token`，并在 JSON body 中提交当前 `configHash`；服务只执行一次有超时、取消和响应大小上限的 OpenAI-compatible `GET <endpoint>/models`，固定拒绝 HTTP、回环/私网/metadata endpoint 且不跟随重定向。SecretRef 仅在内存中解析为请求头，解析值不会进入模型档案、审计、响应或快照。Windows 默认使用 Windows Credential Manager 保存 `keychain:` 密钥，非 Windows 开发环境使用进程内存储且不会持久化；Credential Manager 的单条凭据内容限制为 2560 字节。当前不执行聊天补全，也不支持真实 Anthropic/Responses 调用。
+`GET /v1/models/<profileId>/health` 是只读、非联网健康摘要，默认返回 `NOT_CONFIGURED`。需要真实连接测试时，调用 `POST /v1/models/<profileId>/health`，请求必须带独立 `x-approval-token`，并在 JSON body 中提交当前 `configHash`；服务只执行一次有超时、取消和响应大小上限的 OpenAI-compatible `GET <endpoint>/models`，在探针执行层固定拒绝 HTTP、回环/私网/metadata endpoint 且不跟随重定向。分层口径：配置保存层只要求 endpoint 为 `http(s)` 且不含凭据或敏感查询，允许保存 HTTP 与私网地址；上述 HTTPS 与主机/DNS 检查只在探针／runner 实际发起请求时才生效，不是配置保存层的阻断条件。SecretRef 仅在内存中解析为请求头，解析值不会进入模型档案、审计、响应或快照。Windows 默认使用 Windows Credential Manager 保存 `keychain:` 密钥，非 Windows 开发环境使用进程内存储且不会持久化；Credential Manager 的单条凭据内容限制为 2560 字节。当前不执行聊天补全，也不支持真实 Anthropic/Responses 调用。
 
 `POST /v1/secrets` 只返回凭据名称和配置状态，不返回密钥值；同名写入默认拒绝覆盖。只有显式 `overwrite:true` 的轮换和 `DELETE /v1/secrets/<name>` 才能使用独立 `x-approval-token`，并写入不含密钥值的 `secret.configured`/`secret.deleted` 审计事件。
 
