@@ -336,10 +336,10 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
   }
 
   // Resize passthrough: only providers whose handle exposes resize() (the
-  // POSIX PTY provider) support it. The non-pty default runner and the
-  // Windows ConPTY provider (resize not wired in this slice) report
-  // PTY_UNAVAILABLE / PTY_RESIZE_UNSUPPORTED honestly instead of faking
-  // a size change. Size validation mirrors the POSIX provider limits.
+  // POSIX PTY provider and the Windows ConPTY provider, the latter via
+  // its named-pipe control channel) support it. The non-pty default
+  // runner reports PTY_UNAVAILABLE honestly instead of faking a size
+  // change. Size validation mirrors the provider limits (1-500 x 1-200).
   async function resize(id, cols, rows) {
     if (!records.has(id)) fail('SESSION_NOT_FOUND', 'terminal session not found');
     if (!Number.isSafeInteger(cols) || cols < 1 || cols > 500 || !Number.isSafeInteger(rows) || rows < 1 || rows > 200) fail('SIZE_INVALID', 'terminal session size is invalid');
