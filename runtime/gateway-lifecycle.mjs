@@ -37,7 +37,19 @@ function defaultSpawn({ command, timeoutMs, maxOutputBytes }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, ['--version'], { shell: false, stdio: ['ignore', 'pipe', 'ignore'] });
+      // Node docs (child_process, "Spawning .bat and .cmd files on
+      // Windows"): .bat/.cmd files are not executable on their own and
+      // cannot be launched with spawn() and shell:false. They must be
+      // run through cmd.exe explicitly (what shell:true/exec() do under
+      // the hood). This branch keeps shell:false -- cmd.exe itself is a
+      // real executable -- and only applies on Windows to .cmd/.bat
+      // commands; every other command spawns exactly as before. The
+      // constructor already rejects cmd metacharacters in the command,
+      // so the path cannot smuggle extra cmd syntax through /c.
+      const isBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(command);
+      child = isBatch
+        ? spawn('cmd.exe', ['/d', '/c', command, '--version'], { shell: false, stdio: ['ignore', 'pipe', 'ignore'] })
+        : spawn(command, ['--version'], { shell: false, stdio: ['ignore', 'pipe', 'ignore'] });
     } catch (error) { reject(error); return; }
     let output = '';
     let settled = false;

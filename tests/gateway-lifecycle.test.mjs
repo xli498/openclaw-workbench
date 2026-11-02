@@ -48,6 +48,22 @@ import { join } from 'node:path';
 
 async function makeMockCli(body) {
   const dir = await mkdtemp(join(tmpdir(), 'wb3-gw-mock-cli-'));
+  // POSIX: a shebang script spawned directly (shell:false) works. Windows
+  // does not honor shebangs, and spawning an extensionless script fails,
+  // which is exactly the regression this helper used to carry into
+  // Windows CI (WB3-gw): the mock must be a .cmd shim that runs the same
+  // Node body, because the lifecycle probe spawns one command path with
+  // shell:false on every platform. On Windows the mock is a .cmd shim
+  // (Node docs: .bat/.cmd files cannot be launched with spawn() and
+  // shell:false; defaultSpawn therefore routes .cmd/.bat commands
+  // through cmd.exe explicitly, still with shell:false).
+  if (process.platform === 'win32') {
+    const scriptPath = join(dir, 'openclaw-mock.mjs');
+    await writeFile(scriptPath, `${body}\n`, 'utf8');
+    const cliPath = join(dir, 'openclaw.cmd');
+    await writeFile(cliPath, `@echo off\r\nnode "%~dp0openclaw-mock.mjs" %*\r\n`, 'utf8');
+    return { dir, cliPath };
+  }
   const cliPath = join(dir, 'openclaw');
   await writeFile(cliPath, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
   await chmod(cliPath, 0o755);
