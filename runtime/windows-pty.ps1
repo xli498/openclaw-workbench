@@ -22,11 +22,12 @@ param(
 # channel and no READY line (the provider always sends it, so this
 # path is only for foreign callers). With a control pipe, the helper
 # creates the pipe server BEFORE CreateProcess, starts a control
-# runspace after CreateProcess, and writes exactly one READY line to
-# stdout BEFORE the child output pump starts; the provider strips
-# exactly that line. The script prints only READY plus child process
-# output on stdout; failures print a single PTY_FAILED line on stderr
-# and exit 1.
+# runspace after CreateProcess, and writes exactly one
+# READY <pipeName> line to stdout BEFORE the child output pump
+# starts; the provider scans initial stdout for exactly that line
+# and queues any child lines seen before it. The script prints only
+# READY plus child process output on stdout; failures print a single
+# PTY_FAILED line on stderr and exit 1.
 
 $ErrorActionPreference = 'Stop'
 
@@ -466,18 +467,22 @@ public static class OcwConPty
   $consoleOut = [Console]::OpenStandardOutput()
   $consoleIn = [Console]::OpenStandardInput()
 
-  # Readiness line, flushed BEFORE the output pump starts, so it is
-  # strictly the first stdout line and the provider can strip exactly
-  # this line. It is written through $consoleOut -- the SAME stream
-  # object the output pump writes through -- not through
-  # [Console]::Out, which is a separate TextWriter over the same
-  # handle: two writers can reorder bytes across their independent
-  # buffers, letting child output beat READY to the provider (the
-  # first Windows CI run's readiness failures). One stream means
-  # READY-then-pump order is strict by construction. The provider
-  # accepts READY modulo a trailing CR. No READY in the legacy path.
+  # Readiness line, flushed BEFORE the output pump starts. It carries
+  # the per-session pipe name (READY <pipeName>): the provider scans
+  # initial stdout for exactly that line and queues any child lines
+  # seen before it, because Windows CI rounds 1-2 proved a fast
+  # child's output can reach the pipe before this write even though
+  # the write precedes pump start in program order (the exact
+  # .NET-side reorder mechanism is not established, so the protocol
+  # no longer depends on write order). The pipe name here is the
+  # provider's own value, so a child printing a bare READY cannot
+  # spoof readiness, and the provider consumes this line -- it is
+  # never forwarded as child output and never logged. Written
+  # through $consoleOut, the SAME stream object the output pump
+  # writes through. The provider accepts READY modulo a trailing CR.
+  # No READY in the legacy path.
   if ($null -ne $controlServer) {
-    $readyBytes = [System.Text.Encoding]::ASCII.GetBytes("READY`r`n")
+    $readyBytes = [System.Text.Encoding]::ASCII.GetBytes("READY $controlPipe`r`n")
     $consoleOut.Write($readyBytes, 0, $readyBytes.Length)
     $consoleOut.Flush()
   }

@@ -20,12 +20,26 @@ import { fileURLToPath } from 'node:url';
 // `ocw-pty-<uuid>` and passes it in the helper payload. The helper
 // creates a single-instance NamedPipeServerStream restricted to the
 // current user (explicit PipeSecurity) BEFORE CreateProcess, starts a
-// control runspace, and writes exactly one `READY` line to stdout
-// before the child output pump starts. The provider strips exactly
-// that first line, connects as a named-pipe client, and only then
-// returns the handle: if the pipe cannot be created or connected
-// within a bounded timeout, spawn fails fast with PTY_FAILED -- never
-// a silent no-resize session. resize() sends one JSON line
+// control runspace, and writes exactly one `READY <pipeName>` line to
+// stdout before the child output pump starts. The provider SCANS the
+// initial stdout for exactly that line instead of requiring it to be
+// first: a fast child (cmd echo) can emit output before the helper's
+// readiness write reaches the pipe even though the write precedes
+// pump start in program order (PR #47 Windows CI rounds 1-2 proved
+// the strict-first-line gate false; the exact .NET-side reorder
+// mechanism is NOT established, so the protocol no longer depends
+// on write order at all). Child lines seen before READY
+// are queued and delivered in order once READY arrives, so no output
+// is lost and no session is returned without the channel: if READY
+// never arrives within a bounded 64 KB pre-READY window (or the 30 s
+// overall control wait, or helper exit), spawn fails fast with
+// PTY_FAILED -- never a silent no-resize session. The pipe name in
+// the READY line is the provider's own per-session value, so a child
+// cannot spoof readiness by printing a bare READY. After READY, the
+// provider connects as a named-pipe client, and only then returns
+// the handle: if the pipe cannot be created or connected
+// within a bounded timeout, spawn fails fast with PTY_FAILED.
+// resize() sends one JSON line
 // {id, type: 'resize', cols, rows} and resolves with the acked size
 // only when the helper's ack echoes the same cols/rows; any nack,
 // malformed ack, or missing ack within 5 seconds rejects
@@ -159,8 +173,53 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
     let controlBuffer = '';
     const controlPending = new Map();
     let nextControlId = 1;
-    let readyLineBuffer = '';
+    // Pre-READY scan state (see the header comment): initial stdout is
+    // scanned for exactly `READY <pipeName>`, the provider's own
+    // per-session value. Complete child lines seen before it are
+    // queued and delivered in order once it arrives; the pipe name
+    // itself is never logged or placed in errors (only the fact that
+    // the line was not found within the bound).
+    let preReadyBuffer = '';
+    let preReadyQueued = '';
+    let preReadyFirstLine = true;
     let readyDone = false;
+    const EXPECTED_READY = `READY ${controlPipe}`;
+    const PRE_READY_MAX_BYTES = 65536;
+    function scanPreReady(text) {
+      // Returns 'found' when the readiness line was seen (queued
+      // child lines already forwarded in order, remainder forwarded
+      // verbatim), 'waiting' while still scanning. Throws PTY_FAILED
+      // when pre-READY output exceeds the bound without READY.
+      preReadyBuffer += text;
+      for (;;) {
+        const newline = preReadyBuffer.indexOf('\n');
+        if (newline === -1) break;
+        const rawLine = preReadyBuffer.slice(0, newline);
+        preReadyBuffer = preReadyBuffer.slice(newline + 1);
+        let line = rawLine;
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        // A BOM can only prefix the stream's first line; strip it
+        // there so a BOM-emitting writer cannot hide READY.
+        if (preReadyFirstLine && line.startsWith('\uFEFF')) line = line.slice(1);
+        preReadyFirstLine = false;
+        if (line === EXPECTED_READY) {
+          if (preReadyQueued) onOutput({ stream: 'stdout', text: preReadyQueued });
+          if (preReadyBuffer) onOutput({ stream: 'stdout', text: preReadyBuffer });
+          preReadyQueued = '';
+          preReadyBuffer = '';
+          return 'found';
+        }
+        preReadyQueued += rawLine + '\n';
+      }
+      // Bound applies only once this chunk is fully scanned without
+      // READY: a chunk that carries READY past the bound still
+      // succeeds, since READY was present on the wire. Without READY,
+      // queued + partial bytes cannot grow past the bound + one chunk.
+      if (preReadyQueued.length + preReadyBuffer.length > PRE_READY_MAX_BYTES) {
+        throw new WindowsPtyProviderError('PTY_FAILED', `PTY control channel readiness line not found within ${PRE_READY_MAX_BYTES} bytes of child output (helper stderr: ${stderrText.trim().slice(0, 512) || 'none'})`);
+      }
+      return 'waiting';
+    }
     let readyResolve;
     let readyReject;
     const readyPromise = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
@@ -347,39 +406,24 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       const text = decoder.decode(chunk, { stream: true });
       if (!text) return;
       if (!readyDone) {
-        // The helper writes exactly one READY line before the child
-        // output pump starts, so no child output can precede it.
-        // Buffer until the first newline (the line may split across
-        // chunks); strip it only when it is exactly READY (modulo
-        // the CRLF the console writer emits, and a defensive strip
-        // of a leading BOM should a writer ever emit one). Any other
-        // first line means the control contract is broken: reject
-        // the spawn wait instead of forwarding child output into a
-        // session whose resize channel never existed. The offending
-        // line (escaped, bounded) and the helper's captured stderr
-        // ride along in the error: a bare "invalid" told the last
-        // Windows CI run nothing about WHAT the first line was.
-        readyLineBuffer += text;
-        const newline = readyLineBuffer.indexOf('\n');
-        if (newline === -1) {
-          if (readyLineBuffer.length > 128) {
-            readyDone = true;
-            readyReject(new WindowsPtyProviderError('PTY_FAILED', `PTY control channel readiness line is invalid (no newline within 128 bytes; helper stderr: ${stderrText.trim().slice(0, 512) || 'none'})`));
-          }
+        // Scan for READY (see scanPreReady): child output before it
+        // is queued and delivered in order, never discarded and never
+        // mistaken for a broken contract. Only a bound breach
+        // rejects the spawn wait here; a missing READY with a live
+        // helper is caught by the 30 s overall control wait, and a
+        // missing READY with an exited helper by the exit race.
+        let outcome;
+        try {
+          outcome = scanPreReady(text);
+        } catch (error) {
+          readyDone = true;
+          readyReject(error);
           return;
         }
-        let line = readyLineBuffer.slice(0, newline);
-        if (line.endsWith('\r')) line = line.slice(0, -1);
-        if (line.startsWith('\uFEFF')) line = line.slice(1);
-        const rest = readyLineBuffer.slice(newline + 1);
-        readyDone = true;
-        if (line !== 'READY') {
-          const shown = JSON.stringify(line.slice(0, 128));
-          readyReject(new WindowsPtyProviderError('PTY_FAILED', `PTY control channel readiness line is invalid (first line: ${shown}; helper stderr: ${stderrText.trim().slice(0, 512) || 'none'})`));
-          return;
+        if (outcome === 'found') {
+          readyDone = true;
+          readyResolve();
         }
-        readyResolve();
-        if (rest) onOutput({ stream: 'stdout', text: rest });
         return;
       }
       onOutput({ stream: 'stdout', text });
@@ -403,22 +447,20 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       const outTail = decoder.decode();
       if (outTail) {
         if (!readyDone) {
-          // Helper exited before a complete first line: the tail
-          // can only be a READY fragment, never child output (the
-          // pump starts after READY). Forward only a post-READY
-          // remainder, never the READY line itself.
-          readyLineBuffer += outTail;
-          const newline = readyLineBuffer.indexOf('\n');
-          if (newline !== -1) {
-            let line = readyLineBuffer.slice(0, newline);
-            if (line.endsWith('\r')) line = line.slice(0, -1);
-            if (line === 'READY') {
+          // Helper exited with stdout still buffered: the tail may
+          // hold queued child lines plus the READY line (or a READY
+          // fragment split across the last chunk). Scan it the same
+          // way; if READY is found, resolve (harmless if the exit
+          // race already settled) and forward queued output plus
+          // remainder. If not found, the exit race settles the
+          // provider wait (helper-exited-0 / helper-failed); a
+          // bound breach here must not overwrite the exit result.
+          try {
+            if (scanPreReady(outTail) === 'found') {
               readyDone = true;
               readyResolve();
-              const rest = readyLineBuffer.slice(newline + 1);
-              if (rest) onOutput({ stream: 'stdout', text: rest });
             }
-          }
+          } catch {}
         } else {
           onOutput({ stream: 'stdout', text: outTail });
         }

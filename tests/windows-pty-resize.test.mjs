@@ -80,7 +80,13 @@ async function runSizeLoop(root) {
       if (d) console.error(`PTY_RESIZE_DIAGNOSTIC: control=${d.control} childExitCode=${d.childExitCode ?? 'none'} settled=${d.settled} stderr=${d.stderr}`);
     } catch {}
   };
-  await waitForOutput(outputs, /SIZE:80x24\//, 30_000, logDiagnostics);
+  // Initial SIZE match only: Windows CI measured 23-28 s before the
+  // first SIZE line (powershell child startup under ConPTY), so a
+  // 30 s bound leaves 2-7 s of margin -- a flake risk, not a
+  // condition. 60 s keeps the same assertion (child observes
+  // 80x24) with room for slow runners. Post-resize matches stay
+  // 30 s: the child is already running and prints every 200 ms.
+  await waitForOutput(outputs, /SIZE:80x24\//, 60_000, logDiagnostics);
   console.error(`PTY_RESIZE_TIMING: size-initial-ms=${Date.now() - t0}`);
   return { handle, outputs, exited, controller, logDiagnostics };
 }
