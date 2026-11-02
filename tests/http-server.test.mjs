@@ -1383,3 +1383,202 @@ test('状态 API 汇总重启恢复状态，不暴露会话或提案内容', asy
     await app.close();
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+// --- Worker C (wb8, Q25-2 / Q25-4 / Q25-1) ---
+// Note on wording: the HTTP approval check is the `x-approval-token` header
+// verified against the independent approvalToken. The `approved: true`
+// argument inside executeRecovery is an internal trusted call made only
+// after that HTTP check has passed; it is not HTTP identity and the two
+// must not be conflated in test names or messages.
+
+test('控制面 recovery 并发批准只执行一次，执行副作用恰好一次', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-concurrent-approve-'));
+  const fixture = await createPendingRecoveryFixture(root);
+  let renameCalls = 0;
+  const app = createWorkbenchServer({
+    root,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    __testHooks: {
+      recoveryRenameFile: async (source, target) => {
+        renameCalls += 1;
+        // Hold the first execution open so the second request must arrive
+        // while the claim is held, rather than after it has completed.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return (await import('node:fs/promises')).rename(source, target);
+      },
+    },
+  });
+  const address = await app.listen();
+  try {
+    const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const approveOptions = { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) };
+    const responses = await Promise.all([
+      requestWithoutPooling(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, approveOptions),
+      requestWithoutPooling(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, approveOptions),
+    ]);
+    const statuses = responses.map((response) => response.status).sort();
+    assert.deepEqual(statuses, [200, 409], JSON.stringify(responses));
+    const busy = responses.find((response) => response.status === 409);
+    assert.equal(busy.body.error, 'RECOVERY_BUSY');
+    assert.equal(renameCalls, 1);
+    assert.equal(await readFile(fixture.target, 'utf8'), fixture.after.toString());
+    assert.equal(JSON.parse(await readFile(fixture.manifestPath, 'utf8')).state, 'committed');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面 recovery 审批失败后 claim 释放，同一事务可重建提案并成功批准', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-claim-release-'));
+  const fixture = await createPendingRecoveryFixture(root);
+  const audit = { events: [], failApprovedOnce: true, async append(event) {
+    if (event.type === 'transaction.recovery.approved' && this.failApprovedOnce) {
+      this.failApprovedOnce = false;
+      throw new Error('audit unavailable');
+    }
+    this.events.push(event);
+  } };
+  const app = createWorkbenchServer({ root, audit, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+  const address = await app.listen();
+  try {
+    const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const failed = await request(address, `/v1/recovery/proposals/${created.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: created.body.proposal.action.actionHash }) });
+    assert.notEqual(failed.status, 409, JSON.stringify(failed.body));
+    assert.equal(failed.status, 500, JSON.stringify(failed.body));
+    // If the claim leaked, the fresh proposal below would be rejected 409
+    // RECOVERY_BUSY before any execution. A 200 proves the finally path
+    // released the claim even though the first approval failed.
+    const recreated = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.equal(recreated.status, 201, JSON.stringify(recreated.body));
+    const approved = await request(address, `/v1/recovery/proposals/${recreated.body.proposal.action.id}/approve`, { method: 'POST', headers: { 'x-approval-token': 'approve-token-012345' }, body: JSON.stringify({ actionHash: recreated.body.proposal.action.actionHash }) });
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    assert.equal(approved.body.recovery.state, 'committed');
+    assert.equal(await readFile(fixture.target, 'utf8'), fixture.after.toString());
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面构造器拒绝与 Bearer 相同的审批凭据', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-token-separation-'));
+  try {
+    assert.throws(
+      () => createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'test-token-012345' }),
+      /approval token must differ from bearer token/,
+    );
+    // Distinct values remain accepted, and omitting the approval token is
+    // still a construction-time non-error (HTTP approvals then fail closed).
+    const distinct = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345' });
+    await distinct.close();
+    const omitted = createWorkbenchServer({ root, token: 'test-token-012345' });
+    await omitted.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('Runtime shutdown 并发只触发一次成功回调，回调失败记录可查询状态并允许 Bearer 门控重试', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-shutdown-retry-'));
+  try {
+    // Concurrent-success case: N simultaneous requests invoke once.
+    let concurrentCount = 0;
+    let releaseConcurrent;
+    const concurrentStarted = new Promise((resolve) => { releaseConcurrent = resolve; });
+    const concurrentApp = createWorkbenchServer({
+      root,
+      token: 'test-token-012345',
+      approvalToken: 'approve-token-012345',
+      onShutdown: async () => { concurrentCount += 1; releaseConcurrent(); },
+    });
+    const concurrentAddress = await concurrentApp.listen();
+    try {
+      const responses = await Promise.all(Array.from({ length: 5 }, () => request(concurrentAddress, '/v1/shutdown', { method: 'POST' })));
+      assert.ok(responses.every((response) => response.status === 202));
+      await concurrentStarted;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(concurrentCount, 1);
+      assert.equal(concurrentApp.shutdownError, null);
+      assert.equal(concurrentApp.lastShutdownFailure, null);
+    } finally { await concurrentApp.close(); }
+
+    // Failure + retry case. The raw failure text must never appear in a
+    // response or in the queryable failure state (sanitized code only).
+    let mode = 'fail';
+    let invocations = 0;
+    let successObserved;
+    const successPromise = new Promise((resolve) => { successObserved = resolve; });
+    const app = createWorkbenchServer({
+      root,
+      token: 'test-token-012345',
+      approvalToken: 'approve-token-012345',
+      onShutdown: async () => {
+        invocations += 1;
+        if (mode === 'fail') throw Object.assign(new Error('boom apiKey=TOPSECRET'), { code: 'SHUTDOWN_TEST_FAILURE' });
+        successObserved();
+      },
+    });
+    const address = await app.listen();
+    try {
+      const waitFor = async (predicate) => {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          if (predicate()) return;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error('timed out waiting for shutdown state');
+      };
+      const first = await request(address, '/v1/shutdown', { method: 'POST' });
+      // 202 表示接受关停请求，不代表关停完成；回调失败也不改变 202 语义。
+      assert.equal(first.status, 202);
+      assert.deepEqual(first.body, { accepted: true });
+      await waitFor(() => app.lastShutdownFailure !== null);
+      assert.equal(app.shutdownError, 'SHUTDOWN_TEST_FAILURE');
+      assert.equal(app.lastShutdownFailure.code, 'SHUTDOWN_TEST_FAILURE');
+      assert.equal(JSON.stringify(app.lastShutdownFailure).includes('TOPSECRET'), false);
+      assert.equal(JSON.stringify(first.body).includes('TOPSECRET'), false);
+      // An unauthenticated request must not trigger the retry (Bearer 门控).
+      const unauthorized = await fetch(`http://${address.address}:${address.port}/v1/shutdown`, { method: 'POST' });
+      assert.equal(unauthorized.status, 401);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(invocations, 1);
+      assert.notEqual(app.lastShutdownFailure, null);
+      // Flag reset allows one safe retry; that success is then at-most-once.
+      mode = 'succeed';
+      const retry = await request(address, '/v1/shutdown', { method: 'POST' });
+      assert.equal(retry.status, 202);
+      await successPromise;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(invocations, 2);
+      assert.equal(app.shutdownError, null);
+      assert.equal(app.lastShutdownFailure, null);
+      const third = await request(address, '/v1/shutdown', { method: 'POST' });
+      assert.equal(third.status, 202);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(invocations, 2);
+    } finally { await app.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('控制面 recovery 提案创建失败后 reservation 容量释放', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-recovery-reservation-release-'));
+  const fixture = await createPendingRecoveryFixture(root, { transactionId: 'tx-reservation-release' });
+  const audit = { events: [], failProposedOnce: true, async append(event) {
+    if (event.type === 'transaction.recovery.proposed' && this.failProposedOnce) {
+      this.failProposedOnce = false;
+      throw new Error('audit unavailable');
+    }
+    this.events.push(event);
+  } };
+  // Limit 1 makes a leaked reservation observable: without the finally
+  // release, the second creation would hit the 429 limit.
+  const app = createWorkbenchServer({
+    root,
+    audit,
+    token: 'test-token-012345',
+    approvalToken: 'approve-token-012345',
+    __testHooks: { recoveryProposalLimit: 1 },
+  });
+  const address = await app.listen();
+  try {
+    const failed = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.notEqual(failed.status, 201, JSON.stringify(failed.body));
+    const created = await request(address, `/v1/recovery/${fixture.transactionId}/proposals`, { method: 'POST', body: JSON.stringify({ mode: 'resume' }) });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
