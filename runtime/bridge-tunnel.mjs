@@ -46,10 +46,17 @@ function genericError(error) { return error instanceof BridgeTunnelError ? error
 
 /**
  * Controls an explicitly injected tunnel CLI. It never starts a tunnel until
- * start() is called, never uses a shell, and never exposes the public URL.
- * The injected parser receives stdout lines and may return a URL; that URL is
- * retained only in memory for the caller's connector and is absent from all
- * public state and callbacks.
+ * start() is called, never uses a shell, and never exposes the public URL
+ * or the bearer token in public state or state callbacks. The injected
+ * parser receives stdout lines and may return a URL; that URL is retained
+ * only in memory for the caller's connector. Two explicit caller-only
+ * accessors DO return full sensitive values and must never be logged or
+ * persisted by the caller: endpoint() (the full public endpoint) and
+ * authHeaders() (the full Authorization header). The "bearer only in the
+ * child-process environment" guarantee covers arguments the adapter itself
+ * constructs; caller-supplied args are validated, copied at construction,
+ * and rejected if they contain the token, and a parsed URL containing the
+ * token is discarded rather than retained.
  */
 export function createBridgeTunnelAdapter({
   provider,
@@ -72,8 +79,13 @@ export function createBridgeTunnelAdapter({
   validCommand(command);
   if (!Array.isArray(args) || args.length > 32) fail('TUNNEL_ARGS_INVALID', 'tunnel arguments are invalid');
   args.forEach(validArg);
+  // Copy the validated args: start() must use this frozen snapshot, never
+  // the caller's live array, so mutating the original array after
+  // construction cannot smuggle unvalidated arguments into the spawn.
+  const fixedArgs = Object.freeze([...args]);
   if (!Number.isSafeInteger(localPort) || localPort < 1 || localPort > 65_535) fail('TUNNEL_PORT_INVALID', 'local port is invalid');
-  if (typeof token !== 'string' || token.length < 16 || /[\0\r\n]/.test(token)) fail('TUNNEL_AUTH_INVALID', 'tunnel bearer token is invalid');
+  if (typeof token !== 'string' || token.length < 16 || /[\x00-\x1F\x7F]/.test(token)) fail('TUNNEL_AUTH_INVALID', 'tunnel bearer token is invalid');
+  if (fixedArgs.some((arg) => arg.includes(token))) fail('TUNNEL_ARGS_INVALID', 'tunnel arguments must not contain the bearer token');
   if (typeof spawnImpl !== 'function') fail('TUNNEL_SPAWN_INVALID', 'spawn implementation is unavailable');
   if (typeof parsePublicUrl !== 'function') fail('TUNNEL_URL_PARSER_REQUIRED', 'public URL parser is required');
   validPositive(startTimeoutMs, 'startTimeoutMs');
@@ -102,12 +114,13 @@ export function createBridgeTunnelAdapter({
     emit();
   }
   function currentArgs() {
-    // The bearer is passed as an environment variable, never in argv or URL.
+    // The bearer is passed as an environment variable, never in argv or URL
+    // by this adapter's own construction (see the fixedArgs copy above).
     const target = `http://127.0.0.1:${localPort}/${routePath}`;
-    if (provider === 'cloudflare-named') return ['tunnel', 'run', namedTunnel, ...args];
-    if (provider === 'ngrok-fixed') return ['http', '--domain', fixedHostname, `127.0.0.1:${localPort}`, ...args];
-    if (provider === 'ngrok') return ['http', `127.0.0.1:${localPort}`, ...args];
-    return [...args, '--url', target];
+    if (provider === 'cloudflare-named') return ['tunnel', 'run', namedTunnel, ...fixedArgs];
+    if (provider === 'ngrok-fixed') return ['http', '--domain', fixedHostname, `127.0.0.1:${localPort}`, ...fixedArgs];
+    if (provider === 'ngrok') return ['http', `127.0.0.1:${localPort}`, ...fixedArgs];
+    return [...fixedArgs, '--url', target];
   }
   function consumeOutput(data) {
     outputBuffer += Buffer.isBuffer(data) ? data.toString('utf8') : String(data ?? '');
@@ -118,7 +131,7 @@ export function createBridgeTunnelAdapter({
       outputBuffer = outputBuffer.slice(index + 1);
       try {
         const parsed = parsePublicUrl(line);
-        if (typeof parsed === 'string' && /^https:\/\//.test(parsed) && parsed.length <= 2048) {
+        if (typeof parsed === 'string' && !parsed.includes(token) && /^https:\/\//.test(parsed) && parsed.length <= 2048) {
           const candidate = new URL(parsed);
           if (candidate.protocol !== 'https:' || candidate.username || candidate.password || candidate.search || candidate.hash || (fixedHostname && candidate.hostname.toLowerCase() !== fixedHostname)) continue;
           publicUrl = candidate.origin;
