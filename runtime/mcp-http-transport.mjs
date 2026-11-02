@@ -161,7 +161,24 @@ export function createMcpHttpTransport({
     else signal?.addEventListener('abort', abortExternal, { once: true });
     try {
       const response = await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(sessionId ? { 'mcp-session-id': sessionId } : {}), ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal });
-      if (!response || !response.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      if (!response || !response.ok) {
+        // Spec session rule: a 404 for a request that carried a session
+        // id means the server terminated that session, and the client
+        // MUST start a new session with a bare InitializeRequest. The
+        // old transport kept the dead id, so the next initialize sent
+        // it back and the server answered 400 (session fixation) — the
+        // transport was wedged until close(). Clear the stale id (and
+        // the negotiated version, which belongs to that session) and
+        // report the session loss distinctly, so initialize() works
+        // again immediately. A 404 with no session id carried (e.g. a
+        // wrong endpoint) stays a plain HTTP error.
+        if (response?.status === 404 && sessionId) {
+          sessionId = null;
+          protocolVersion = null;
+          throw new McpHttpTransportError('MCP_SESSION_NOT_FOUND', 'MCP session was terminated by the server; start a new session with initialize()');
+        }
+        throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      }
       if (response.status === 202 || response.status === 204) return null;
       const responseText = await readBoundedText(response, maxFrameBytes);
       const contentType = String(response.headers?.get?.('content-type') ?? '').toLowerCase();
@@ -195,7 +212,17 @@ export function createMcpHttpTransport({
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     try {
       const response = await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(sessionId ? { 'mcp-session-id': sessionId } : {}), ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal });
-      if (!response || !response.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      if (!response || !response.ok) {
+        // Same session-termination rule as request(): a 404 for a
+        // notification that carried a session id clears the stale id
+        // instead of leaving the transport wedged.
+        if (response?.status === 404 && sessionId) {
+          sessionId = null;
+          protocolVersion = null;
+          throw new McpHttpTransportError('MCP_SESSION_NOT_FOUND', 'MCP session was terminated by the server; start a new session with initialize()');
+        }
+        throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      }
       return Object.freeze({ status: response.status });
     } finally { clearTimeout(timer); activeControllers.delete(controller); }
   }
@@ -257,7 +284,17 @@ export function createMcpHttpTransport({
     void (async () => {
       try {
         const response = await fetchImpl(target, { method: 'GET', headers: { ...baseHeaders, accept: 'text/event-stream', 'mcp-session-id': sessionId, ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}), ...(lastEventId ? { 'last-event-id': lastEventId } : {}) }, signal: controller.signal });
-        if (!response || !response.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP SSE stream returned an HTTP error');
+        if (!response || !response.ok) {
+          // A GET stream always carries a session id, so a 404 here is
+          // a terminated session: clear it before reporting, so an
+          // onError handler that re-initializes sees a clean transport.
+          if (response?.status === 404) {
+            sessionId = null;
+            protocolVersion = null;
+            throw new McpHttpTransportError('MCP_SESSION_NOT_FOUND', 'MCP session was terminated by the server; start a new session with initialize()');
+          }
+          throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP SSE stream returned an HTTP error');
+        }
         const contentType = String(response.headers?.get?.('content-type') ?? '').toLowerCase();
         if (!contentType.includes('text/event-stream')) throw new McpHttpTransportError('MCP_FRAME_INVALID', 'MCP SSE stream did not return an event stream');
         const decoder = new TextDecoder();
