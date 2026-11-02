@@ -214,7 +214,15 @@ export function createMcpBridgeServer({
     // jsonrpc 2.0, a method, an object params (when present), and no
     // id/result/error keys, so a corrupted snapshot cannot smuggle a
     // JSON-RPC response — or a request a client would answer — into a
-    // replay stream. Anything failing any of these checks drops the
+    // replay stream. The encoded text must also be a single line: the
+    // replay writer splices it verbatim into one SSE `data:` line, so
+    // a raw CR or LF in it (for example pretty-printed JSON) would
+    // split the frame. Its size limit is UTF-8 bytes, matching the
+    // writer's boundedJson, not JS string length, so a multibyte frame
+    // cannot slip past the limit. The method check rejects only
+    // NUL/CR/LF — TAB, ESC, DEL still pass, exactly as broadcast
+    // does — so it must not be described as "no control characters".
+    // Anything failing any of these checks drops the
     // whole entry; a valid entry in the same file is unaffected.
     let previousSequence = null;
     for (const event of entry.events) {
@@ -222,7 +230,8 @@ export function createMcpBridgeServer({
         || !Number.isSafeInteger(event.sequence) || event.sequence < 1
         || event.id !== `evt-${event.sequence}`
         || (previousSequence !== null && event.sequence !== previousSequence + 1)
-        || typeof event.encoded !== 'string' || event.encoded.length > maxResponseBytes) return false;
+        || typeof event.encoded !== 'string' || Buffer.byteLength(event.encoded, 'utf8') > maxResponseBytes
+        || /[\r\n]/.test(event.encoded)) return false;
       previousSequence = event.sequence;
       try {
         const parsed = JSON.parse(event.encoded);
