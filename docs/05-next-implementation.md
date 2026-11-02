@@ -128,7 +128,7 @@
 
 | PR | 分支 / head | 改动范围（与 main 的 diff 实测） | CI（check-runs 实测，每项 3 个检查） | 合并门 |
 | --- | --- | --- | --- | --- |
-| #47 Windows ConPTY resize | `wb6-pty-resize` / `3623152` | `runtime/windows-pty-provider.mjs`、`runtime/windows-pty.ps1`、新增 `tests/windows-pty-resize.test.mjs`；命名管道控制通道（每会话 `ocw-pty-<uuid>`），无控制通道不静默退化为无 resize 会话 | test (22.19.0)、test (24.x)、windows-compatibility 全部 success | 协调员通报：主窗口第一批审查中；GitHub 上无 review 记录，审查在主窗口侧进行。结论与交叉核对未齐前不合 |
+| #47 Windows ConPTY resize | `wb6-pty-resize` / `3623152` | `runtime/windows-pty-provider.mjs`、`runtime/windows-pty.ps1`、`runtime/terminal-session.mjs`（resize 说明注释：Windows ConPTY 经命名管道控制通道支持 resize，+4/-4）、新增 `tests/windows-pty-resize.test.mjs`；命名管道控制通道（每会话 `ocw-pty-<uuid>`），无控制通道不静默退化为无 resize 会话 | test (22.19.0)、test (24.x)、windows-compatibility 全部 success（check-runs 实测，run 41402922561：test 完成 2026-11-02T06:55:28Z／06:55:29Z，windows 完成 2026-11-02T07:07:31Z） | 协调员通报：主窗口第一批审查中；GitHub 上无 review 记录，审查在主窗口侧进行。结论与交叉核对未齐前不合 |
 | #48 LSP 真实 pyright | `wb6-lsp-real` / `a920b07` | 仅新增 `tests/lsp-real-server.test.mjs`（3 项，真实 pyright-langserver over stdio，hover/definition、diagnostics、didOpen/didChange/didClose），无运行时改动 | test (22.19.0)、test (24.x)、windows-compatibility 全部 success，但该绿不等于 CI 上已验真实服务器（见下） | 两道门未齐：①协调员通报：审查包已按新规则转发 ChatGPT 网页版 Codex 窗口，复核结论交叉核对未完成；②CI pyright 安装步未齐：#48 diff 只改测试文件，`ci.yml` 未动，CI 上无 pyright 时测试按设计跳过（`SKIP_NO_SERVER`），故 CI 绿不能当作真实服务器已验的证据 |
 | #49 快照校验加固 | `wb6-streamable-snapshot` / `64b72b0` | 仅 `runtime/mcp-bridge-server.mjs` 的快照校验／加载器＋新增 `tests/mcp-bridge-snapshot-red-team.test.mjs`（7 项） | test (22.19.0)、test (24.x)、windows-compatibility 全部 success | 待复核结论与交叉核对后才可合并 |
 | #50 程序化路径过期 | `wb6-streamable-expiry` / `143d82a` | 仅 `runtime/mcp-bridge-server.mjs` 的 `broadcast` 与 `resumeSession` 两处调用点＋新增 `tests/mcp-bridge-expiry-red-team.test.mjs`（4 项） | test (22.19.0)、test (24.x)、windows-compatibility 全部 success | 待复核结论与交叉核对后才可合并 |
@@ -136,9 +136,11 @@
 
 建议合并顺序：#49 → #50 → #51，每合一个重看 CI（分支保护 strict，要求最新 main 下的 test (22.19.0) 与 test (24.x) 绿；#47、#48 各自的合并门与此三者无关，不捆绑）。
 
+注（#52 自身时效记录，GitHub API 实测 2026-11-02）：#52 head `407e2f5` 的三项检查全部 success（run 41414885637；windows-compatibility 完成 2026-11-02T08:53:02Z），此前转告的“待 windows 变绿后再定”条件已满足；#52 本身仍 open、未合，是否合并仍由协调员定，本修复不替协调员定合并。
+
 ### 审查路线（最新规则，取代第五轮的 GPT Work 表述）
 
-- 往后新复核一律走 ChatGPT 网页版 Codex 窗口（查看电脑配置任务线程，Full access＋GPT-6.1 Sol Extra High），结论须经本窗口交叉核对后才采纳。
+- 往后新复核一律走 ChatGPT 网页版 Codex 窗口（查看电脑配置任务线程，Full access＋GPT-6.1 Sol Extra High），结论须经执行方主窗口交叉核对后、由协调员决定采纳。
 - 第一批、第二批旧 GPT Work 包不动、不转 Codex；第三批及以后走 Codex。第五轮 PR #45 的 GPT Work 审查记录是历史事实，保留原样，不改写。
 - 大段代码不得裸粘进 Codex 网页版输入框：成对美元符会被界面当数学公式渲染，PR #48 首轮即因此误报源码损坏。优先让 Codex 直接读 GitHub 原文；小片段用四重反引号围栏包裹，并在指令里写明围栏内美元符按原文读。
 - 本 docs 同步 PR 本身如需复核，也按 Codex 窗口表述报给协调员转发主窗口，不另发 GPT Work 包。
@@ -154,22 +156,22 @@
 - 显式 `broadcast`：服务端自动推送只来自显式调用，工具执行不自动产生广播；`patch`／`command` 仍只返回待审批提案。
 - 审批与 allowlist 全程未动：Bridge 不替代控制面审批，工具调用仍命中 allowlist。
 
-本轮补齐三项（全部 open、未合，见上表；三者互不重叠，各自只改一处）：
+本轮提交的修复及新增测试（全部 open、未合，见上表，尚待复核；三项主题分离，#49／#50 同文件不同函数，当前修改 hunk 不重叠；合并顺序及更新后的 CI 要求见上文）：
 
-- #49 快照校验加固：事件 id 须与 sequence 对应（`evt-N` ⇔ sequence N）、缓冲须连续无缺口、游标须跟随末事件（空缓冲的开放会话游标须为 1，关闭 tombstone 豁免该条但不豁免其他条）；编码帧须恰为 broadcast notification（jsonrpc 2.0、有 method、无 id／result／error 键，params 若有须为对象）；任一校验失败即整条目丢弃、同文件内有效条目不受影响；同键后来重复条目不得覆盖首个有效快照。红队 7 项覆盖：id／sequence 错位、缺口、重复、游标错位、响应／请求帧混入、合法截断缓冲与 tombstone、坏条目隔离与跨会话隔离、截断／空／错版文件 fail-closed、超大事件丢弃。
-- #50 程序化路径过期：`broadcast` 与 `resumeSession` 入口先执行过期判定， idle-expired 的活会话广播失败且不被复活、resume 报 `MCP_SESSION_EXPIRED` 而非 `MCP_SESSION_ACTIVE`；活会话广播仍刷新 activity。红队 4 项覆盖：广播复活阻断、活会话刷新、resume 过期语义、HTTP／broadcast／resume 三路一致 404。
-- #51 客户端 404 重初始化：request、notify、GET SSE 三路，携带会话 id 的请求收到 404 即清空旧会话 id 与已协商版本并报 `MCP_SESSION_NOT_FOUND`，随后 `initialize()` 可立即以裸 InitializeRequest 重开；无会话 id 的 404（如错 endpoint）仍为普通 HTTP 错误。红队 4 项覆盖：request、notify、GET 三路清会话与重初始化、无会话 id 的 404 不误清。
+- #49 快照校验加固：事件 id 须与 sequence 对应（`evt-N` ⇔ sequence N）、缓冲须连续无缺口、游标须跟随末事件（空缓冲的开放会话游标须为 1，关闭 tombstone 豁免该条但不豁免其他条）；编码帧须恰为 broadcast notification（jsonrpc 2.0、有 method、无 id／result／error 键，params 若有须为对象）；任一校验失败即整条目丢弃、同文件内有效条目不受影响；同键后来重复条目不得覆盖首个有效快照。红队 7 项覆盖：id／sequence 错位、缺口、重复、游标错位、响应／请求帧混入、合法截断缓冲与 tombstone、坏条目隔离与跨会话隔离、截断／空／错版文件 fail-closed、超大事件丢弃。限定：超大事件测试仅 ASCII（UTF-8 多字节超限未覆盖，字符串长度与 UTF-8 字节口径差异尚待交叉核对），跨会话测试未读实际回放内容；以上为本轮提交的测试范围，尚待复核。
+- #50 程序化路径过期：`broadcast` 与 `resumeSession` 入口先执行过期判定， idle-expired 的活会话广播失败且不被复活、resume 报 `MCP_SESSION_EXPIRED` 而非 `MCP_SESSION_ACTIVE`（限定：须仍有过期快照在；无快照时为 `MCP_SESSION_NOT_FOUND`）；活会话广播仍刷新 activity。红队 4 项覆盖：广播复活阻断、活会话刷新、resume 过期语义、HTTP／broadcast／resume 三路一致拒绝过期会话（非都返回 404：HTTP 为 404，broadcast 为会话不存在码，resume 为过期码）。
+- #51 客户端 404 重初始化：request、notify、GET SSE 三路，携带会话 id 的请求收到 404 即清空旧会话 id 与已协商版本并报 `MCP_SESSION_NOT_FOUND`，随后 `initialize()` 可立即以裸 InitializeRequest 重开；无会话 id 的 404（如错 endpoint）仍为普通 HTTP 错误。红队 4 项覆盖：request、notify、GET 三路清会话与重初始化、无会话 id 的 404 不误清。限定：串行重开有依据；迟到旧 404 清掉新会话的并发边界未解，重开后状态可靠性尚待复核。
 
-三 PR 均守住的点（diff 实测）：快照不含 token／密钥（#49 只加校验、不加字段）；管理面只产提案（#49–#51 均未碰管理面与审批代码）；审批与 allowlist 未动（#49 改校验／加载器、#50 改两处过期调用点、#51 改客户端 404 处理，无一触及审批或 allowlist）。
+三 PR 均守住的点（diff 实测）：未新增 token／密钥持久化字段（#49 只加校验、不加字段；该断言不及于事件内容本身是否脱敏）；Bridge 的 patch／command 工具入口仍产待审批提案（#49–#51 均未碰管理面与审批代码）；本轮未修改审批与 allowlist（#49 改校验／加载器、#50 改两处过期调用点、#51 改客户端 404 处理，无一触及审批或 allowlist；“未改”不等于继承实现已重新完成全链安全验收）。
 
-部分／未采纳／未闭合项（逐项裁决待定，不冒充完成）：
+部分／未实现／未闭合项（逐项裁决待定，不冒充完成）：
 
 - POST SSE 续接：部分。POST 单帧响应不可续接；410 后客户端须自行用 tools/list/call 重查状态。
-- Initialize 版本协商：未采纳。服务端与客户端均只认 `2025-06-18`，不符返回 400 `MCP_PROTOCOL_INVALID`；不做多版本协商。
+- Initialize 版本协商：未实现，是否采纳待裁决。服务端与客户端均只认 `2025-06-18`，不做多版本协商；错误口径分开写：服务端不符返回 HTTP 400 `MCP_PROTOCOL_INVALID`，客户端版本不符为 `MCP_PROTOCOL_VERSION_MISMATCH`（客户端抛错口径），两者不要混写为同一返回。
 - `notifications/cancelled`：未处理。除 `notifications/initialized` 外的 notification 在工具路由上返回 400；取消语义未实现。
-- 服务端主动请求（server-to-client requests）：未实现。客户端侧对服务端请求的默认回 -32601 仍在；桥接服务端不发主动请求。
+- 服务端主动请求（server-to-client requests）：未实现。HTTP 客户端支持可选 onRequest 分派，默认拒绝语义尚未闭合；桥接服务端不发主动请求。
 - 多 GET 流扇出：已知张力。`streamCount` 存在，但多流并发语义未逐项裁决。
-- 服务端状态快照 HTTP 端点：未采纳。只有程序化 `resumeSession`，无 HTTP 快照端点。
+- 服务端状态快照 HTTP 端点：未实现，是否采纳待裁决。只有程序化 `resumeSession`，无 HTTP 快照端点。
 - 快照留存无界：未闭合。单会话缓冲有 `maxReplayEvents` 上限，但快照文件条目总数无上限、无定期清理；过期快照只在被 resume 触及时删除。
 - 外部截断致整文件丢失：已知限制。快照文件 JSON 解析失败即整文件丢弃、启动不受影响（#49 红队覆盖 fail-closed，但不恢复部分条目）。
 - 快照文件权限：后续加固候选。回放快照写盘经 tmp＋rename，但无显式 0600，与工作区快照 0600／0700 的口径不统一。
@@ -183,6 +185,6 @@
 
 - **Gateway 生命周期**：未实现（仅探针与帮助面实测）。下一步：凭用户授权的非密钥登录／配对路径，或可注入的已验证 channel 适配器，再推进；凡涉及登录、配对、token、写真实配置的验证，须用户明确授权后另行受控验证。
 - **公网隧道真实部署验证**：未验证。quick-tunnel 两次建链均失败（TLS 握手异常类别，带代理与直连均同；已排查时钟偏差约 3 秒、DNS CGNAT sinkhole 答案、公共解析器 UDP 53 被拦）。下一步：仅在能到达真实 Cloudflare 边缘的可 clean egress 主机上重跑哑元 quick 试验，验证前不称生产可用。
-- **Streamable 部分／未采纳／未闭合项的逐项裁决**：见上表（POST SSE 续接、多版本协商、`notifications/cancelled`、服务端主动请求、多 GET 流扇出、服务端状态快照 HTTP 端点、快照留存无界、外部截断整文件丢失、快照文件权限），每项须单独裁决采纳／不采纳／排期，不得打包默认通过。
+- **Streamable 部分／未实现／未闭合项的逐项裁决**：见上表（POST SSE 续接、多版本协商、`notifications/cancelled`、服务端主动请求、多 GET 流扇出、服务端状态快照 HTTP 端点、快照留存无界、外部截断整文件丢失、快照文件权限），每项须单独裁决采纳／不采纳／排期，不得打包默认通过。
 - **#47／#48／#49／#50／#51 的合并门**：见上表。#47 等第一批审查结论与交叉核对；#48 等 Codex 窗口复核结论交叉核对＋CI pyright 安装步；#49–#51 等复核结论与交叉核对，建议顺序 #49 → #50 → #51，每合一个重看 CI。
 - **承接项（不重列已闭合项）**：LSP 真实服务器接入在 #48 合入前仍算未验证（CI 安装步缺失时测试跳过）；Windows resize 在 #47 合入前仍为 `PTY_RESIZE_UNSUPPORTED`；MCP 管理面板全量编辑器与 deny/cancel 路由已在第四轮闭合，不再重列。
