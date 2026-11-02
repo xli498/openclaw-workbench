@@ -4,13 +4,11 @@ param(
 
 # Windows ConPTY helper for openclaw-workbench.
 #
-# WINDOWS_PTY_STATUS: UNVERIFIED. This script has never run on Windows
-# (written and reviewed on Linux). It is a real implementation attempt
-# using CreatePseudoConsole + CreateProcess with a pseudoconsole
-# attribute, not a verified path: Windows CI must validate spawn, input
-# pumping, output pumping, cancel (taskkill from the Node provider) and
-# exit-code propagation before any real session uses it. Do not report
-# this path as working until that validation lands.
+# WINDOWS_PTY_STATUS: VERIFIED ON WINDOWS CI (PR #45, 2026-11-02).
+# This script was written and reviewed on Linux, then validated by
+# Windows CI execution tests (spawn, input pumping, output pumping,
+# cancel via taskkill from the Node provider, and exit-code propagation).
+# Windows resize is still PTY_RESIZE_UNSUPPORTED.
 #
 # Invocation contract (Node side, shell:false, base64 JSON payload):
 #   { cwd, argv, cols, rows, env }

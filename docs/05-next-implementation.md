@@ -95,3 +95,27 @@
 - **streamable HTTP 剩余**：进程内回放缓冲重启即失；无服务端状态快照端点。下一步：如需跨重启续接，设计持久化回放缓冲与快照语义（仍守审批与 allowlist）。
 - **MCP 管理剩余**：面板全量配置编辑器未实现；提案拒绝/撤销入口缺失（后端无 deny/cancel 路由）；更新后重新启用无面板入口。下一步：在管理面 API 上补上述入口。
 - **公网隧道真实部署验证**：未验证（见上）。下一步：仅在 TLS 建链可通的环境重跑哑元 quick 试验，验证前不称生产可用。
+
+## 第四轮闭环已完成（2026-11-01，PR #42–#44）
+
+- **LSP documentChanges 提案化（已完成）**：create/rename/delete 类编辑从拒绝改为只产冻结提案数据，落盘仍走 Patch 提案＋独立审批；positionEncodings 协商与 UTF-16 转换已合；pyright 实测 hover/definition 通过（UTF-8/32 对齐由 mock 与纯转换器验证，非 pyright）。
+- **MCP 管理完整化（已完成）**：后端 deny/cancel 路由（审批 token＋actionHash 绑定，拒绝后不得再批准）；桌面面板补全量配置编辑器（仅 env 键名，不含密钥值）、拒绝/撤销按钮与更新后重新启用入口。
+- **Streamable 持久回放（已完成）**：快照只含事件内容与游标（会话 id 仅 SHA-256 哈希，不含 token）；重启后旧会话按过期处理、不静默复活；跨重启续接须显式 resumeSession（新会话 id、一次性）。
+
+## 第五轮闭环已完成（2026-11-02，GPT Work 审查交叉核对，PR #45）
+
+- **审查来源与核对方式**：主窗口谷歌浏览器 GPT Work 模式（GPT-6.1 Sol，Extra High）静态审查结论，审查包在 ~/workspace/wb4-work/gpt-review-packet/（不进仓库）；结论采纳前逐项在 wb4-pty 现行 head 源码里验真，行号以现行 head 为准。未用 Codex（该授权已作废）。
+- **Q2 指针修复（已验证）**：ps1 直接传 $hPC，删 $pcPtr 分配/写入/释放，保留外层属性列表清理；管道改为非继承、CreateProcess 的 bInheritHandles 改为 $false（旧注释称必须为 TRUE 已纠正，伪控制台属性与普通句柄继承不得混为一谈）；CreateProcess 成功后立即关闭并置零 helper 持有的 $inputPipe.Read/$outputPipe.Write，主机端 FileStream 改为单一所有者；[uint32] 读码、进入 finally 前输出 PTY_CHILD_EXIT decimal/hex，provider 仅在确实收到时附加 error.childExitCode，顶层 result.code 契约与 0/1 归一化不变。错误码纠错已验算：3221225794 = 0xC0000142、3221225474 = 0xC0000002、3221226021 = 0xC0000225；“CRLF 导致初始化失败”无证据，未采纳为根因。
+- **Q1 清理顺序与日志（已验证）**：PTY_STAGE/PTY_WAIT 日志（Wait 返回值不再 [void] 丢弃）；provider 增加 handle.diagnostics()，测试超时 abort 前先打印诊断；清理改为“解除实际 I/O → 有界等待 → Dispose”，输入 pump 加共享停止标志＋尽力而为的 CancelIoEx（只取消调用线程的 I/O，FALSE 只作信息）、输出 pump 保持运行、先 ClosePseudoConsole 再等 EOF；仍阻塞的 pump 不同步 Stop，跳过 Dispose 并记日志，靠进程退出终止；结算后移除 abort listener。分步证据：Q2 单独落地时 230/232 原样超时，Q1 落地后才变绿，故 Q1/Q2 未合并认定。
+- **Q3 高项（已验证）**：provider 改为 exit 只记状态、close 收齐 stdio 后刷新两个 decoder 再结算；231 断言 error.childExitCode === 42（启动失败再也不能冒充真 42）；233 先等就绪标记、断言取消前未退出、再取消；新增大输出（100 行＋唯一尾标记）测试，尾标记须在 onExit 解析时已在输出中。
+- **Q3 中、低项（已验证）**：provider 注册 stdin error 监听；taskkill 加 5 秒有限 timeout 并保存结果；环境合并按 Windows 不区分大小写规范化键，helper 按 OrdinalIgnoreCase 排序环境块；全部 cmd 测试 argv 加 /d（AutoRun 未断言为原因，仅作加固）。
+- **Windows CI 验证结果（PR #45 最终 head cbaea26，run 41391398892，job 125103384548）**：test (22.19.0) success、test (24.x) success、windows-compatibility success；Windows PTY 测试 229–236 全部通过（229 PS 可用、230 echo、231 exit 42、232 input、233 cancel、234 尾标记、235 提前结束写、236 环境规范化）。PR #45 以合并 commit d810db0 合入 main，wb4-pty 分支已删。
+- **本地测试说明**：最终全量本地为 557 项中 532 通过、2 失败、23 跳过；2 项失败均为 pinned HTTPS transport 测试的 ERR_PROXY_TUNNEL 代理隧道超时，已在基线 1f440e7 的 worktree 上复现同一失败，与本次改动文件无关；Windows-only 测试在 Linux 上按设计跳过，从未声称本地跑过。
+
+## 仍未闭合项（截至第五轮闭环，2026-11-02，写明原因与下一步，不冒充完成）
+
+- **Windows ConPTY resize**：仅有命名管道控制通道的设计文档（~/workspace/wb4-work/windows-pty-resize-design.md，不进仓库），PTY_RESIZE_UNSUPPORTED 仍在。下一步：在已验证的 ConPTY 执行路径上补实现 PR＋绿色 Windows 执行测试（含 $Host.UI.RawUI.WindowSize 观测验证）。
+- **LSP 全量剩余**：真实语言服务器接入未验证；UTF-8/UTF-32 编码对齐仅由 mock 与纯转换器验证。下一步：接真实语言服务器实测后再切片。
+- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针与帮助面实测）。channel add/login/logout、scope 升级、设备配对、持久化运行时 token、gateway install/start 均未做（授权边界止步）。下一步：凭用户授权的非密钥登录/配对路径，或可注入的已验证 channel 适配器，再推进。
+- **公网隧道真实部署验证**：未验证。quick-tunnel 两次建链均失败（TLS 握手异常类别，带代理与直连均同；已排查时钟偏差约 3 秒、DNS CGNAT sinkhole 答案、公共解析器 UDP 53 被拦）。下一步：仅在能到达真实 Cloudflare 边缘的可 clean egress 主机上重跑哑元 quick 试验，验证前不称生产可用。
+- **Streamable 剩余**：回放缓冲持久化已实现（replayStorePath），但服务端状态快照端点等完整语义仍按 MCP 2025-06-18 逐项核对中。下一步：按协议逐项补齐并加红队测试，仍守审批与 allowlist。
