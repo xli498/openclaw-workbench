@@ -65,4 +65,4 @@ OpenClaw Workbench 是面向 OpenClaw 的本地 Agent 工作台：把模型配�
 
 产品核心闭环必须能在干净工作区中完成：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具调用 → 生成审批提案 → 人工批准并验证 → 脱敏审计。每一步都要有公开 schema、错误状态和可重复测试证据。
 
-`Streamable HTTP MCP Bridge` 是独立的远程接入里程碑：本地 Bridge 只负责受保护的 MCP 会话与工具目录，公网隧道由单独适配器提供。当前公网隧道仅有受控 CLI 适配器、真实公网部署未验证，LSP 仅实现只读客户端切片，持久 PTY 仅 POSIX 显式注入 provider（默认仍 pty:false）；这些能力不能用“诊断接口”或一次性命令调用冒充完成。
+`Streamable HTTP MCP Bridge` 是独立的远程接入里程碑：本地 Bridge 只负责受保护的 MCP 会话与工具目录，公网隧道由单独适配器提供。当前公网隧道仅有受控 CLI 适配器、真实公网部署未验证，LSP 已实现文档同步、诊断与经审批编辑提案，持久 PTY 已实现 POSIX resize 通道与 Windows ConPTY 已由 Windows CI 执行测试验证（Windows resize 仍未接线，默认仍 pty:false）；这些能力不能用“诊断接口”或一次性命令调用冒充完成。

@@ -4,7 +4,7 @@
 
 > 这是独立的、非官方 OpenClaw 项目，不会自动修改 OpenClaw 配置。当前版本是可测试的 Runtime 产品基线，不是已经接管生产环境的完整控制面。
 
-产品核心的可验收闭环是：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具 → 审批提案 → 验证与脱敏审计。`Streamable HTTP MCP Bridge` 已作为独立的本机回环服务实现；公网隧道仅有受控 CLI 适配器、真实公网部署未验证，LSP 仅实现只读客户端切片，持久 PTY 仅 POSIX 显式注入 provider（默认仍 pty:false），不能用诊断或一次性命令执行冒充这些能力。
+产品核心的可验收闭环是：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具 → 审批提案 → 验证与脱敏审计。`Streamable HTTP MCP Bridge` 已作为独立的本机回环服务实现；公网隧道仅有受控 CLI 适配器、真实公网部署未验证，LSP 已实现只读客户端切片之上的文档同步、诊断、经审批编辑提案与 documentChanges 提案化，持久 PTY 已实现 POSIX 显式注入 provider 的 resize 通道（默认仍 pty:false）与 Windows ConPTY 已由 Windows CI 执行测试验证（Windows resize 仍未接线），不能用诊断或一次性命令执行冒充这些能力。
 
 ## 当前可运行入口
 
@@ -116,7 +116,7 @@ Plan 会话支持 `POST /v1/sessions/:id/plan` 的多模型只读复核；传入
 
 事件可通过只读 `GET /v1/events` 轮询，或通过 Bearer 鉴权的 `GET /v1/events/stream?after=<sequence>` 使用 SSE 接收历史事件和后续事件（含 keep-alive）；事件流不是审批或执行入口。`createGatewayAdapter` 只提供显式调用的回环 WebSocket 传输边界，固定禁止公网地址，不自动连接、启动 Gateway、读取密钥或执行 MCP 工具；OpenClaw 私有协议、channel 生命周期、WebSocket 控制面和公网 Bridge 仍未实现。
 
-Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前已有本地 Web 控制台与 Tauri 桌面壳；MCP 管理面 API（update/remove 提案、GET tools）与桌面控制台 MCP 面板已实现（面板只改显示名称、无拒绝入口、批准后需重新启用），OpenClaw channel/Gateway 生命周期接入和作为产品能力的公网 Bridge 仍未实现。
+Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作区 revision 和 `actionHash` 的提案，用户明确批准后调用 `approveAndApplyPatch`，由事务引擎原子应用并返回 `verified` action。`Ask` 模式不能创建修改提案，审批后工作区 revision 变化会阻断应用。当前已有本地 Web 控制台与 Tauri 桌面壳；MCP 管理面 API（update/remove 提案、deny/cancel 路由、GET tools）与桌面控制台 MCP 面板已实现（面板含全量配置编辑器、拒绝/撤销入口与更新后重新启用入口，批准后需重新启用），OpenClaw channel/Gateway 生命周期接入和作为产品能力的公网 Bridge 仍未实现。
 
 配置管理垂直切片提供 `GET /v1/config`、`POST /v1/config/import`、`POST /v1/config/rollback` 和 `POST /v1/config/:actionId/approve`。配置文件必须是工作区内的相对 `.json` 文件（默认 `openclaw.json`）；导入会先创建 `.openclaw-workbench/config-backups/` 下的备份，写入前和写入时都校验 `expectedHash`，冲突返回 `409 CONFIG_CONFLICT`。创建提案只返回相对路径、大小和哈希，原始配置内容不写入 proposals 快照、不返回 UI，也不进入审计；待审批提案只保存在当前进程，重启后必须重新创建。
 
@@ -158,7 +158,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 控制面提供 `GET /v1/terminal/sessions`、`POST /v1/terminal/sessions`、`GET /v1/terminal/sessions/:id/output`、`POST /v1/terminal/sessions/:id/input` 和 `POST /v1/terminal/sessions/:id/cancel`。创建、输入和取消都需要独立 `X-Approval-Token`；命令仍经过 argv、cwd 和只读策略门禁。输出按游标增量读取并有硬上限，输入原文不写入快照。
 
-当前默认实现使用受控命令 runner 作为非 PTY fallback，返回 `capabilities: { pty: false, input: false, incrementalOutput: false }`，因此不会把一次性命令冒充交互终端。真正的 PTY provider 需要宿主显式注入并单独完成进程树、权限和秘密环境复审。服务重启后未完成会话只进入 `manual_review`，不会自动重放。
+当前默认实现使用受控命令 runner 作为非 PTY fallback，返回 `capabilities: { pty: false, input: false, incrementalOutput: false }`，因此不会把一次性命令冒充交互终端。POSIX PTY provider 需要宿主显式注入并单独完成进程树、权限和秘密环境复审；Windows ConPTY provider 已由 Windows CI 执行测试验证 spawn/输出/输入/取消/退出码（Windows resize 仍未接线）。服务重启后未完成会话只进入 `manual_review`，不会自动重放。
 
 `GET /v1/audit?limit=<n>` 只读返回最近的脱敏审计事件，最多 500 条；控制台可查看并导出这份脱敏 JSON。未显式注入 audit 时，服务会惰性写入工作区 `.openclaw-workbench/audit.jsonl`；命令预览、完整错误文本、环境变量、凭据和绝对路径不会通过该接口返回。
 

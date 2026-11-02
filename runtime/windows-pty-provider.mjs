@@ -4,14 +4,12 @@ import { fileURLToPath } from 'node:url';
 
 // Windows ConPTY provider for terminal sessions.
 //
-// WINDOWS_PTY_STATUS: UNVERIFIED. This file and runtime/windows-pty.ps1
-// were written and reviewed on Linux and have never run on Windows:
-// the ConPTY path (CreatePseudoConsole + CreateProcess with a
-// pseudoconsole attribute) is a real implementation attempt, not a
-// verified one. Windows CI (owned by the parent agent) must validate
-// spawn/write/cancel/exit-code propagation before this provider is used
-// for real sessions. Until then, treat every Windows success claim as
-// unproven.
+// WINDOWS_PTY_STATUS: VERIFIED ON WINDOWS CI (PR #45, 2026-11-02).
+// This file and runtime/windows-pty.ps1 were written and reviewed on
+// Linux, then validated by Windows CI execution tests (spawn, output
+// pumping, input pumping, cancel, exit-code propagation; tests 229-236
+// in tests/windows-pty-provider.test.mjs). Windows resize is still
+// PTY_RESIZE_UNSUPPORTED (no persistent control channel yet).
 //
 // What is guaranteed on every platform: on non-Windows, this provider
 // refuses with PTY_UNAVAILABLE and never fakes a pty (no fallback
