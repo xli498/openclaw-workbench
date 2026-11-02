@@ -122,11 +122,20 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      // The abort listener must not survive settlement: a later
+      // abort (e.g. a test timing out after the helper already
+      // exited) must not taskkill an unrelated process reusing the
+      // pid, and a retained listener keeps the session referenced.
+      try { signal?.removeEventListener('abort', killTree); } catch {}
       onExit(result);
     };
+    let lastKillResult = null;
     const killTree = () => {
       if (!child.pid) return;
-      try { spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true }); } catch {}
+      try {
+        const kill = spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
+        lastKillResult = { status: kill.status, error: kill.error ? String(kill.error.code ?? kill.error) : null, signal: kill.signal ?? null };
+      } catch (error) { lastKillResult = { status: null, error: String(error), signal: null }; }
     };
     child.stdout.on('data', (chunk) => {
       const text = decoder.decode(chunk, { stream: true });
@@ -143,6 +152,12 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
     else signal?.addEventListener('abort', killTree, { once: true });
     return Object.freeze({
       capabilities: Object.freeze({ pty: true, input: true, incrementalOutput: true }),
+      // Bounded diagnostic snapshot for a test that is about to
+      // abort: the provider used to surface helper stderr only AFTER
+      // helper exit, so a timed-out test could never show what the
+      // helper had already printed (PTY_WAIT / PTY_CHILD_EXIT /
+      // PTY_STAGE / PTY_PUMP_STATS). Callers log this before abort.
+      diagnostics: () => ({ stderr: stderrText, childExitCode, settled, kill: lastKillResult }),
       write: async (input) => {
         if (typeof input !== 'string' || !input) throw new WindowsPtyProviderError('PTY_INPUT_INVALID', 'PTY input is invalid');
         if (child.stdin.destroyed) throw new WindowsPtyProviderError('PTY_CLOSED', 'PTY session is closed');

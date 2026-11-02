@@ -167,6 +167,9 @@ public static class OcwConPty
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
 }
 '@
 
@@ -305,6 +308,7 @@ public static class OcwConPty
   # to swallow every exception silently, so a stuck or failed input
   # path was indistinguishable from a child that never read input.
   $pumpStats = [hashtable]::Synchronized(@{
+    stop = $false
     inputRead = 0; inputWritten = 0; inputError = ''
     outputRead = 0; outputWritten = 0; outputError = ''
   })
@@ -329,7 +333,7 @@ public static class OcwConPty
     param($from, $to, $stats)
     $buffer = New-Object byte[] 65536
     try {
-      while ($true) {
+      while (-not $stats.stop) {
         $n = $from.Read($buffer, 0, $buffer.Length)
         if ($n -le 0) { break }
         $stats.inputRead += $n
@@ -345,7 +349,13 @@ public static class OcwConPty
   $outputJob = $outputPump.BeginInvoke()
   $inputJob = $inputPump.BeginInvoke()
   try {
+    [Console]::Error.WriteLine('PTY_STAGE: before-wait')
     $waitResult = [OcwConPty]::WaitForSingleObject($procInfo.hProcess, [OcwConPty]::WaitInfinite)
+    # The Wait return value used to be discarded with [void]; a
+    # timeout or failure there is exactly the difference between "the
+    # child never exited" and "the child exited but cleanup hung", so
+    # it is logged, not dropped. WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258.
+    [Console]::Error.WriteLine(('PTY_WAIT: result={0}; hex=0x{0:X8}' -f $waitResult))
     # Read the code as [uint32]: GetExitCodeProcess returns a DWORD,
     # and a child NTSTATUS (>= 2^31) must survive the read instead of
     # crashing an [int] cast. The raw code is reported on stderr
@@ -357,21 +367,50 @@ public static class OcwConPty
     if (-not [OcwConPty]::GetExitCodeProcess($procInfo.hProcess, [ref]$exitCode)) { throw 'GetExitCodeProcess failed' }
     [Console]::Error.WriteLine(('PTY_CHILD_EXIT: decimal={0}; hex=0x{0:X8}' -f $exitCode))
   } finally {
-    # Close the streams BEFORE stopping the pumps: a pump blocked in
-    # a synchronous Read is only unblocked when its stream is closed
-    # (the Read then throws into the pump's catch block). Stopping
-    # first can block forever on that stuck Read, so the helper never
-    # reaches [Environment]::Exit -- and a lingering helper keeps the
-    # test-file process alive through its piped stdio, hanging the
-    # whole Windows run even though the single test already timed out.
+    [Console]::Error.WriteLine('PTY_STAGE: entering-cleanup')
+    # Cleanup order is "release the real I/O, bounded-wait, Dispose"
+    # -- NOT the previous "close streams, then synchronously Stop".
+    # Closing a pump's WRITE target does not unblock a synchronous
+    # Read on its source, and a synchronous Stop() on a pump blocked
+    # in Read can itself block forever, which is a live candidate for
+    # the 60s helper hang. So: signal the input pump, attempt to
+    # cancel its blocked stdin Read (CancelIoEx; best effort -- it
+    # only cancels I/O issued by the calling thread, so a FALSE here
+    # is informative, not fatal), close the stdin stream, then keep
+    # the OUTPUT pump running while ClosePseudoConsole runs (closing
+    # the console can emit a final frame, and on older Windows it can
+    # stall if the output pipe is neither closed nor being read).
+    # Each pump is then awaited only for a bounded time; a pump that
+    # is still blocked after that is NOT Stop()ed synchronously --
+    # its Dispose is skipped and logged, and process exit below
+    # terminates it. Hiding a stuck pump behind an unbounded Stop
+    # would reproduce the hang this change exists to remove.
+    try { $pumpStats.stop = $true } catch { }
+    $stdinHandle = [IntPtr]::Zero
+    try {
+      if ($consoleIn -is [System.IO.FileStream]) { $stdinHandle = $consoleIn.SafeFileHandle.DangerousGetHandle() }
+    } catch { }
+    $cancelOk = $false
+    if ($stdinHandle -ne [IntPtr]::Zero) {
+      try { $cancelOk = [OcwConPty]::CancelIoEx($stdinHandle, [IntPtr]::Zero) } catch { $cancelOk = $false }
+    }
+    [Console]::Error.WriteLine("PTY_STAGE: cancel-input-read ok=$cancelOk")
+    try { $consoleIn.Close() } catch { }
     try { $inputStream.Close() } catch { }
+    try { [OcwConPty]::ClosePseudoConsole($hPC) } catch { }
+    [Console]::Error.WriteLine('PTY_STAGE: conpty-closed')
+    $outputDone = $false
+    try { $outputDone = $outputJob.AsyncWaitHandle.WaitOne(5000) } catch { }
+    [Console]::Error.WriteLine("PTY_STAGE: output-pump-done=$outputDone")
+    if ($outputDone) { try { $outputPump.EndInvoke($outputJob) } catch { } }
     try { $outputStream.Close() } catch { }
-    try { $outputPump.Stop() } catch { }
-    try { $inputPump.Stop() } catch { }
-    try { $outputPump.Dispose() } catch { }
-    try { $inputPump.Dispose() } catch { }
+    $inputDone = $false
+    try { $inputDone = $inputJob.AsyncWaitHandle.WaitOne(2000) } catch { }
+    [Console]::Error.WriteLine("PTY_STAGE: input-pump-done=$inputDone")
+    if ($inputDone) { try { $inputPump.EndInvoke($inputJob) } catch { } }
+    if ($outputDone) { try { $outputPump.Dispose() } catch { } } else { [Console]::Error.WriteLine('PTY_STAGE: output-pump-dispose-skipped-still-running') }
+    if ($inputDone) { try { $inputPump.Dispose() } catch { } } else { [Console]::Error.WriteLine('PTY_STAGE: input-pump-dispose-skipped-still-running') }
     [void][OcwConPty]::CloseHandle($procInfo.hProcess)
-    [OcwConPty]::ClosePseudoConsole($hPC)
     # ConPTY-side ends were already closed (and zeroed) right after a
     # successful CreateProcess; close them here only if that step did
     # not run (CreateProcess failure path), never twice.

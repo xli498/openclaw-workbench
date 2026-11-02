@@ -55,6 +55,15 @@ async function runConPty(root, argv, { writeInput = null, readyPattern = null } 
     onOutput: (value) => { outputs.push(value.text); },
     onExit: (result) => resolveExit(result),
   });
+  // Log the helper's captured stderr BEFORE aborting: once the
+  // helper is taskkilled, the chance to see whether it reached
+  // PTY_WAIT / PTY_CHILD_EXIT / cleanup stages is gone.
+  const logDiagnostics = () => {
+    try {
+      const d = handle.diagnostics?.();
+      if (d) console.error(`PTY_DIAGNOSTIC: childExitCode=${d.childExitCode ?? 'none'} settled=${d.settled} stderr=${d.stderr}`);
+    } catch {}
+  };
   if (writeInput !== null) {
     if (readyPattern) {
       // A write-callback success only proves the bytes reached the
@@ -64,6 +73,7 @@ async function runConPty(root, argv, { writeInput = null, readyPattern = null } 
       const deadline = Date.now() + 30_000;
       while (!readyPattern.test(outputs.join(''))) {
         if (Date.now() > deadline) {
+          logDiagnostics();
           controller.abort();
           throw new Error('timed out waiting for ConPTY child ready marker');
         }
@@ -81,6 +91,7 @@ async function runConPty(root, argv, { writeInput = null, readyPattern = null } 
     // the test-file process alive through its piped stdio and hangs
     // the whole Windows run even though this test already failed.
     // Abort triggers the provider's taskkill of the helper tree.
+    logDiagnostics();
     controller.abort();
     throw error;
   }
