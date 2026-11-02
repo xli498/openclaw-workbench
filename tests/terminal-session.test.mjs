@@ -314,3 +314,95 @@ test('恢复持久化终端会话时再次脱敏绝对路径输出', async () =>
     await manager.close();
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+// Regression for the s1 review finding (Q23-4): the public view redacted
+// argv through the path-aware helper, but the persisted snapshot and the
+// restore path used the secret-only helper, so absolute paths survived on
+// disk even though get() looked clean. All paths below are synthetic fakes
+// that never appear on this machine; the old fixed-prefix pattern covered
+// none of the POSIX forms here, and only the drive/UNC forms.
+test('持久化快照与公开视图对未覆盖前缀的绝对路径 argv 脱敏一致，且执行参数保持原文', async () => {
+  const root = await fixture('ocw-terminal-session-persist-redaction-');
+  const seen = [];
+  const manager = createTerminalSessionManager({
+    root,
+    sessionProvider: ({ argv, onOutput }) => {
+      seen.push([...argv]);
+      onOutput({ stream: 'stdout', text: 'see http://example.com/x and a/b' });
+      return { cancel() {} };
+    },
+  });
+  const fakes = [
+    '/workspace/fake-proj/secret.txt',
+    '/opt/fake-vendor/tool.bin',
+    '/srv/fake-data/file.txt',
+    '/etc/fake-conf.conf',
+    '/usr/local/fake/bin',
+    'C:\\fake\\secret.txt',
+    '\\\\fake-server\\fake-share\\file.txt',
+  ];
+  try {
+    const session = await manager.create({ argv: ['pwd', ...fakes, '--opt=/workspace/fake-proj/other.txt'], approved: true });
+    await wait();
+    // The live command still receives the real arguments; only outward
+    // copies are redacted.
+    assert.deepEqual(seen[0], ['pwd', ...fakes, '--opt=/workspace/fake-proj/other.txt']);
+    const shown = await manager.get(session.id);
+    assert.deepEqual(shown.argv, ['pwd', ...fakes.map(() => '[path redacted]'), '--opt=[path redacted]']);
+    assert.deepEqual(manager.list()[0].argv, shown.argv);
+    // URLs and relative segments are not absolute paths and must survive.
+    assert.equal((await manager.read(session.id)).chunks[0].text, 'see http://example.com/x and a/b');
+    const file = path.join(root, '.openclaw-workbench', 'terminal-sessions', `${session.id}.json`);
+    for (const raw of [await readFile(file, 'utf8')]) {
+      for (const fake of fakes) assert.equal(raw.includes(fake), false);
+      assert.equal(raw.includes('/workspace/fake-proj/other.txt'), false);
+      assert.equal(raw.includes('[path redacted]'), true);
+    }
+    await manager.close();
+    const afterClose = await readFile(file, 'utf8');
+    for (const fake of fakes) assert.equal(afterClose.includes(fake), false);
+    assert.equal(afterClose.includes('[path redacted]'), true);
+  } finally { await manager.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('恢复旧快照时磁盘 argv 与公开视图同步脱敏，二次恢复仍干净', async () => {
+  const root = await fixture('ocw-terminal-session-restore-disk-redaction-');
+  const id = '00000000-0000-4000-8000-000000000021';
+  const directory = path.join(root, '.openclaw-workbench', 'terminal-sessions');
+  const fakes = ['/workspace/fake-tool', '/opt/fake-data/file.txt', 'C:\\fake\\secret.txt', '/srv/fake-data/out.txt'];
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, `${id}.json`), JSON.stringify({ version: 1, id, status: 'exited', argv: fakes.slice(0, 3), cwd: '.', capabilities: { pty: false, input: false, incrementalOutput: false }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), outputBytes: 32, chunks: [{ sequence: 1, stream: 'stdout', text: `wrote ${fakes[3]}` }] }), 'utf8');
+    const manager = createTerminalSessionManager({ root });
+    await manager.restore();
+    assert.deepEqual((await manager.get(id)).argv, ['[path redacted]', '[path redacted]', '[path redacted]']);
+    assert.equal((await manager.read(id)).chunks[0].text.includes(fakes[3]), false);
+    // close() re-persists every record, so the on-disk snapshot itself must
+    // now be clean — checking get() alone would not prove this.
+    await manager.close();
+    const raw = await readFile(path.join(directory, `${id}.json`), 'utf8');
+    for (const fake of fakes) assert.equal(raw.includes(fake), false);
+    assert.equal(raw.includes('[path redacted]'), true);
+    const second = createTerminalSessionManager({ root });
+    await second.restore();
+    assert.deepEqual((await second.get(id)).argv, ['[path redacted]', '[path redacted]', '[path redacted]']);
+    await second.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('含空格的工作区根路径在持久化与公开视图中整体脱敏', async () => {
+  const spaced = path.join(tmpdir(), `ocw fake root-${Math.random().toString(36).slice(2, 8)}`);
+  await mkdir(spaced, { recursive: true });
+  const manager = createTerminalSessionManager({ root: spaced, sessionProvider: () => ({ cancel() {} }) });
+  try {
+    const session = await manager.create({ argv: ['pwd', `${spaced}/sub/secret.txt`], approved: true });
+    // Exact equality: a prefix-only redaction would stop at the space and
+    // leak the remainder of the root path.
+    assert.equal((await manager.get(session.id)).argv[1], '[path redacted]');
+    await manager.close();
+    const raw = await readFile(path.join(spaced, '.openclaw-workbench', 'terminal-sessions', `${session.id}.json`), 'utf8');
+    assert.equal(raw.includes(spaced), false);
+    assert.equal(raw.includes('fake root'), false);
+    assert.equal(raw.includes('[path redacted]'), true);
+  } finally { await manager.close(); await rm(spaced, { recursive: true, force: true }); }
+});

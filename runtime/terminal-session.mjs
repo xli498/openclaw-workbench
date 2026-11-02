@@ -13,7 +13,20 @@ const MAX_SESSION_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_INPUT_BYTES = 16 * 1024;
 const SESSION_ID_PATTERN = /^[0-9a-f-]{36}$/i;
 const TERMINAL_STATES = new Set(['running', 'exited', 'cancelled', 'timed_out', 'failed', 'manual_review']);
-const ABSOLUTE_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\\\\|\/(?:Users|home|tmp|private|var)\/)[^\s\r\n]*/g;
+// Absolute-path redaction for every outward-facing copy of a session (public
+// view, persisted snapshot, restored record). The old pattern only matched a
+// fixed POSIX prefix list (/Users/, /home/, /tmp/, /private/, /var/), so a
+// path under any other root (/workspace/, /opt/, /srv/, /etc/, /usr/, ...)
+// passed through untouched. The new pattern matches any token-start absolute
+// path: a Windows drive path, a backslash UNC path, or a POSIX path. A bare
+// "//" after a scheme or "=" is left alone so URLs such as http://... are not
+// mangled; a path must start at the string start or after a delimiter, so a
+// relative segment such as "a/b" is not treated as absolute.
+const ABSOLUTE_PATH_PATTERN = /(^|[\s=:"'([{;,}\]])(?:[A-Za-z]:[\\/]|\\\\|\/(?!\/))[^\s\r\n'"]*/g;
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 export class TerminalSessionError extends Error {
   constructor(code, message, details = {}) { super(message); this.name = 'TerminalSessionError'; this.code = code; this.details = details; }
@@ -43,16 +56,30 @@ function safeError(error, fallback = 'SESSION_FAILED') {
   return Object.freeze({ code });
 }
 
-  function redactOutput(value, maxLength) {
-    return redactText(typeof value === 'string' ? value.replace(ABSOLUTE_PATH_PATTERN, '[path redacted]') : value, maxLength);
+  function stripAbsolutePaths(value) {
+    return value.replace(ABSOLUTE_PATH_PATTERN, '$1[path redacted]');
   }
 
-  function restoreChunks(value, outputLimit) {
+  function truncateText(value, maxLength) {
+    return value.length <= maxLength ? value : `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+  }
+
+  // Order matters: secret redaction first, then path replacement, then the
+  // length cap. Replacing paths first would leave "[path redacted]" right
+  // after a sensitive key (for example "key=/abs/path"), and the secret
+  // rule would then cut the placeholder at its space, producing the mangled
+  // "key=[redacted] redacted]".
+  function redactOutput(value, maxLength) {
+    if (typeof value !== 'string') return redactText(value, maxLength);
+    return truncateText(stripAbsolutePaths(redactText(value, Number.MAX_SAFE_INTEGER)), maxLength);
+  }
+
+  function restoreChunks(value, outputLimit, redact = redactOutput) {
     if (!Array.isArray(value)) return { chunks: [], outputBytes: 0 };
     const chunks = [];
     let outputBytes = 0;
     for (const chunk of value.slice(0, 512)) {
-      const text = redactOutput(String(chunk?.text ?? ''), Math.max(outputLimit + 3, 16 * 1024));
+      const text = redact(String(chunk?.text ?? ''), Math.max(outputLimit + 3, 16 * 1024));
       if (!text) continue;
       const bytes = Buffer.byteLength(text, 'utf8');
       const remaining = outputLimit - outputBytes;
@@ -66,11 +93,11 @@ function safeError(error, fallback = 'SESSION_FAILED') {
     return { chunks, outputBytes };
   }
 
-function publicRecord(record) {
+function publicRecord(record, redact = redactOutput) {
   return Object.freeze({
     id: record.id,
     status: record.status,
-    argv: Object.freeze(record.argv.map((value) => redactOutput(value, 1_024))),
+    argv: Object.freeze(record.argv.map((value) => redact(value, 1_024))),
     cwd: record.cwd,
     capabilities: Object.freeze({ ...record.capabilities }),
     createdAt: record.createdAt,
@@ -107,6 +134,22 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
   if (typeof sessionDirectory !== 'string' || path.isAbsolute(sessionDirectory) || sessionDirectory.includes('..') || sessionDirectory.split(/[\\/]/).some((segment) => !segment)) throw new TerminalSessionError('CONFIG_INVALID', 'session directory is invalid');
 
   const rootPath = path.resolve(root);
+  // Workspace-root variants for path redaction. The generic pattern above
+  // cannot redact a root that contains a space (it stops at the space), so
+  // the root itself — plus any path nested under it — is replaced first, as
+  // one placeholder, before the generic pattern runs. The in-memory record
+  // argv is deliberately NOT rewritten here: the live command still needs
+  // the real arguments; only outward-facing copies (public view, persisted
+  // snapshot, restored record) go through this function.
+  const rootVariants = [...new Set([rootPath, rootPath.replaceAll('\\', '/')])].filter((variant) => variant.length > 1);
+  function redactStoredPath(value, maxLength) {
+    if (typeof value !== 'string') return redactOutput(value, maxLength);
+    let output = redactText(value, Number.MAX_SAFE_INTEGER);
+    for (const variant of rootVariants) {
+      output = output.replace(new RegExp(`${escapeRegExp(variant)}(?:[\\/][^\\s\\r\\n'"]*)?`, 'g'), '[path redacted]');
+    }
+    return truncateText(stripAbsolutePaths(output), maxLength);
+  }
   const records = new Map();
   const runtimes = new Map();
   const digests = new Map();
@@ -134,13 +177,13 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
       version: 1,
       id: record.id,
       status: record.status,
-      argv: record.argv.map((value) => redactText(value, 1_024)),
+      argv: record.argv.map((value) => redactStoredPath(value, 1_024)),
       cwd: record.cwd,
       capabilities: { ...record.capabilities },
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       outputBytes: record.outputBytes,
-      chunks: record.chunks.map((chunk) => ({ sequence: chunk.sequence, stream: chunk.stream, text: redactOutput(chunk.text, record.maxOutputBytes) })),
+      chunks: record.chunks.map((chunk) => ({ sequence: chunk.sequence, stream: chunk.stream, text: redactStoredPath(chunk.text, record.maxOutputBytes) })),
       ...(Number.isSafeInteger(record.exitCode) ? { exitCode: record.exitCode } : {}),
       ...(record.error ? { error: { code: record.error.code } } : {}),
     };
@@ -186,7 +229,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     if (record.status !== 'running') return;
     const stream = value?.stream === 'stderr' ? 'stderr' : 'stdout';
     const outputLimit = record.maxOutputBytes ?? maxOutputBytes;
-    const text = redactOutput(typeof value === 'string' ? value : value?.text, Math.max(outputLimit + 3, 16 * 1024));
+    const text = redactStoredPath(typeof value === 'string' ? value : value?.text, Math.max(outputLimit + 3, 16 * 1024));
     if (!text) return;
     const bytes = Buffer.byteLength(text, 'utf8');
     if (record.outputBytes + bytes > outputLimit) {
@@ -264,8 +307,8 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
         if (!snapshot.content) continue;
         const value = JSON.parse(snapshot.content);
         if (value?.version !== 1 || value.id !== id || !Array.isArray(value.argv) || !TERMINAL_STATES.has(value.status)) continue;
-        const restoredOutput = restoreChunks(value.chunks, maxOutputBytes);
-        const record = { id, status: value.status, argv: value.argv.map((item) => redactText(String(item), 1_024)), cwd: safeCwd(value.cwd), timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputBytes, capabilities: { pty: value.capabilities?.pty === true, input: value.capabilities?.input === true, incrementalOutput: value.capabilities?.incrementalOutput === true }, createdAt: value.createdAt, updatedAt: value.updatedAt, outputBytes: restoredOutput.outputBytes, chunks: restoredOutput.chunks, ...(value.exitCode !== undefined ? { exitCode: value.exitCode } : {}), ...(value.error ? { error: safeError(value.error) } : {}) };
+        const restoredOutput = restoreChunks(value.chunks, maxOutputBytes, redactStoredPath);
+        const record = { id, status: value.status, argv: value.argv.map((item) => redactStoredPath(String(item), 1_024)), cwd: safeCwd(value.cwd), timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputBytes, capabilities: { pty: value.capabilities?.pty === true, input: value.capabilities?.input === true, incrementalOutput: value.capabilities?.incrementalOutput === true }, createdAt: value.createdAt, updatedAt: value.updatedAt, outputBytes: restoredOutput.outputBytes, chunks: restoredOutput.chunks, ...(value.exitCode !== undefined ? { exitCode: value.exitCode } : {}), ...(value.error ? { error: safeError(value.error) } : {}) };
         digests.set(id, snapshot.digest);
         records.set(id, record);
         if (record.status === 'running') { record.status = 'manual_review'; record.capabilities = { pty: false, input: false, incrementalOutput: false }; record.error = { code: 'SESSION_INTERRUPTED' }; record.updatedAt = new Date(clock()).toISOString(); await persist(record); }
@@ -298,7 +341,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
       records.set(safeId, record);
       try { await persist(record); await start(record); }
       catch (error) { records.delete(safeId); throw error; }
-      return publicRecord(record);
+      return publicRecord(record, redactStoredPath);
     } finally {
       reservations.delete(safeId);
       resolveCreation();
@@ -308,10 +351,10 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
 
   function get(id) {
     if (!records.has(id)) fail('SESSION_NOT_FOUND', 'terminal session not found');
-    return publicRecord(records.get(id));
+    return publicRecord(records.get(id), redactStoredPath);
   }
 
-  function list() { return Object.freeze([...records.values()].map(publicRecord)); }
+  function list() { return Object.freeze([...records.values()].map((record) => publicRecord(record, redactStoredPath))); }
 
   async function read(id, { after = 0, limit = 100 } = {}) {
     if (!records.has(id)) fail('SESSION_NOT_FOUND', 'terminal session not found');
@@ -319,7 +362,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     const record = records.get(id);
     const earliest = record.chunks[0]?.sequence ?? record.chunks.length + 1;
     const cursorExpired = after > 0 && after < earliest - 1;
-    return Object.freeze({ session: publicRecord(record), chunks: Object.freeze(record.chunks.filter((chunk) => chunk.sequence > after).slice(0, limit).map((chunk) => Object.freeze({ ...chunk }))), next: record.chunks.at(-1)?.sequence ?? after, earliest, cursorExpired });
+    return Object.freeze({ session: publicRecord(record, redactStoredPath), chunks: Object.freeze(record.chunks.filter((chunk) => chunk.sequence > after).slice(0, limit).map((chunk) => Object.freeze({ ...chunk }))), next: record.chunks.at(-1)?.sequence ?? after, earliest, cursorExpired });
   }
 
   async function write(id, input) {
@@ -355,7 +398,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
   async function cancel(id) {
     if (!records.has(id)) fail('SESSION_NOT_FOUND', 'terminal session not found');
     const record = records.get(id);
-    if (record.status !== 'running') return publicRecord(record);
+    if (record.status !== 'running') return publicRecord(record, redactStoredPath);
     const runtime = runtimes.get(id);
     try {
       if (runtime?.timeout) clearTimeout(runtime.timeout);
@@ -364,7 +407,7 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     catch {}
     finish(record, 'cancelled', { code: 'SESSION_CANCELLED' });
     runtimes.delete(id);
-    return publicRecord(record);
+    return publicRecord(record, redactStoredPath);
   }
 
   async function close() {
