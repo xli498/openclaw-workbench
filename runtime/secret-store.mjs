@@ -75,6 +75,26 @@ function validateName(name) {
   return name;
 }
 
+// Q24-1: Windows credential target names must be unambiguous in
+// (service, name). The previous encoding, `OpenClawWorkbench:<service>:<name>`,
+// collided whenever either side contained a colon: (a:b, c) and (a, b:c)
+// both produced `OpenClawWorkbench:a:b:c`. The length-prefixed encoding
+// below is injective: each field is preceded by its length in UTF-16 code
+// units (JavaScript string length), so a field boundary can only be read
+// one way and no two distinct (service, name) pairs share a target.
+// Encoding happens here, in the JS backend, so get/set/has/delete all use
+// the identical target for a pair; the PowerShell helper receives the
+// finished target verbatim and never re-splits it. Targets written under
+// the old colon-joined scheme are left orphaned in the credential store:
+// they are not migrated and not read back (see the PR description).
+// The in-memory backend is unaffected: it already keys on a NUL
+// separator, which neither service nor name can contain.
+export function encodeCredentialTarget(service, name) {
+  validateService(service);
+  validateName(name);
+  return `OpenClawWorkbench:${service.length}:${service}:${name.length}:${name}`;
+}
+
 function validateSecret(secret) {
   if (typeof secret !== 'string' || !secret || Buffer.byteLength(secret, 'utf8') > MAX_SECRET_LENGTH || Buffer.byteLength(secret, 'utf16le') > MAX_CREDENTIAL_BLOB_BYTES || /[\0\r\n]/.test(secret)) fail('SECRET_STORE_INPUT_INVALID', 'store input is invalid');
   return secret;
@@ -104,7 +124,8 @@ public static class OcwCredentialNative {
   [DllImport("Advapi32.dll")] public static extern void CredFree(IntPtr buffer);
 }
 '@
-  $target = 'OpenClawWorkbench:' + [string]$request.service + ':' + [string]$request.name
+  $target = [string]$request.target
+  if (-not $target) { throw 'credential operation failed' }
   $kind = [UInt32]1
   if ($request.op -eq 'set') {
     $blob = [System.Text.Encoding]::Unicode.GetBytes([string]$request.value)
@@ -163,7 +184,7 @@ export function createPowerShellCredentialBackend({ platform = process.platform,
   if (spawnImpl !== undefined && typeof spawnImpl !== 'function') fail('SECRET_STORE_BACKEND_INVALID', 'secret store backend is invalid');
   const executable = `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
   async function invoke(op, service, name, value) {
-    const input = JSON.stringify({ op, service, name, ...(value === undefined ? {} : { value }) });
+    const input = JSON.stringify({ op, target: encodeCredentialTarget(service, name), ...(value === undefined ? {} : { value }) });
     try {
       const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', POWERSHELL_SCRIPT];
       const result = runPowerShell
