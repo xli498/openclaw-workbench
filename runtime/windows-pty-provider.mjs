@@ -43,6 +43,23 @@ function powershellPath() {
   return path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 }
 
+function mergeEnvCaseInsensitive(base, extra) {
+  // Windows environment names are case-insensitive: merging a
+  // caller 'Path' over a base 'PATH' must leave exactly one entry,
+  // or the child sees a duplicated name and the winner depends on
+  // block order. The caller's entry wins and keeps its own casing;
+  // a second case-variant inside extra itself is resolved the same
+  // way, in insertion order.
+  const merged = { ...base };
+  for (const [key, val] of Object.entries(extra)) {
+    for (const existing of Object.keys(merged)) {
+      if (existing.toLowerCase() === key.toLowerCase()) delete merged[existing];
+    }
+    merged[key] = val;
+  }
+  return merged;
+}
+
 function safeEnv(value) {
   if (value === undefined) return {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new WindowsPtyProviderError('PTY_ENV_INVALID', 'PTY env must be an object');
@@ -86,7 +103,7 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       argv,
       cols: 80,
       rows: 24,
-      env: { PATH: process.env.PATH ?? '', ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}), ...extraEnv },
+      env: mergeEnvCaseInsensitive({ PATH: process.env.PATH ?? '', ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) }, extraEnv),
     }), 'utf8').toString('base64');
     const child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper, '-Payload', payload], {
       cwd: workdir,
@@ -133,10 +150,25 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
     const killTree = () => {
       if (!child.pid) return;
       try {
-        const kill = spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
+        // Bounded: an unbounded synchronous taskkill could itself
+        // hang the event loop past every JS-side timeout, so it gets
+        // a finite timeout and its result is saved for diagnostics
+        // instead of being discarded.
+        const kill = spawnSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true, timeout: 5000 });
         lastKillResult = { status: kill.status, error: kill.error ? String(kill.error.code ?? kill.error) : null, signal: kill.signal ?? null };
       } catch (error) { lastKillResult = { status: null, error: String(error), signal: null }; }
     };
+    // A write callback alone is not an error listener: if the helper
+    // ends early, a later write can surface as an unhandled stdin
+    // 'error' event instead of a controlled rejection. Record it and
+    // fail the session in a controlled way (only while the helper
+    // has not already exited -- after exit, close settlement owns
+    // the result and a stray stdin error must not overwrite it).
+    let stdinError = null;
+    child.stdin.on('error', (error) => {
+      stdinError = error;
+      if (!settled && exitCode === null) finish({ status: 'failed', error: { code: 'PTY_WRITE_FAILED', message: 'PTY stdin error' } });
+    });
     child.stdout.on('data', (chunk) => {
       const text = decoder.decode(chunk, { stream: true });
       if (text) onOutput({ stream: 'stdout', text });
@@ -174,10 +206,11 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       // helper exit, so a timed-out test could never show what the
       // helper had already printed (PTY_WAIT / PTY_CHILD_EXIT /
       // PTY_STAGE / PTY_PUMP_STATS). Callers log this before abort.
-      diagnostics: () => ({ stderr: stderrText, childExitCode, exitCode, settled, kill: lastKillResult }),
+      diagnostics: () => ({ stderr: stderrText, childExitCode, exitCode, settled, kill: lastKillResult, stdinError: stdinError ? String(stdinError.code ?? stdinError) : null }),
       write: async (input) => {
         if (typeof input !== 'string' || !input) throw new WindowsPtyProviderError('PTY_INPUT_INVALID', 'PTY input is invalid');
         if (child.stdin.destroyed) throw new WindowsPtyProviderError('PTY_CLOSED', 'PTY session is closed');
+        if (stdinError) throw new WindowsPtyProviderError('PTY_WRITE_FAILED', 'PTY write failed');
         await new Promise((resolve, reject) => child.stdin.write(input, (error) => (error ? reject(new WindowsPtyProviderError('PTY_WRITE_FAILED', 'PTY write failed')) : resolve())));
       },
       // Honest gap: no ConPTY resize channel exists in this slice.

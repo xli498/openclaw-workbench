@@ -65,6 +65,17 @@ try {
 
   $envBlock = $null
   if ($envPairs.Count -gt 0) {
+    # Windows environment names are case-insensitive and the block
+    # is conventionally sorted. The provider already collapses
+    # case-variant duplicates, but JSON property order is not a
+    # contract, so sort here by key in case-insensitive Unicode
+    # (ordinal) order: the block is then identical regardless of
+    # the caller's insertion order. Keys are ASCII-only by the
+    # validation above, so OrdinalIgnoreCase is exact here.
+    $envKeys = @($envPairs | ForEach-Object { $_.Substring(0, $_.IndexOf('=')) })
+    $envItems = [string[]]$envPairs
+    [Array]::Sort($envKeys, $envItems, [System.StringComparer]::OrdinalIgnoreCase)
+    $envPairs = $envItems
     $envText = ($envPairs | ForEach-Object { "$_`0" }) -join ''
     $envText += "`0"
     $envBlock = [System.Text.Encoding]::Unicode.GetBytes($envText)

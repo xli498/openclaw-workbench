@@ -105,7 +105,7 @@ test('Windows PTY ConPTY reports PowerShell available', { skip: SKIP_OFF_WINDOWS
 test('Windows PTY ConPTY spawns cmd, pumps output, and exits zero', { skip: SKIP_OFF_WINDOWS }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
-    const { handle, outputs, result } = await runConPty(root, ['cmd.exe', '/c', 'echo', 'hello-conpty']);
+    const { handle, outputs, result } = await runConPty(root, ['cmd.exe', '/d', '/c', 'echo', 'hello-conpty']);
     assert.deepEqual(handle.capabilities, { pty: true, input: true, incrementalOutput: true });
     assert.equal(result.status, 'exited', JSON.stringify(result));
     assert.equal(result.code, 0);
@@ -116,7 +116,7 @@ test('Windows PTY ConPTY spawns cmd, pumps output, and exits zero', { skip: SKIP
 test('Windows PTY ConPTY propagates a non-zero child exit as failed', { skip: SKIP_OFF_WINDOWS }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
-    const { result } = await runConPty(root, ['cmd.exe', '/c', 'exit', '42']);
+    const { result } = await runConPty(root, ['cmd.exe', '/d', '/c', 'exit', '42']);
     assert.equal(result.status, 'failed', JSON.stringify(result));
     assert.equal(result.error.code, 'PTY_FAILED');
     // The raw child code IS carried, as error.childExitCode, from the
@@ -133,7 +133,7 @@ test('Windows PTY ConPTY propagates a non-zero child exit as failed', { skip: SK
 test('Windows PTY ConPTY pumps input to a child reading a line', { skip: SKIP_OFF_WINDOWS }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
-    const { outputs, result } = await runConPty(root, ['cmd.exe', '/v:on', '/c', 'echo pty-ready-232 & set /p v= && echo got-!v!'], { writeInput: 'hello-input\r\n', readyPattern: /pty-ready-232/ });
+    const { outputs, result } = await runConPty(root, ['cmd.exe', '/d', '/v:on', '/c', 'echo pty-ready-232 & set /p v= && echo got-!v!'], { writeInput: 'hello-input\r\n', readyPattern: /pty-ready-232/ });
     assert.equal(result.status, 'exited', JSON.stringify(result));
     assert.match(outputs.join(''), /got-hello-input/);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -149,7 +149,7 @@ test('Windows PTY ConPTY cancel stops a long-running child', { skip: SKIP_OFF_WI
     const exited = new Promise((resolve) => { resolveExit = resolve; });
     const controller = new AbortController();
     const handle = await provider({
-      root, argv: ['cmd.exe', '/c', 'echo pty-ready-233 & ping -n 60 127.0.0.1'], cwd: '.', signal: controller.signal,
+      root, argv: ['cmd.exe', '/d', '/c', 'echo pty-ready-233 & ping -n 60 127.0.0.1'], cwd: '.', signal: controller.signal,
       onOutput: (value) => { outputs.push(value.text); },
       onExit: (result) => { exitedFlag = true; resolveExit(result); },
     });
@@ -171,6 +171,12 @@ test('Windows PTY ConPTY cancel stops a long-running child', { skip: SKIP_OFF_WI
     const result = await withTimeout(exited, 30_000, 'ConPTY child exit after cancel');
     assert.notEqual(result.status, 'exited');
     assert.match(outputs.join(''), /pty-ready-233/);
+    // CI-visible cancel accounting: the taskkill outcome and whether
+    // the helper actually exited, not just "cancel returned".
+    try {
+      const diag = handle.diagnostics?.();
+      if (diag) console.error(`PTY_CANCEL_DIAGNOSTIC: taskkill=${JSON.stringify(diag.kill)} helperExitCode=${diag.exitCode ?? 'none'}`);
+    } catch {}
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -182,8 +188,76 @@ test('Windows PTY ConPTY delivers trailing output before exit', { skip: SKIP_OFF
     // The marker must already be in outputs when onExit resolves.
     const fills = Array.from({ length: 100 }, (_, i) => `echo fill-${i}`);
     const command = [...fills, 'echo pty-tail-marker-9f3'].join(' & ');
-    const { outputs, result } = await runConPty(root, ['cmd.exe', '/c', command]);
+    const { outputs, result } = await runConPty(root, ['cmd.exe', '/d', '/c', command]);
     assert.equal(result.status, 'exited', JSON.stringify(result));
     assert.match(outputs.join(''), /pty-tail-marker-9f3/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('Windows PTY ConPTY write after helper ends fails in a controlled way', { skip: SKIP_OFF_WINDOWS }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
+  try {
+    // The write and the wait are inside the same timeout/abort/
+    // cleanup scope: a helper that already ended must produce a
+    // controlled PTY rejection, never an unhandled stdin error and
+    // never a leftover helper.
+    const provider = createWindowsPtyProvider();
+    const outputs = [];
+    let resolveExit;
+    const exited = new Promise((resolve) => { resolveExit = resolve; });
+    const controller = new AbortController();
+    const handle = await provider({
+      root, argv: ['cmd.exe', '/d', '/c', 'echo done-early'], cwd: '.', signal: controller.signal,
+      onOutput: (value) => { outputs.push(value.text); },
+      onExit: (result) => resolveExit(result),
+    });
+    let result;
+    try {
+      result = await withTimeout(exited, 30_000, 'ConPTY child exit');
+    } catch (error) {
+      controller.abort();
+      throw error;
+    }
+    assert.equal(result.status, 'exited', JSON.stringify(result));
+    assert.match(outputs.join(''), /done-early/);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await assert.rejects(
+      handle.write('late-input\r\n'),
+      (error) => error.code === 'PTY_CLOSED' || error.code === 'PTY_WRITE_FAILED',
+    );
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('Windows PTY ConPTY normalizes case-variant env and reads caller value', { skip: SKIP_OFF_WINDOWS }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
+  try {
+    // Caller 'Path' must collapse the base 'PATH' to exactly one
+    // entry with the caller's value; with both present, cmd would
+    // expand the base PATH instead. Keys are deliberately given out
+    // of order (ZEBRA before ALPHA); the helper sorts the block, so
+    // the block does not depend on insertion order (that sorting is
+    // internal -- what the child can observe is the collapsed value).
+    const provider = createWindowsPtyProvider({ env: { ZEBRA: 'z-9', Path: 'C:\\pty-custom-path-9', ALPHA: 'a-9' } });
+    const outputs = [];
+    let resolveExit;
+    const exited = new Promise((resolve) => { resolveExit = resolve; });
+    const controller = new AbortController();
+    await provider({
+      root, argv: ['cmd.exe', '/d', '/c', 'echo %Path% & echo %ZEBRA% & echo %ALPHA%'], cwd: '.', signal: controller.signal,
+      onOutput: (value) => { outputs.push(value.text); },
+      onExit: (result) => resolveExit(result),
+    });
+    let result;
+    try {
+      result = await withTimeout(exited, 30_000, 'ConPTY child exit');
+    } catch (error) {
+      controller.abort();
+      throw error;
+    }
+    assert.equal(result.status, 'exited', JSON.stringify(result));
+    const joined = outputs.join('');
+    assert.match(joined, /pty-custom-path-9/);
+    assert.match(joined, /z-9/);
+    assert.match(joined, /a-9/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
