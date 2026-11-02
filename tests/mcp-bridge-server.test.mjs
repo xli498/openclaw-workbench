@@ -136,6 +136,53 @@ test('MCP bridge expires an idle SSE session and stops without retaining the str
   }
 });
 
+test('MCP bridge serves requests on an IPv6 loopback host and rejects non-loopback hosts on every entry point', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-bridge-ipv6-'));
+  try {
+    // Non-loopback hosts are rejected at construction, directly and
+    // through the control-plane entry point that forwards host options.
+    for (const host of ['0.0.0.0', '192.168.1.1', 'example.com', '::']) {
+      assert.throws(() => createMcpBridgeServer({ root, token: TOKEN, host, registry: createToolRegistry({ root }) }), { code: 'MCP_BIND_INVALID' });
+    }
+    const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: 'approval-token-012345' });
+    const controlAddress = await app.listen();
+    try {
+      assert.throws(() => app.createMcpBridge({ token: TOKEN, host: '0.0.0.0' }), { code: 'MCP_BIND_INVALID' });
+    } finally {
+      await app.close();
+    }
+    void controlAddress;
+
+    // IPv6 request path: before the fix, handle() built an unbracketed
+    // `http://::1` base URL outside any try, so every request on a ::1
+    // bridge threw an unhandled rejection instead of being answered.
+    const bridge = createMcpBridgeServer({ root, token: TOKEN, host: '::1', registry: createToolRegistry({ root }) });
+    let address;
+    try {
+      address = await bridge.start();
+    } catch (error) {
+      if (['EADDRNOTAVAIL', 'ENODEV', 'EAFNOSUPPORT', 'EINVAL'].includes(error.code)) return t.skip('IPv6 loopback unavailable in this environment');
+      throw error;
+    }
+    try {
+      assert.match(address.address, /:/);
+      const response = await fetch(`http://[${address.address}]:${address.port}/mcp`, {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'initialize-v6', method: 'initialize', params: { protocolVersion: VERSION, capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } } }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.result.protocolVersion, VERSION);
+      assert.match(response.headers.get('mcp-session-id'), /^[!-~]+$/);
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('MCP bridge shares the control-plane proposal store so a Code proposal remains independently approvable', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-bridge-control-'));
   const approvalToken = 'approval-token-012345';

@@ -89,6 +89,7 @@ export function createBridgeTunnelAdapter({
   let lastError = null;
   let outputBuffer = '';
   let startPromise = null;
+  let stopPromise = null;
   let urlWaiter = null;
 
   function publicState() {
@@ -137,44 +138,80 @@ export function createBridgeTunnelAdapter({
   }
   async function stopProcess() {
     const current = child;
-    child = null;
     if (!current) return;
-    await new Promise((resolve) => {
+    // Already exited (real child processes report exitCode); drop the
+    // handle without waiting on an exit event that will never re-fire.
+    if (current.exitCode !== null && current.exitCode !== undefined) { child = null; return; }
+    await new Promise((resolve, reject) => {
       let settled = false;
-      const done = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
-      const timer = setTimeout(done, stopTimeoutMs);
+      const clearCurrent = () => { if (child === current) child = null; };
+      const done = () => { if (!settled) { settled = true; clearTimeout(timer); clearCurrent(); resolve(); } };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        // Timeout is a failure, not a completed stop: keep the handle so
+        // a later stop() can retry the kill, and drop it only if the
+        // process exits on its own afterwards.
+        current.once?.('exit', clearCurrent);
+        current.once?.('close', clearCurrent);
+        reject(new BridgeTunnelError('TUNNEL_STOP_TIMEOUT', 'tunnel process did not exit within the stop timeout'));
+      }, stopTimeoutMs);
       current.once?.('exit', done);
       current.once?.('close', done);
-      try { current.kill?.(); } catch { done(); }
+      try { current.kill?.(); }
+      catch (error) {
+        if (!settled) { settled = true; clearTimeout(timer); reject(genericError(error)); }
+      }
     });
   }
   async function start() {
     if (state === 'ready') return Object.freeze({ ...publicState(), endpoint: publicUrl ? `${publicUrl}/${routePath}` : null });
-    if (startPromise) return startPromise;
+    // Busy is decided BEFORE any promise is stored: a busy rejection
+    // must never linger in startPromise and poison later starts.
+    if (state === 'starting' || state === 'stopping' || stopPromise || startPromise) fail('TUNNEL_BUSY', 'tunnel lifecycle is busy');
     startPromise = (async () => {
-      if (state === 'starting' || state === 'stopping') fail('TUNNEL_BUSY', 'tunnel lifecycle is busy');
-      publicUrl = null;
-      outputBuffer = '';
-      routePath = randomSecretPath();
-      const thisGeneration = ++generation;
-      setState('starting');
       try {
+        // A previous stop that timed out leaves its child handle behind
+        // for a retry; never start a second process over it.
+        if (child) fail('TUNNEL_BUSY', 'previous tunnel process has not exited');
+        publicUrl = null;
+        outputBuffer = '';
+        routePath = randomSecretPath();
+        const thisGeneration = ++generation;
+        setState('starting');
         child = spawnImpl(command, currentArgs(), {
           shell: false,
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe'],
           env: { PATH: process.env.PATH ?? '', OCW_BRIDGE_BEARER: token },
         });
+        const startedChild = child;
         child.stdout?.on?.('data', consumeOutput);
         child.stderr?.on?.('data', consumeOutput);
         child.once?.('error', (error) => { if (thisGeneration === generation) { lastError = genericError(error); setState('failed', error); } });
+        // Continuous monitoring after ready: an unexpected exit withdraws
+        // the endpoint and fails the adapter instead of leaving a stale
+        // ready state. An exit while starting fails fast instead of
+        // waiting out the full URL timeout.
+        child.once?.('exit', () => {
+          if (thisGeneration !== generation) return;
+          if (state === 'ready') {
+            if (child === startedChild) child = null;
+            publicUrl = null;
+            setState('failed', new BridgeTunnelError('TUNNEL_PROCESS_EXITED', 'tunnel process exited unexpectedly'));
+          } else if (state === 'starting') {
+            urlWaiter?.reject(new BridgeTunnelError('TUNNEL_PROCESS_FAILED', 'tunnel process exited before reporting a URL'));
+            urlWaiter = null;
+          }
+        });
         await waitForUrl(startTimeoutMs, thisGeneration);
         if (thisGeneration !== generation || !child) fail('TUNNEL_RESET', 'tunnel was reset');
         startedAt = new Date(clock()).toISOString();
         setState('ready');
         return Object.freeze({ ...publicState(), endpoint: `${publicUrl}/${routePath}` });
       } catch (error) {
-        await stopProcess();
+        try { await stopProcess(); }
+        catch (stopError) { publicUrl = null; setState('failed', stopError); throw genericError(stopError); }
         publicUrl = null;
         setState('failed', error);
         throw genericError(error);
@@ -183,16 +220,34 @@ export function createBridgeTunnelAdapter({
     return startPromise;
   }
   async function stop() {
-    ++generation;
-    urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
-    urlWaiter = null;
-    if (state === 'idle') return publicState();
-    setState('stopping');
-    await stopProcess();
-    publicUrl = null;
-    startedAt = null;
-    setState('idle');
-    return publicState();
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      try {
+        ++generation;
+        urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
+        urlWaiter = null;
+        if (state === 'idle' && !child) return publicState();
+        // Serialize with an in-flight start: stop runs synchronously
+        // into 'stopping' first, so a concurrent start() sees busy
+        // instead of racing the start's failure handling.
+        const pendingStart = startPromise;
+        if (pendingStart) {
+          setState('stopping');
+          try { await pendingStart; } catch { /* a stop-induced start failure is expected */ }
+        }
+        if (state === 'idle' && !child) return publicState();
+        setState('stopping');
+        await stopProcess();
+        publicUrl = null;
+        startedAt = null;
+        setState('idle');
+        return publicState();
+      } catch (error) {
+        setState('failed', error);
+        throw genericError(error);
+      } finally { stopPromise = null; }
+    })();
+    return stopPromise;
   }
   async function reset() {
     await stop();
