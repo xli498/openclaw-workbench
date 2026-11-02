@@ -173,7 +173,13 @@ public static class OcwConPty
   function New-InheritPipe {
     $sa = New-Object OcwConPty+SecurityAttributes
     $sa.nLength = [System.Runtime.InteropServices.Marshal]::SizeOf($sa)
-    $sa.bInheritHandle = $true
+    # MS ConPTY sample order: pipes are created NON-inheritable (NULL
+    # security attributes in the sample). The pseudoconsole handle
+    # travels to the child through the attribute list, not through
+    # ordinary handle inheritance, so inheritable pipes here would only
+    # let the child or its descendants hold extra pipe ends (which also
+    # blocks EOF on the output reader).
+    $sa.bInheritHandle = $false
     $read = [IntPtr]::Zero
     $write = [IntPtr]::Zero
     if (-not [OcwConPty]::CreatePipe([ref]$read, [ref]$write, [ref]$sa, 0)) { throw 'CreatePipe failed' }
@@ -194,10 +200,13 @@ public static class OcwConPty
   $attrList = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($attrSize)
   try {
     if (-not [OcwConPty]::InitializeProcThreadAttributeList($attrList, 1, 0, [ref]$attrSize)) { throw 'InitializeProcThreadAttributeList failed' }
-    $pcPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
-    [System.Runtime.InteropServices.Marshal]::WriteIntPtr($pcPtr, $hPC)
-    try {
-      if (-not [OcwConPty]::UpdateProcThreadAttribute($attrList, 0, [OcwConPty]::ProcThreadAttributePseudoConsole, $pcPtr, [IntPtr][IntPtr]::Size, [IntPtr]::Zero, [IntPtr]::Zero)) { throw 'UpdateProcThreadAttribute failed' }
+    # PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the pseudoconsole
+    # handle itself, not a pointer to it: the P/Invoke lpValue is
+    # already an IntPtr, so wrapping $hPC in an extra AllocHGlobal
+    # pointer (the previous code) hands CreateProcess an invalid
+    # pseudoconsole value, which the client then fails to initialize
+    # with (historically 0xC0000142). Pass $hPC directly.
+    if (-not [OcwConPty]::UpdateProcThreadAttribute($attrList, 0, [OcwConPty]::ProcThreadAttributePseudoConsole, $hPC, [IntPtr][IntPtr]::Size, [IntPtr]::Zero, [IntPtr]::Zero)) { throw 'UpdateProcThreadAttribute failed' }
       $startup = New-Object OcwConPty+StartupInfoEx
       # cb MUST be sizeof(STARTUPINFOEX), not sizeof(STARTUPINFO):
       # Microsoft's STARTUPINFOEX docs state this explicitly ("Be sure
@@ -225,11 +234,12 @@ public static class OcwConPty
       $procInfo = New-Object OcwConPty+ProcessInformation
       $flags = [OcwConPty]::ExtendedStartupinfoPresent -bor [OcwConPty]::CreateUnicodeEnvironment
       $cmd = New-Object System.Text.StringBuilder($commandLine)
-      # bInheritHandles must be TRUE: the pseudoconsole handle travels to
-      # the child through the attribute list, which is only applied to
-      # inheritable handles. FALSE leaves the child without a console
-      # (or fails CreateProcess outright), which is the classic ConPTY
-      # P/Invoke failure mode.
+      # bInheritHandles is FALSE: the pseudoconsole handle travels to
+      # the child through the attribute list, which is not ordinary
+      # handle inheritance; the MS ConPTY sample creates the client
+      # with bInheritHandles = FALSE and non-inheritable pipes.
+      # (An earlier version of this script claimed TRUE was required;
+      # that conflated the attribute-list mechanism with inheritance.)
       # Application-name resolution: a bare module name (no directory
       # separator) relies on CreateProcess's own search, which fails in
       # this hosted context -- proven by failure-path probes on Windows
@@ -255,13 +265,23 @@ public static class OcwConPty
           } catch { }
         }
       }
-      if (-not [OcwConPty]::CreateProcess($appName, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) {
+      if (-not [OcwConPty]::CreateProcess($appName, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, $flags, $envBlock, $cwd, [ref]$startup, [ref]$procInfo)) {
         $win32 = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw "CreateProcess failed (Win32 $win32, cb=$($startup.StartupInfo.cb))"
       }
-    } finally {
-      [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pcPtr)
-    }
+      # MS ConPTY sample order: bInheritHandles is FALSE (the
+      # pseudoconsole travels via the attribute list, not inheritance)
+      # and, once CreateProcess succeeds, the helper immediately
+      # releases the ConPTY-side pipe ends it handed to
+      # CreatePseudoConsole ($inputPipe.Read, $outputPipe.Write). The
+      # host ends ($inputPipe.Write, $outputPipe.Read) stay open below.
+      # Holding the ConPTY-side ends would keep the output reader from
+      # ever seeing EOF. Zeroed so the cleanup below cannot close them
+      # a second time.
+      [void][OcwConPty]::CloseHandle($inputPipe.Read)
+      [void][OcwConPty]::CloseHandle($outputPipe.Write)
+      $inputPipe.Read = [IntPtr]::Zero
+      $outputPipe.Write = [IntPtr]::Zero
   } finally {
     [OcwConPty]::DeleteProcThreadAttributeList($attrList)
     [System.Runtime.InteropServices.Marshal]::FreeHGlobal($attrList)
@@ -271,41 +291,71 @@ public static class OcwConPty
   # CreateProcess is not the sample order and risks tearing the console
   # session down early. It is closed in the cleanup below.
 
-  $outputStream = New-Object System.IO.FileStream((New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($outputPipe.Read, $false)), [System.IO.FileAccess]::Read)
-  $inputStream = New-Object System.IO.FileStream((New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($inputPipe.Write, $false)), [System.IO.FileAccess]::Write)
+  # Host ends are owned by exactly one FileStream each
+  # (ownsHandle=$true): FileStream.Close then really closes the
+  # underlying handle. With $false the cleanup below could not rely on
+  # Close to release anything, and a second owner could keep the pipe
+  # open past EOF. The ConPTY-side ends are not wrapped here at all.
+  $outputStream = New-Object System.IO.FileStream((New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($outputPipe.Read, $true)), [System.IO.FileAccess]::Read)
+  $inputStream = New-Object System.IO.FileStream((New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($inputPipe.Write, $true)), [System.IO.FileAccess]::Write)
   $consoleOut = [Console]::OpenStandardOutput()
   $consoleIn = [Console]::OpenStandardInput()
 
+  # Pump diagnostics, shared with both runspaces. The input pump used
+  # to swallow every exception silently, so a stuck or failed input
+  # path was indistinguishable from a child that never read input.
+  $pumpStats = [hashtable]::Synchronized(@{
+    inputRead = 0; inputWritten = 0; inputError = ''
+    outputRead = 0; outputWritten = 0; outputError = ''
+  })
   $outputPump = [powershell]::Create().AddScript({
-    param($from, $to)
+    param($from, $to, $stats)
     $buffer = New-Object byte[] 65536
     try {
       while ($true) {
         $n = $from.Read($buffer, 0, $buffer.Length)
         if ($n -le 0) { break }
+        $stats.outputRead += $n
         $to.Write($buffer, 0, $n)
         $to.Flush()
+        $stats.outputWritten += $n
       }
-    } catch { }
-  }).AddParameters(@{ from = $outputStream; to = $consoleOut })
+    } catch {
+      $stats.outputError = $_.Exception.GetType().FullName
+      [Console]::Error.WriteLine("PTY_OUTPUT_PUMP_ERROR: class=$($stats.outputError)")
+    }
+  }).AddParameters(@{ from = $outputStream; to = $consoleOut; stats = $pumpStats })
   $inputPump = [powershell]::Create().AddScript({
-    param($from, $to)
+    param($from, $to, $stats)
     $buffer = New-Object byte[] 65536
     try {
       while ($true) {
         $n = $from.Read($buffer, 0, $buffer.Length)
         if ($n -le 0) { break }
+        $stats.inputRead += $n
         $to.Write($buffer, 0, $n)
         $to.Flush()
+        $stats.inputWritten += $n
       }
-    } catch { }
-  }).AddParameters(@{ from = $consoleIn; to = $inputStream })
+    } catch {
+      $stats.inputError = $_.Exception.GetType().FullName
+      [Console]::Error.WriteLine("PTY_INPUT_PUMP_ERROR: class=$($stats.inputError)")
+    }
+  }).AddParameters(@{ from = $consoleIn; to = $inputStream; stats = $pumpStats })
   $outputJob = $outputPump.BeginInvoke()
   $inputJob = $inputPump.BeginInvoke()
   try {
-    [void][OcwConPty]::WaitForSingleObject($procInfo.hProcess, [OcwConPty]::WaitInfinite)
-    $exitCode = 0
+    $waitResult = [OcwConPty]::WaitForSingleObject($procInfo.hProcess, [OcwConPty]::WaitInfinite)
+    # Read the code as [uint32]: GetExitCodeProcess returns a DWORD,
+    # and a child NTSTATUS (>= 2^31) must survive the read instead of
+    # crashing an [int] cast. The raw code is reported on stderr
+    # BEFORE entering the finally block below, so a later cleanup
+    # failure cannot be mistaken for the child's own exit code; the
+    # provider carries it as error.childExitCode (only when received)
+    # while the helper's own exit stays normalized to 0/1.
+    [uint32]$exitCode = 0
     if (-not [OcwConPty]::GetExitCodeProcess($procInfo.hProcess, [ref]$exitCode)) { throw 'GetExitCodeProcess failed' }
+    [Console]::Error.WriteLine(('PTY_CHILD_EXIT: decimal={0}; hex=0x{0:X8}' -f $exitCode))
   } finally {
     # Close the streams BEFORE stopping the pumps: a pump blocked in
     # a synchronous Read is only unblocked when its stream is closed
@@ -322,8 +372,12 @@ public static class OcwConPty
     try { $inputPump.Dispose() } catch { }
     [void][OcwConPty]::CloseHandle($procInfo.hProcess)
     [OcwConPty]::ClosePseudoConsole($hPC)
-    [void][OcwConPty]::CloseHandle($inputPipe.Read)
-    [void][OcwConPty]::CloseHandle($outputPipe.Write)
+    # ConPTY-side ends were already closed (and zeroed) right after a
+    # successful CreateProcess; close them here only if that step did
+    # not run (CreateProcess failure path), never twice.
+    if ($inputPipe.Read -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($inputPipe.Read); $inputPipe.Read = [IntPtr]::Zero }
+    if ($outputPipe.Write -ne [IntPtr]::Zero) { [void][OcwConPty]::CloseHandle($outputPipe.Write); $outputPipe.Write = [IntPtr]::Zero }
+    [Console]::Error.WriteLine(('PTY_PUMP_STATS: inputRead={0}; inputWritten={1}; inputError={2}; outputRead={3}; outputWritten={4}; outputError={5}' -f $pumpStats.inputRead, $pumpStats.inputWritten, $pumpStats.inputError, $pumpStats.outputRead, $pumpStats.outputWritten, $pumpStats.outputError))
   }
   # GetExitCodeProcess returns a DWORD; a child exit code >= 2^31 is an
   # NTSTATUS value, and PowerShell's [int] cast of such a uint throws

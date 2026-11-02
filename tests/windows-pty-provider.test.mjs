@@ -44,7 +44,7 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function runConPty(root, argv, { writeInput = null } = {}) {
+async function runConPty(root, argv, { writeInput = null, readyPattern = null } = {}) {
   const provider = createWindowsPtyProvider();
   const outputs = [];
   let resolveExit;
@@ -55,7 +55,23 @@ async function runConPty(root, argv, { writeInput = null } = {}) {
     onOutput: (value) => { outputs.push(value.text); },
     onExit: (result) => resolveExit(result),
   });
-  if (writeInput !== null) await handle.write(writeInput);
+  if (writeInput !== null) {
+    if (readyPattern) {
+      // A write-callback success only proves the bytes reached the
+      // helper's stdin, not that the child consumed them. Wait for the
+      // child's own ready marker first, so a missing echo cannot be
+      // blamed on (or hidden by) write timing.
+      const deadline = Date.now() + 30_000;
+      while (!readyPattern.test(outputs.join(''))) {
+        if (Date.now() > deadline) {
+          controller.abort();
+          throw new Error('timed out waiting for ConPTY child ready marker');
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    await handle.write(writeInput);
+  }
   let result;
   try {
     result = await withTimeout(exited, 60_000, 'ConPTY child exit');
@@ -103,7 +119,7 @@ test('Windows PTY ConPTY propagates a non-zero child exit as failed', { skip: SK
 test('Windows PTY ConPTY pumps input to a child reading a line', { skip: SKIP_OFF_WINDOWS }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
-    const { outputs, result } = await runConPty(root, ['cmd.exe', '/v:on', '/c', 'set /p v= && echo got-!v!'], { writeInput: 'hello-input\r\n' });
+    const { outputs, result } = await runConPty(root, ['cmd.exe', '/v:on', '/c', 'echo pty-ready-232 & set /p v= && echo got-!v!'], { writeInput: 'hello-input\r\n', readyPattern: /pty-ready-232/ });
     assert.equal(result.status, 'exited', JSON.stringify(result));
     assert.match(outputs.join(''), /got-hello-input/);
   } finally { await rm(root, { recursive: true, force: true }); }

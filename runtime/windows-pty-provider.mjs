@@ -102,9 +102,22 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
     // capturing bounded stderr here is safe and makes the next Windows
     // CI failure self-diagnosing instead of a bare PTY_FAILED code.
     let stderrText = '';
+    // Raw child exit code reported by the helper on stderr as
+    // PTY_CHILD_EXIT (before its own cleanup, so it is the child's
+    // code, not a cleanup artefact). Carried on the failed result as
+    // error.childExitCode ONLY when actually received; the top-level
+    // result.code contract is unchanged (0 on exited, absent on
+    // failed) and the helper's own exit stays normalized to 0/1.
+    let childExitCode = null;
+    let stderrParseBuffer = '';
     child.stderr.on('data', (chunk) => {
-      stderrText += stderrDecoder.decode(chunk, { stream: true });
+      const text = stderrDecoder.decode(chunk, { stream: true });
+      stderrText += text;
       if (stderrText.length > 4096) stderrText = stderrText.slice(0, 4096);
+      stderrParseBuffer += text;
+      const match = /PTY_CHILD_EXIT: decimal=(\d+); hex=0x[0-9A-Fa-f]+/.exec(stderrParseBuffer);
+      if (match) childExitCode = Number(match[1]);
+      if (stderrParseBuffer.length > 512) stderrParseBuffer = stderrParseBuffer.slice(-512);
     });
     const finish = (result) => {
       if (settled) return;
@@ -124,7 +137,7 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       const tail = decoder.decode();
       if (tail) onOutput({ stream: 'stdout', text: tail });
       if (code === 0) finish({ status: 'exited', code: 0 });
-      else finish({ status: 'failed', error: { code: 'PTY_FAILED', message: stderrText.trim() || 'PTY failed' } });
+      else finish({ status: 'failed', error: { code: 'PTY_FAILED', message: stderrText.trim() || 'PTY failed', ...(childExitCode !== null ? { childExitCode } : {}) } });
     });
     if (signal?.aborted) killTree();
     else signal?.addEventListener('abort', killTree, { once: true });
