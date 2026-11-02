@@ -142,9 +142,26 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       if (text) onOutput({ stream: 'stdout', text });
     });
     child.once('error', () => finish({ status: 'failed', error: { code: 'PTY_UNAVAILABLE' } }));
-    child.once('exit', (code) => {
-      const tail = decoder.decode();
-      if (tail) onOutput({ stream: 'stdout', text: tail });
+    // Settle on 'close', not on 'exit': 'exit' fires when the helper
+    // process ends, but stdio data can still be in flight after it.
+    // Settling on 'exit' used to flush only the stdout decoder and
+    // call onExit while trailing output or diagnostics were still
+    // undelivered. 'close' fires after all stdio is closed, so both
+    // decoders are flushed there and settlement sees everything.
+    // (The 'error' path above keeps its immediate finish: a spawn
+    // error has no stdio to wait for.)
+    let exitCode = null;
+    child.once('exit', (code) => { exitCode = code; });
+    child.once('close', (code) => {
+      const outTail = decoder.decode();
+      if (outTail) onOutput({ stream: 'stdout', text: outTail });
+      const errTail = stderrDecoder.decode();
+      if (errTail) {
+        stderrText += errTail;
+        if (stderrText.length > 4096) stderrText = stderrText.slice(0, 4096);
+        const tailMatch = /PTY_CHILD_EXIT: decimal=(\d+); hex=0x[0-9A-Fa-f]+/.exec(errTail);
+        if (tailMatch) childExitCode = Number(tailMatch[1]);
+      }
       if (code === 0) finish({ status: 'exited', code: 0 });
       else finish({ status: 'failed', error: { code: 'PTY_FAILED', message: stderrText.trim() || 'PTY failed', ...(childExitCode !== null ? { childExitCode } : {}) } });
     });
@@ -157,7 +174,7 @@ export function createWindowsPtyProvider({ env, helperPath, powershellCommand } 
       // helper exit, so a timed-out test could never show what the
       // helper had already printed (PTY_WAIT / PTY_CHILD_EXIT /
       // PTY_STAGE / PTY_PUMP_STATS). Callers log this before abort.
-      diagnostics: () => ({ stderr: stderrText, childExitCode, settled, kill: lastKillResult }),
+      diagnostics: () => ({ stderr: stderrText, childExitCode, exitCode, settled, kill: lastKillResult }),
       write: async (input) => {
         if (typeof input !== 'string' || !input) throw new WindowsPtyProviderError('PTY_INPUT_INVALID', 'PTY input is invalid');
         if (child.stdin.destroyed) throw new WindowsPtyProviderError('PTY_CLOSED', 'PTY session is closed');

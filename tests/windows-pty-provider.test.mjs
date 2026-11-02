@@ -119,11 +119,14 @@ test('Windows PTY ConPTY propagates a non-zero child exit as failed', { skip: SK
     const { result } = await runConPty(root, ['cmd.exe', '/c', 'exit', '42']);
     assert.equal(result.status, 'failed', JSON.stringify(result));
     assert.equal(result.error.code, 'PTY_FAILED');
-    // Known contract gap, shared with the POSIX provider: the child's
-    // numeric exit code is not carried on the failed result (only the
-    // PTY_FAILED code is). Asserting the current contract, not the
-    // wished-for one; see docs/05.
-    assert.equal(result.code, undefined);
+    // The raw child code IS carried, as error.childExitCode, from the
+    // helper's PTY_CHILD_EXIT diagnostic (42 here, before the
+    // helper's own 0/1 normalization). Accepting any PTY_FAILED
+    // would let a startup failure masquerade as the exit-42 path, so
+    // the exact code is asserted. The top-level result.code stays
+    // absent on failed results (the shared provider contract); only
+    // the diagnostic field carries the number.
+    assert.equal(result.error.childExitCode, 42);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -140,18 +143,47 @@ test('Windows PTY ConPTY cancel stops a long-running child', { skip: SKIP_OFF_WI
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
     const provider = createWindowsPtyProvider();
+    const outputs = [];
     let resolveExit;
+    let exitedFlag = false;
     const exited = new Promise((resolve) => { resolveExit = resolve; });
     const controller = new AbortController();
     const handle = await provider({
-      root, argv: ['cmd.exe', '/c', 'ping', '-n', '60', '127.0.0.1'], cwd: '.', signal: controller.signal,
-      onOutput: () => {},
-      onExit: (result) => resolveExit(result),
+      root, argv: ['cmd.exe', '/c', 'echo pty-ready-233 & ping -n 60 127.0.0.1'], cwd: '.', signal: controller.signal,
+      onOutput: (value) => { outputs.push(value.text); },
+      onExit: (result) => { exitedFlag = true; resolveExit(result); },
     });
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    // Cancel must be tested against a child that has provably
+    // STARTED, not one that merely has not exited yet: without the
+    // ready marker, an initialization failure would also satisfy
+    // "not exited" and the test would pass vacuously.
+    const deadline = Date.now() + 30_000;
+    while (!/pty-ready-233/.test(outputs.join(''))) {
+      if (Date.now() > deadline) {
+        controller.abort();
+        throw new Error('timed out waiting for ConPTY child ready marker');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(exitedFlag, false, 'child must not have exited before cancel');
     controller.abort();
     await handle.cancel();
     const result = await withTimeout(exited, 30_000, 'ConPTY child exit after cancel');
     assert.notEqual(result.status, 'exited');
+    assert.match(outputs.join(''), /pty-ready-233/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('Windows PTY ConPTY delivers trailing output before exit', { skip: SKIP_OFF_WINDOWS }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
+  try {
+    // A large body plus a unique final marker: settling on helper
+    // 'exit' instead of stdio 'close' risks losing exactly this tail.
+    // The marker must already be in outputs when onExit resolves.
+    const fills = Array.from({ length: 100 }, (_, i) => `echo fill-${i}`);
+    const command = [...fills, 'echo pty-tail-marker-9f3'].join(' & ');
+    const { outputs, result } = await runConPty(root, ['cmd.exe', '/c', command]);
+    assert.equal(result.status, 'exited', JSON.stringify(result));
+    assert.match(outputs.join(''), /pty-tail-marker-9f3/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
