@@ -285,14 +285,19 @@ test('共享同一 keychain 引用的待处理模型提案不会互相清理密�
     assert.equal(cancelledFirst.body.secretCleanup, 'retained');
     assert.equal(values.has('workbench.model.shared'), true);
 
+    // wb10 #56 Q3 ("unknown -> retained" convergence): even the last
+    // same-server referrer no longer auto-deletes, because same-server
+    // gates cannot prove exclusive creation across workspaces (another
+    // workspace's reference is invisible here). Manual deletion via
+    // DELETE /v1/secrets remains the deletion path.
     const cancelledSecond = await request(address, `/v1/models/${second.action.id}/cancel`, {
       method: 'POST',
       headers: { 'x-approval-token': 'approve-token-012345' },
       body: JSON.stringify({ actionHash: second.action.actionHash }),
     });
     assert.equal(cancelledSecond.status, 200);
-    assert.equal(cancelledSecond.body.secretCleanup, 'deleted');
-    assert.equal(values.has('workbench.model.shared'), false);
+    assert.equal(cancelledSecond.body.secretCleanup, 'retained');
+    assert.equal(values.has('workbench.model.shared'), true);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
@@ -400,19 +405,50 @@ test('Q24-5: 跨工作区共享的密钥在本工作区提案取消时保留', a
 test('Q24-5: 并发新引用在清理检查前登记时清理保留', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-secret-concurrent-ref-'));
   const values = new Map();
-  const secretStore = { async set(name, value) { values.set(name, value); }, async get(name) { return values.get(name) ?? null; }, async has(name) { return values.has(name); }, async delete(name) { return values.delete(name); } };
+  // wb10 #56 Q3: the old version of this test only fired one HTTP
+  // request before the other, which does not guarantee which request
+  // takes the server's secret lock first. This version fixes the lock
+  // order with a barrier: the second proposal's attribution snapshot
+  // (which runs inside the secret lock and calls backend `has`) blocks
+  // until the test releases it, so the cancel provably queues behind
+  // the snapshot instead of racing it.
+  let releaseSnapshot;
+  const snapshotGate = new Promise((resolve) => { releaseSnapshot = resolve; });
+  let snapshotEntered;
+  const snapshotEnteredPromise = new Promise((resolve) => { snapshotEntered = resolve; });
+  let gateArmed = false;
+  let gateUsed = false;
+  const secretStore = {
+    async set(name, value) { values.set(name, value); },
+    async get(name) { return values.get(name) ?? null; },
+    async has(name) {
+      if (gateArmed && !gateUsed && name === 'workbench.model.concurrent') {
+        gateUsed = true;
+        snapshotEntered();
+        await snapshotGate;
+      }
+      return values.has(name);
+    },
+    async delete(name) { return values.delete(name); },
+  };
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore });
   const address = await app.listen();
   try {
     assert.equal((await saveSecret(address, 'workbench.model.concurrent', 'concurrent-secret')).status, 200);
     const first = (await createModelProposal(address, 'concurrent', 'concurrent-first', 'workbench.model.concurrent')).body.proposal;
-    // Fire the new reference first, then the cancel, without awaiting
-    // either: the shared secret lock serializes the attribution
-    // snapshot ahead of the cleanup check, so cleanup must retain.
-    const [created, cancelled] = await Promise.all([
-      createModelProposal(address, 'concurrent', 'concurrent-second', 'workbench.model.concurrent'),
-      cancelModelProposal(address, first),
-    ]);
+    gateArmed = true;
+    const createdPromise = createModelProposal(address, 'concurrent', 'concurrent-second', 'workbench.model.concurrent');
+    await snapshotEnteredPromise;
+    const cancelledPromise = cancelModelProposal(address, first);
+    // The cancel cannot resolve while the snapshot holds the lock:
+    // it must still be waiting after a scheduling delay, proving the
+    // order is snapshot-before-cleanup rather than fire-order luck.
+    let cancelState = 'waiting';
+    cancelledPromise.then(() => { cancelState = 'resolved'; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(cancelState, 'waiting');
+    releaseSnapshot();
+    const [created, cancelled] = await Promise.all([createdPromise, cancelledPromise]);
     assert.equal(created.status, 201);
     assert.equal(cancelled.status, 200);
     assert.equal(cancelled.body.secretCleanup, 'retained');
@@ -420,14 +456,15 @@ test('Q24-5: 并发新引用在清理检查前登记时清理保留', async () =
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-test('Q24-5: 清理后端失败时不误删且报告 failed', async () => {
+test('Q24-5: 自动清理停用后取消提案保留密钥且不调用后端删除', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-secret-cleanup-fail-'));
   const values = new Map();
+  let deleteCalled = false;
   const secretStore = {
     async set(name, value) { values.set(name, value); },
     async get(name) { return values.get(name) ?? null; },
     async has(name) { return values.has(name); },
-    async delete() { throw new SecretStoreError('SECRET_STORE_BACKEND_FAILED', 'secret store operation failed'); },
+    async delete() { deleteCalled = true; throw new SecretStoreError('SECRET_STORE_BACKEND_FAILED', 'secret store operation failed'); },
   };
   const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore });
   const address = await app.listen();
@@ -436,7 +473,11 @@ test('Q24-5: 清理后端失败时不误删且报告 failed', async () => {
     const proposal = (await createModelProposal(address, 'cleanfail', 'cleanfail', 'workbench.model.cleanfail')).body.proposal;
     const cancelled = await cancelModelProposal(address, proposal);
     assert.equal(cancelled.status, 200);
-    assert.equal(cancelled.body.secretCleanup, 'failed');
+    // wb10 #56 Q3: automatic cleanup is disabled ("unknown ->
+    // retained"), so cancel never attempts a backend delete at all --
+    // a throwing backend is irrelevant, and the secret stays.
+    assert.equal(cancelled.body.secretCleanup, 'retained');
+    assert.equal(deleteCalled, false);
     assert.equal(values.has('workbench.model.cleanfail'), true);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });
@@ -473,4 +514,93 @@ test('Q24-5: 无归属字段的旧提案取消时保留密钥', async () => {
     assert.equal(cancelled.body.secretCleanup, 'retained');
     assert.equal(values.has('workbench.model.legacy'), true);
   } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('模型提案取消时删除后重建的密钥保留新值', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-secret-delete-recreate-'));
+  const values = new Map();
+  const secretStore = { async set(name, value) { values.set(name, value); }, async get(name) { return values.get(name) ?? null; }, async has(name) { return values.has(name); }, async delete(name) { return values.delete(name); } };
+  const app = createWorkbenchServer({ root, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore });
+  const address = await app.listen();
+  try {
+    assert.equal((await saveSecret(address, 'workbench.model.recreated', 'old-value')).status, 200);
+    const proposal = (await createModelProposal(address, 'recreated', 'recreated', 'workbench.model.recreated')).body.proposal;
+    // wb10 #56 Q3, version-reuse path: DELETE used to clear the
+    // version counter, so the recreate minted version 1 again and
+    // cancelling the old proposal deleted the NEW value. The
+    // never-reused generation token breaks that equality.
+    assert.equal((await deleteSecret(address, 'workbench.model.recreated')).status, 200);
+    assert.equal((await saveSecret(address, 'workbench.model.recreated', 'new-value')).status, 200);
+    const cancelled = await cancelModelProposal(address, proposal);
+    assert.equal(cancelled.status, 200);
+    assert.equal(cancelled.body.secretCleanup, 'retained');
+    assert.equal(values.get('workbench.model.recreated'), 'new-value');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('模型提案重启后重写密钥时取消旧提案保留新值', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-secret-restart-rewrite-'));
+  const values = new Map();
+  const secretStore = {
+    async set(name, value) { values.set(name, value); },
+    async get(name) { return values.get(name) ?? null; },
+    async has(name) { return values.has(name); },
+    async delete(name) { return values.delete(name); },
+  };
+  const options = { root, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore };
+  let app = createWorkbenchServer(options);
+  let address = await app.listen();
+  let proposal;
+  try {
+    assert.equal((await saveSecret(address, 'workbench.model.rewritten', 'pre-restart-value')).status, 200);
+    proposal = (await createModelProposal(address, 'rewritten', 'rewritten', 'workbench.model.rewritten')).body.proposal;
+  } finally { await app.close(); }
+
+  // wb10 #56 Q3, restart-rewrite path: the restart wipes the
+  // in-memory write record, so a rewrite used to mint version 1
+  // again and cancelling the pre-restart proposal deleted the
+  // rewritten value (the old code only checked that createdAt was a
+  // string, never that it matched). The generation token of the
+  // rewrite can never equal the pre-restart attribution's token.
+  app = createWorkbenchServer(options);
+  address = await app.listen();
+  try {
+    assert.equal((await saveSecret(address, 'workbench.model.rewritten', 'rewritten-value', { overwrite: true, version: 'present', approval: true })).status, 200);
+    const cancelled = await cancelModelProposal(address, proposal);
+    assert.equal(cancelled.status, 200);
+    assert.equal(cancelled.body.secretCleanup, 'retained');
+    assert.equal(values.get('workbench.model.rewritten'), 'rewritten-value');
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('模型提案创建方取消时另一工作区仍引用则保留共享密钥', async () => {
+  const rootA = await mkdtemp(path.join(tmpdir(), 'ocw-secret-xws-creator-a-'));
+  const rootB = await mkdtemp(path.join(tmpdir(), 'ocw-secret-xws-creator-b-'));
+  // One shared backend, as when two workspaces share the default
+  // credential service. Workspace A wrote the secret and created the
+  // attributed proposal; workspace B only references the same secret.
+  // wb10 #56 Q3, cross-workspace path: cleanup in A only sees A's own
+  // registry and proposals, so B's live reference is invisible to it.
+  // Since exclusive creation across workspaces can never be proven
+  // from A's view, cancelling A's proposal must retain the shared
+  // secret ("unknown -> retained" convergence) instead of deleting
+  // it out from under B.
+  const values = new Map();
+  const secretStore = { async set(name, value) { values.set(name, value); }, async get(name) { return values.get(name) ?? null; }, async has(name) { return values.has(name); }, async delete(name) { return values.delete(name); } };
+  const appA = createWorkbenchServer({ root: rootA, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore });
+  const appB = createWorkbenchServer({ root: rootB, token: 'test-token-012345', approvalToken: 'approve-token-012345', secretStore });
+  const addressA = await appA.listen();
+  const addressB = await appB.listen();
+  try {
+    assert.equal((await saveSecret(addressA, 'workbench.model.creator', 'creator-secret')).status, 200);
+    const proposalA = (await createModelProposal(addressA, 'creator', 'creator', 'workbench.model.creator')).body.proposal;
+    const proposalB = (await createModelProposal(addressB, 'creator', 'creator-ref', 'workbench.model.creator')).body.proposal;
+    assert.equal(proposalB.action.status, 'awaiting_approval');
+    const cancelled = await cancelModelProposal(addressA, proposalA);
+    assert.equal(cancelled.status, 200);
+    assert.equal(cancelled.body.secretCleanup, 'retained');
+    assert.equal(values.get('workbench.model.creator'), 'creator-secret');
+    const stillListed = await request(addressB, '/v1/models/proposals');
+    assert.equal(stillListed.body.proposals.some((item) => item.action.id === proposalB.action.id), true);
+  } finally { await appA.close(); await appB.close(); await rm(rootA, { recursive: true, force: true }); await rm(rootB, { recursive: true, force: true }); }
 });
