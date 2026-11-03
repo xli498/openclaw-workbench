@@ -1097,14 +1097,16 @@ saveModel.addEventListener('click', async () => {
     renderModelProposal(result.proposal);
     setFeedback(modelFeedback, '密钥已保存到 Windows 凭据管理器；模型档案等待人工批准。', 'success');
   } catch (error) {
+    let secretCleanupFailed = false;
     if (secretStored && !profileProposed) {
       try {
         const configured = (await modelRequest('GET', `/v1/secrets/${encodeURIComponent(secretName)}`)).configured === true;
         await modelRequest('DELETE', `/v1/secrets/${encodeURIComponent(secretName)}`, { actionHash: await secretActionHash('delete', secretName, configured ? 'present' : 'absent') }, true);
-      } catch {}
+      } catch { secretCleanupFailed = true; }
     }
     const message = error.message || '模型配置失败。';
-    setFeedback(modelFeedback, apiKey && message.includes(apiKey) ? '模型配置失败，错误内容已隐藏。' : message, 'error');
+    const shown = apiKey && message.includes(apiKey) ? '模型配置失败，错误内容已隐藏。' : message;
+    setFeedback(modelFeedback, secretCleanupFailed ? `${shown} 已保存的密钥（${secretName}）清理未获确认，请检查凭据管理器并手动清理残留。` : shown, 'error');
   } finally {
     modelApiKeyInput.value = '';
     updateModelActionState();
