@@ -135,7 +135,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 | 本地控制台 UI、OpenClaw CLI 诊断 | 已实现；首次连接会显示 CLI 状态 |
 | 聚合诊断 API | 已实现；只返回状态、哈希、计数和脱敏审计 |
 | Durable terminal session 合同 | 已实现；审批、游标、输出上限、取消/超时和 manual review；默认 `pty:false` |
-| MCP 注册、工具 allowlist、健康状态 | 已实现受控注册骨架；默认禁用，不启动 Server/调用工具；管理面 API 与桌面面板已实现（见 MCP 章节） |
+| MCP 注册、工具 allowlist、健康状态 | 默认禁用，已有受审批约束的注册、启停与工具调用（注册／启用／授权／启停／工具调用均须独立审批并绑定当前 configHash，工具调用须命中 allowlist；管理面 API 与桌面面板已实现，见 MCP 章节）；完整管理能力仍有未闭合项：OpenClaw 私有协议与 Gateway 生命周期未接入、公网 Bridge 未验证、桥接服务端 workspace.patch／workspace.command 仍只返回审批提案而不直接执行、服务端状态快照端点仍在按 MCP 2025-06-18 核对 |
 | 本机 Streamable HTTP MCP Bridge | 已实现；回环绑定、Bearer、会话、SSE、回放保护和审批提案边界；服务端 Last-Event-ID 断线回放已实现（默认进程内缓冲，重启后丢失；传 `replayStorePath` 后缓冲与游标持久化，快照只含事件内容与游标、不含 Bearer 与原始会话 id，重启后旧会话 id 仍按过期处理、已关闭会话不复活，续接须由调用方显式 `resumeSession` 接入新会话） |
 | 公网 Bridge / 隧道 | 受控 CLI 适配器已实现；真实公网启动、部署与第三方 CLI 仍未验证 |
 | 生产部署承诺 | 不承诺 |
