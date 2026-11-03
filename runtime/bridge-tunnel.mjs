@@ -46,10 +46,17 @@ function genericError(error) { return error instanceof BridgeTunnelError ? error
 
 /**
  * Controls an explicitly injected tunnel CLI. It never starts a tunnel until
- * start() is called, never uses a shell, and never exposes the public URL.
- * The injected parser receives stdout lines and may return a URL; that URL is
- * retained only in memory for the caller's connector and is absent from all
- * public state and callbacks.
+ * start() is called, never uses a shell, and never exposes the public URL
+ * or the bearer token in public state or state callbacks. The injected
+ * parser receives stdout lines and may return a URL; that URL is retained
+ * only in memory for the caller's connector. Two explicit caller-only
+ * accessors DO return full sensitive values and must never be logged or
+ * persisted by the caller: endpoint() (the full public endpoint) and
+ * authHeaders() (the full Authorization header). The "bearer only in the
+ * child-process environment" guarantee covers arguments the adapter itself
+ * constructs; caller-supplied args are validated, copied at construction,
+ * and rejected if they contain the token, and a parsed URL containing the
+ * token is discarded rather than retained.
  */
 export function createBridgeTunnelAdapter({
   provider,
@@ -72,8 +79,13 @@ export function createBridgeTunnelAdapter({
   validCommand(command);
   if (!Array.isArray(args) || args.length > 32) fail('TUNNEL_ARGS_INVALID', 'tunnel arguments are invalid');
   args.forEach(validArg);
+  // Copy the validated args: start() must use this frozen snapshot, never
+  // the caller's live array, so mutating the original array after
+  // construction cannot smuggle unvalidated arguments into the spawn.
+  const fixedArgs = Object.freeze([...args]);
   if (!Number.isSafeInteger(localPort) || localPort < 1 || localPort > 65_535) fail('TUNNEL_PORT_INVALID', 'local port is invalid');
-  if (typeof token !== 'string' || token.length < 16 || /[\0\r\n]/.test(token)) fail('TUNNEL_AUTH_INVALID', 'tunnel bearer token is invalid');
+  if (typeof token !== 'string' || token.length < 16 || /[\x00-\x1F\x7F]/.test(token)) fail('TUNNEL_AUTH_INVALID', 'tunnel bearer token is invalid');
+  if (fixedArgs.some((arg) => arg.includes(token))) fail('TUNNEL_ARGS_INVALID', 'tunnel arguments must not contain the bearer token');
   if (typeof spawnImpl !== 'function') fail('TUNNEL_SPAWN_INVALID', 'spawn implementation is unavailable');
   if (typeof parsePublicUrl !== 'function') fail('TUNNEL_URL_PARSER_REQUIRED', 'public URL parser is required');
   validPositive(startTimeoutMs, 'startTimeoutMs');
@@ -89,6 +101,8 @@ export function createBridgeTunnelAdapter({
   let lastError = null;
   let outputBuffer = '';
   let startPromise = null;
+  let stopPromise = null;
+  let resetPromise = null;
   let urlWaiter = null;
 
   function publicState() {
@@ -102,12 +116,13 @@ export function createBridgeTunnelAdapter({
     emit();
   }
   function currentArgs() {
-    // The bearer is passed as an environment variable, never in argv or URL.
+    // The bearer is passed as an environment variable, never in argv or URL
+    // by this adapter's own construction (see the fixedArgs copy above).
     const target = `http://127.0.0.1:${localPort}/${routePath}`;
-    if (provider === 'cloudflare-named') return ['tunnel', 'run', namedTunnel, ...args];
-    if (provider === 'ngrok-fixed') return ['http', '--domain', fixedHostname, `127.0.0.1:${localPort}`, ...args];
-    if (provider === 'ngrok') return ['http', `127.0.0.1:${localPort}`, ...args];
-    return [...args, '--url', target];
+    if (provider === 'cloudflare-named') return ['tunnel', 'run', namedTunnel, ...fixedArgs];
+    if (provider === 'ngrok-fixed') return ['http', '--domain', fixedHostname, `127.0.0.1:${localPort}`, ...fixedArgs];
+    if (provider === 'ngrok') return ['http', `127.0.0.1:${localPort}`, ...fixedArgs];
+    return [...fixedArgs, '--url', target];
   }
   function consumeOutput(data) {
     outputBuffer += Buffer.isBuffer(data) ? data.toString('utf8') : String(data ?? '');
@@ -118,9 +133,13 @@ export function createBridgeTunnelAdapter({
       outputBuffer = outputBuffer.slice(index + 1);
       try {
         const parsed = parsePublicUrl(line);
-        if (typeof parsed === 'string' && /^https:\/\//.test(parsed) && parsed.length <= 2048) {
+        if (typeof parsed === 'string' && !parsed.includes(token) && /^https:\/\//.test(parsed) && parsed.length <= 2048) {
           const candidate = new URL(parsed);
           if (candidate.protocol !== 'https:' || candidate.username || candidate.password || candidate.search || candidate.hash || (fixedHostname && candidate.hostname.toLowerCase() !== fixedHostname)) continue;
+          // Re-check the normalized origin: URL parsing lowercases the host,
+          // so a token spelled in another case would otherwise survive the
+          // case-sensitive raw-string check above and be retained in origin.
+          if (candidate.origin.toLowerCase().includes(token.toLowerCase())) continue;
           publicUrl = candidate.origin;
           urlWaiter?.resolve(publicUrl);
           urlWaiter = null;
@@ -137,44 +156,88 @@ export function createBridgeTunnelAdapter({
   }
   async function stopProcess() {
     const current = child;
-    child = null;
     if (!current) return;
-    await new Promise((resolve) => {
+    // Already exited (real child processes report exitCode); drop the
+    // handle without waiting on an exit event that will never re-fire.
+    if (current.exitCode !== null && current.exitCode !== undefined) { child = null; return; }
+    await new Promise((resolve, reject) => {
       let settled = false;
-      const done = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
-      const timer = setTimeout(done, stopTimeoutMs);
+      const clearCurrent = () => { if (child === current) child = null; };
+      const done = () => { if (!settled) { settled = true; clearTimeout(timer); clearCurrent(); resolve(); } };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        // Timeout is a failure, not a completed stop: keep the handle so
+        // a later stop() can retry the kill, and drop it only if the
+        // process exits on its own afterwards.
+        current.once?.('exit', clearCurrent);
+        current.once?.('close', clearCurrent);
+        reject(new BridgeTunnelError('TUNNEL_STOP_TIMEOUT', 'tunnel process did not exit within the stop timeout'));
+      }, stopTimeoutMs);
       current.once?.('exit', done);
       current.once?.('close', done);
-      try { current.kill?.(); } catch { done(); }
+      try { current.kill?.(); }
+      catch (error) {
+        if (!settled) { settled = true; clearTimeout(timer); reject(genericError(error)); }
+      }
     });
   }
   async function start() {
     if (state === 'ready') return Object.freeze({ ...publicState(), endpoint: publicUrl ? `${publicUrl}/${routePath}` : null });
-    if (startPromise) return startPromise;
+    // Busy is decided BEFORE any promise is stored: a busy rejection
+    // must never linger in startPromise and poison later starts. A
+    // reset in flight also holds the lifecycle busy for its whole
+    // duration, including the stop-completion to route-rotation window.
+    if (state === 'starting' || state === 'stopping' || stopPromise || startPromise || resetPromise) fail('TUNNEL_BUSY', 'tunnel lifecycle is busy');
     startPromise = (async () => {
-      if (state === 'starting' || state === 'stopping') fail('TUNNEL_BUSY', 'tunnel lifecycle is busy');
-      publicUrl = null;
-      outputBuffer = '';
-      routePath = randomSecretPath();
-      const thisGeneration = ++generation;
-      setState('starting');
       try {
-        child = spawnImpl(command, currentArgs(), {
+        // A previous stop that timed out leaves its child handle behind
+        // for a retry; never start a second process over it.
+        if (child) fail('TUNNEL_BUSY', 'previous tunnel process has not exited');
+        publicUrl = null;
+        outputBuffer = '';
+        routePath = randomSecretPath();
+        const thisGeneration = ++generation;
+        setState('starting');
+        // Final argv check at start: construction-time validation only covers
+        // caller-supplied args, while provider-derived entries (named tunnel
+        // / fixed hostname) reach argv through currentArgs(). A token-shaped
+        // name or hostname must be rejected here, before any spawn.
+        const argv = currentArgs();
+        if (command.includes(token) || argv.some((arg) => arg.includes(token))) fail('TUNNEL_ARGS_INVALID', 'tunnel arguments must not contain the bearer token');
+        child = spawnImpl(command, argv, {
           shell: false,
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe'],
           env: { PATH: process.env.PATH ?? '', OCW_BRIDGE_BEARER: token },
         });
+        const startedChild = child;
         child.stdout?.on?.('data', consumeOutput);
         child.stderr?.on?.('data', consumeOutput);
         child.once?.('error', (error) => { if (thisGeneration === generation) { lastError = genericError(error); setState('failed', error); } });
+        // Continuous monitoring after ready: an unexpected exit withdraws
+        // the endpoint and fails the adapter instead of leaving a stale
+        // ready state. An exit while starting fails fast instead of
+        // waiting out the full URL timeout.
+        child.once?.('exit', () => {
+          if (thisGeneration !== generation) return;
+          if (state === 'ready') {
+            if (child === startedChild) child = null;
+            publicUrl = null;
+            setState('failed', new BridgeTunnelError('TUNNEL_PROCESS_EXITED', 'tunnel process exited unexpectedly'));
+          } else if (state === 'starting') {
+            urlWaiter?.reject(new BridgeTunnelError('TUNNEL_PROCESS_FAILED', 'tunnel process exited before reporting a URL'));
+            urlWaiter = null;
+          }
+        });
         await waitForUrl(startTimeoutMs, thisGeneration);
         if (thisGeneration !== generation || !child) fail('TUNNEL_RESET', 'tunnel was reset');
         startedAt = new Date(clock()).toISOString();
         setState('ready');
         return Object.freeze({ ...publicState(), endpoint: `${publicUrl}/${routePath}` });
       } catch (error) {
-        await stopProcess();
+        try { await stopProcess(); }
+        catch (stopError) { publicUrl = null; setState('failed', stopError); throw genericError(stopError); }
         publicUrl = null;
         setState('failed', error);
         throw genericError(error);
@@ -183,21 +246,65 @@ export function createBridgeTunnelAdapter({
     return startPromise;
   }
   async function stop() {
-    ++generation;
-    urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
-    urlWaiter = null;
-    if (state === 'idle') return publicState();
-    setState('stopping');
-    await stopProcess();
-    publicUrl = null;
-    startedAt = null;
-    setState('idle');
-    return publicState();
+    if (stopPromise) return stopPromise;
+    // Idle fast path BEFORE any promise is stored: the IIFE below runs
+    // synchronously up to its first await, so an idle shortcut inside it
+    // would complete (and run its finally clearing stopPromise) before
+    // the outer assignment, leaving the already-resolved promise stored
+    // forever and every later start() reporting TUNNEL_BUSY. Handling
+    // the idle case here, without creating a promise, removes that
+    // ordering hazard entirely. The remaining IIFE paths always hit an
+    // await before completing, so their finally clears correctly.
+    if (state === 'idle' && !child) {
+      ++generation;
+      urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
+      urlWaiter = null;
+      return publicState();
+    }
+    stopPromise = (async () => {
+      try {
+        ++generation;
+        urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
+        urlWaiter = null;
+        // Serialize with an in-flight start: stop runs synchronously
+        // into 'stopping' first, so a concurrent start() sees busy
+        // instead of racing the start's failure handling.
+        const pendingStart = startPromise;
+        if (pendingStart) {
+          setState('stopping');
+          try { await pendingStart; } catch { /* a stop-induced start failure is expected */ }
+        }
+        if (state === 'idle' && !child) return publicState();
+        setState('stopping');
+        await stopProcess();
+        publicUrl = null;
+        startedAt = null;
+        setState('idle');
+        return publicState();
+      } catch (error) {
+        setState('failed', error);
+        throw genericError(error);
+      } finally { stopPromise = null; }
+    })();
+    return stopPromise;
   }
   async function reset() {
-    await stop();
-    routePath = randomSecretPath();
-    return publicState();
+    if (resetPromise) return resetPromise;
+    // Reset holds busy for its whole duration: without resetPromise, a
+    // start continuation queued ahead of reset's post-stop continuation
+    // could spawn with the old routePath before reset rotates it,
+    // leaving the spawned tunnel and the reported endpoint on different
+    // routes. start() checks resetPromise, so such a start is rejected
+    // with TUNNEL_BUSY instead. Concurrent reset() calls share the one
+    // in-flight reset, mirroring stop().
+    resetPromise = (async () => {
+      try {
+        await stop();
+        routePath = randomSecretPath();
+        return publicState();
+      } finally { resetPromise = null; }
+    })();
+    return resetPromise;
   }
   return Object.freeze({ start, stop, reset, status: publicState, provider, authHeaders: () => Object.freeze({ authorization: `Bearer ${token}` }), endpoint: () => publicUrl ? `${publicUrl}/${routePath}` : null });
 }

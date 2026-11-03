@@ -108,6 +108,15 @@ let mcpUpdateTargetId = '';
 let mcpKnownHashes = {};
 let mcpStaleIds = new Set();
 let mcpBusy = false;
+// Approval busy: while an approve/deny/cancel request is in flight, the
+// panel must not let a second approval decision start, and the completion
+// handler must only clear the proposal it actually decided. Without this,
+// the old handler re-read mcpPendingProposal after the await and cleared
+// unconditionally: a proposal submitted during the wait was cleared by
+// mistake (with feedback for the wrong operation), and a cleared pending
+// made the post-await read throw, surfacing as "approval failed" even
+// though the approval had succeeded.
+let mcpApprovalBusy = false;
 let recoveryTransactions = [];
 let recoveryVisibleCount = 20;
 const RECOVERY_PAGE_SIZE = 20;
@@ -326,10 +335,10 @@ function mcpHealthLabel(status) {
 }
 
 function updateMcpActionState() {
-  refreshMcpButton.disabled = !runtimeReady || mcpBusy;
-  approveMcp.disabled = !runtimeReady || !mcpPendingProposal?.action;
-  denyMcp.disabled = !runtimeReady || !mcpPendingProposal?.action;
-  cancelMcp.disabled = !runtimeReady || !mcpPendingProposal?.action;
+  refreshMcpButton.disabled = !runtimeReady || mcpBusy || mcpApprovalBusy;
+  approveMcp.disabled = !runtimeReady || mcpApprovalBusy || !mcpPendingProposal?.action;
+  denyMcp.disabled = !runtimeReady || mcpApprovalBusy || !mcpPendingProposal?.action;
+  cancelMcp.disabled = !runtimeReady || mcpApprovalBusy || !mcpPendingProposal?.action;
 }
 
 // Display boundary: the list renderer only ever reads a server's display
@@ -420,7 +429,7 @@ function clearMcp() {
 }
 
 async function refreshMcp() {
-  if (!runtimeReady || !invoke || mcpBusy) return;
+  if (!runtimeReady || !invoke || mcpBusy || mcpApprovalBusy) return;
   mcpBusy = true;
   updateMcpActionState();
   try {
@@ -1044,6 +1053,12 @@ stopRuntime.addEventListener('click', async () => {
   catch (error) { setFeedback(projectFeedback, error.message || 'Runtime 停止失败。', 'error'); await refreshRuntime(); }
 });
 
+async function secretActionHash(operation, name, version) {
+  const input = JSON.stringify({ type: `secret.${operation}`, sessionId: 'secret', workspaceRevision: version, target: name, preview: null, risk: 'high' });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 saveModel.addEventListener('click', async () => {
   const id = modelIdInput.value.trim();
   const provider = modelProviderInput.value.trim();
@@ -1064,7 +1079,8 @@ saveModel.addEventListener('click', async () => {
   let profileProposed = false;
   const secretName = `workbench.model.${id}`;
   try {
-    await modelRequest('POST', '/v1/secrets', { name: secretName, value: apiKey });
+    const configured = (await modelRequest('GET', `/v1/secrets/${encodeURIComponent(secretName)}`)).configured === true;
+    await modelRequest('POST', '/v1/secrets', { name: secretName, value: apiKey, actionHash: await secretActionHash('create', secretName, configured ? 'present' : 'absent') });
     secretStored = true;
     modelApiKeyInput.value = '';
     const result = await modelRequest('POST', '/v1/models', {
@@ -1082,7 +1098,10 @@ saveModel.addEventListener('click', async () => {
     setFeedback(modelFeedback, '密钥已保存到 Windows 凭据管理器；模型档案等待人工批准。', 'success');
   } catch (error) {
     if (secretStored && !profileProposed) {
-      try { await modelRequest('DELETE', `/v1/secrets/${encodeURIComponent(secretName)}`, null, true); } catch {}
+      try {
+        const configured = (await modelRequest('GET', `/v1/secrets/${encodeURIComponent(secretName)}`)).configured === true;
+        await modelRequest('DELETE', `/v1/secrets/${encodeURIComponent(secretName)}`, { actionHash: await secretActionHash('delete', secretName, configured ? 'present' : 'absent') }, true);
+      } catch {}
     }
     const message = error.message || '模型配置失败。';
     setFeedback(modelFeedback, apiKey && message.includes(apiKey) ? '模型配置失败，错误内容已隐藏。' : message, 'error');
@@ -1176,39 +1195,53 @@ mcpList.addEventListener('click', (event) => {
 });
 submitMcpUpdate.addEventListener('click', () => { void submitMcpUpdateProposal(); });
 approveMcp.addEventListener('click', async () => {
-  const action = mcpPendingProposal?.action;
-  if (!action || !runtimeReady) return;
-  approveMcp.disabled = true;
+  // Capture the proposal being decided BEFORE the await: the completion
+  // handler below must act only on this action id, never on whatever
+  // mcpPendingProposal happens to hold after the wait.
+  const pending = mcpPendingProposal;
+  const action = pending?.action;
+  if (!action || !runtimeReady || mcpApprovalBusy) return;
+  const operation = pending.operation;
+  mcpApprovalBusy = true;
+  updateMcpActionState();
   try {
     // The approve route is keyed by proposal action id, mirroring the model
     // approval path; approval=true routes through the independent approval
     // token instead of the ordinary control token.
     await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(action.id)}/approve`, { actionHash: action.actionHash }, true, { recoverRuntime: false });
-    const wasUpdate = mcpPendingProposal.operation === 'update';
-    renderMcpProposal(null);
+    // Clear only the proposal this approval decided. A newer proposal
+    // submitted during the wait survives; a pending cleared during the
+    // wait stays cleared (no post-await read of a null pending, so a
+    // successful approval can no longer surface as "approval failed").
+    if (mcpPendingProposal?.action?.id === action.id) renderMcpProposal(null);
+    mcpApprovalBusy = false;
+    updateMcpActionState();
     await refreshMcp();
-    setFeedback(mcpFeedback, wasUpdate ? 'MCP 变更已批准；服务器已停用，需重新启用。' : 'MCP 变更已批准。', 'success');
+    setFeedback(mcpFeedback, operation === 'update' ? 'MCP 变更已批准；服务器已停用，需重新启用。' : 'MCP 变更已批准。', 'success');
   } catch (error) {
     setFeedback(mcpFeedback, error.message || 'MCP 审批失败。', 'error');
   } finally {
+    mcpApprovalBusy = false;
     updateMcpActionState();
   }
 });
 async function rejectMcpProposal(verb) {
-  const action = mcpPendingProposal?.action;
-  if (!action || !runtimeReady) return;
-  denyMcp.disabled = true;
-  cancelMcp.disabled = true;
+  const pending = mcpPendingProposal;
+  const action = pending?.action;
+  if (!action || !runtimeReady || mcpApprovalBusy) return;
+  mcpApprovalBusy = true;
+  updateMcpActionState();
   try {
     // Deny/cancel go through the same independent approval token and
     // actionHash binding as approval; afterwards the proposal is gone
     // from the server map, so a later approve gets MCP_PROPOSAL_NOT_FOUND.
     await modelRequest('POST', `/v1/mcp/servers/${encodeURIComponent(action.id)}/${verb}`, { actionHash: action.actionHash }, true, { recoverRuntime: false });
-    renderMcpProposal(null);
+    if (mcpPendingProposal?.action?.id === action.id) renderMcpProposal(null);
     setFeedback(mcpFeedback, verb === 'deny' ? 'MCP 提案已拒绝，不会执行。' : 'MCP 提案已撤销，不会执行。', 'success');
   } catch (error) {
     setFeedback(mcpFeedback, error.message || 'MCP 提案拒绝/撤销失败。', 'error');
   } finally {
+    mcpApprovalBusy = false;
     updateMcpActionState();
   }
 }

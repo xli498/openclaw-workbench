@@ -10,7 +10,12 @@ import { spawn } from 'node:child_process';
 // therefore refuses to guess or hard-code any OpenClaw private protocol:
 //
 // - probe() only runs `<cli> --version` with shell:false, a timeout, and
-//   a bounded, redacted first line. Missing CLI -> CLI_NOT_FOUND.
+//   a bounded, redacted first line. Missing CLI -> CLI_NOT_FOUND; an
+//   internal probe timeout -> GATEWAY_PROBE_TIMEOUT; probe output over
+//   the limit -> GATEWAY_PROBE_LIMIT; any other probe failure ->
+//   GATEWAY_PROBE_FAILED. The four codes are deliberately distinct so
+//   callers can tell "no CLI installed" apart from "probe itself
+//   timed out / was capped / failed internally".
 // - start() without an explicit, caller-injected channelAdapter throws
 //   GATEWAY_LIFECYCLE_NOT_IMPLEMENTED. A caller that has independently
 //   verified a channel adapter may inject it; the injection, not this
@@ -29,8 +34,14 @@ export class GatewayLifecycleError extends Error {
   }
 }
 
+// Redact BEFORE taking the first line and truncating. Truncating
+// first would cut a credential pattern at the truncation point (e.g.
+// the '@' of a URL userinfo falling past the cut), so the pattern
+// would no longer match and the credential fragment before the cut
+// would leak. Redaction first guarantees no credential material
+// survives regardless of where the cut lands.
 function redactVersion(value) {
-  return String(value ?? '').split('\n')[0].slice(0, 256).replace(SECRET_VALUE_PATTERN, '[redacted]');
+  return String(value ?? '').replace(SECRET_VALUE_PATTERN, '[redacted]').split('\n')[0].slice(0, 256);
 }
 
 function defaultSpawn({ command, timeoutMs, maxOutputBytes }) {
@@ -84,7 +95,13 @@ export function createGatewayLifecycle({
 } = {}) {
   if (typeof cliCommand !== 'string' || !cliCommand || /[\0\r\n]/.test(cliCommand) || /[;&|<>`$()]/.test(cliCommand)) throw new GatewayLifecycleError('GATEWAY_CLI_INVALID', 'Gateway CLI command is invalid');
   if (spawnFn !== undefined && typeof spawnFn !== 'function') throw new GatewayLifecycleError('GATEWAY_SPAWN_INVALID', 'Gateway spawn function is invalid');
-  if (channelAdapter !== undefined && (typeof channelAdapter !== 'object' || typeof channelAdapter.start !== 'function')) throw new GatewayLifecycleError('GATEWAY_ADAPTER_INVALID', 'Gateway channel adapter must provide start()');
+  // An injected adapter must provide BOTH start() and stop(). Checking
+  // only start() used to let a stop-less adapter through, after which
+  // stop() silently reported { status: 'stopped' } without stopping
+  // anything. A null adapter is a config error, not a TypeError: it
+  // must fail here with GATEWAY_ADAPTER_INVALID instead of throwing
+  // when .start is read off null below.
+  if (channelAdapter !== undefined && (channelAdapter === null || typeof channelAdapter !== 'object' || typeof channelAdapter.start !== 'function' || typeof channelAdapter.stop !== 'function')) throw new GatewayLifecycleError('GATEWAY_ADAPTER_INVALID', 'Gateway channel adapter must provide start() and stop()');
   for (const [name, value] of [['probeTimeoutMs', probeTimeoutMs], ['maxOutputBytes', maxOutputBytes]]) if (!Number.isSafeInteger(value) || value < 1) throw new GatewayLifecycleError('GATEWAY_CONFIG_INVALID', `${name} must be a positive safe integer`);
 
   let state = 'disconnected';
@@ -100,7 +117,16 @@ export function createGatewayLifecycle({
         lastProbe = Object.freeze({ available: true, cli: cliCommand, version: redactVersion(result.stdout) });
       }
     } catch (error) {
-      lastProbe = Object.freeze({ available: false, cli: cliCommand, code: error?.code === 'ENOENT' ? 'CLI_NOT_FOUND' : 'GATEWAY_PROBE_FAILED' });
+      // Preserve the probe's own failure taxonomy instead of folding
+      // everything non-ENOENT into GATEWAY_PROBE_FAILED: a timeout or
+      // an output-limit kill is a probe-internal outcome, not evidence
+      // about the CLI, and collapsing it hides which one happened.
+      const code = error?.code;
+      const probeCode = code === 'ENOENT' ? 'CLI_NOT_FOUND'
+        : code === 'GATEWAY_PROBE_TIMEOUT' ? 'GATEWAY_PROBE_TIMEOUT'
+        : code === 'GATEWAY_PROBE_LIMIT' ? 'GATEWAY_PROBE_LIMIT'
+        : 'GATEWAY_PROBE_FAILED';
+      lastProbe = Object.freeze({ available: false, cli: cliCommand, code: probeCode });
     }
     state = 'probed';
     return lastProbe;
@@ -114,7 +140,11 @@ export function createGatewayLifecycle({
   }
 
   async function stop(...args) {
-    if (channelAdapter && typeof channelAdapter.stop === 'function') await channelAdapter.stop(...args);
+    // No adapter at all: nothing was ever started, so reporting
+    // stopped is honest. With an adapter, the constructor already
+    // guaranteed a stop() function, so this always performs a real
+    // stop instead of silently reporting one.
+    if (channelAdapter) await channelAdapter.stop(...args);
     state = 'disconnected';
     return Object.freeze({ status: 'stopped' });
   }

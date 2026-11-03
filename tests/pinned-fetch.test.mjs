@@ -28,7 +28,8 @@ function localLookup(onCall) {
   };
 }
 
-test('pinned HTTPS transport uses the checked address while preserving TLS SNI and response streaming', async () => {
+// 本文件验证的是 DNS 地址固定并保留 TLS 验证：无证书指纹或 SPKI 校验逻辑。
+test('DNS 地址固定并保留 TLS 验证的 HTTPS 传输：使用已检查地址并保留 TLS SNI 与响应流式传输', async () => {
   const server = await listen((request, response) => {
     const chunks = [];
     request.setEncoding('utf8');
@@ -65,7 +66,7 @@ test('pinned HTTPS transport uses the checked address while preserving TLS SNI a
   }
 });
 
-test('pinned HTTPS transport aborts an in-flight response body and rejects its Web reader', async () => {
+test('DNS 地址固定并保留 TLS 验证的 HTTPS 传输：中止在途响应体并拒绝其 Web reader', async () => {
   let connectionClosed;
   const closed = new Promise((resolve) => { connectionClosed = resolve; });
   const server = await listen((_request, response) => {
@@ -93,7 +94,7 @@ test('pinned HTTPS transport aborts an in-flight response body and rejects its W
   }
 });
 
-test('pinned HTTPS transport rejects before headers when the request signal is aborted', async () => {
+test('DNS 地址固定并保留 TLS 验证的 HTTPS 传输：请求信号已中止时在响应头前拒绝', async () => {
   const server = await listen((_request, response) => {
     setTimeout(() => response.end('late'), 200);
   });

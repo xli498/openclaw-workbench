@@ -121,3 +121,63 @@ test('package exports the constrained MCP HTTP transport', async () => {
   const pkg = await import('openclaw-workbench');
   assert.equal(typeof pkg.createMcpHttpTransport, 'function');
 });
+
+test('MCP HTTP transport caller abort wins over a timeout whose fetch rejection is processed late', async () => {
+  // Deterministic race regression (Q40-3): the old test only aborted
+  // immediately after issuing the request, so a mapping that checked the
+  // timeout flag first passed it too -- the fetch rejection had not yet
+  // been processed when the caller aborted, and nothing forced the timer
+  // to have fired first. Here the injected fetch holds its rejection
+  // until the test releases it, and the test only aborts the caller
+  // AFTER observing the controller signal aborted, which proves the
+  // timeout timer already fired. An implementation that maps timeout
+  // before caller abort fails this test; the current flag order
+  // (abortedByCaller first) passes it.
+  const makeHeldFetch = () => {
+    let release;
+    let fetchSignal = null;
+    const held = new Promise((_, reject) => { release = () => reject(new Error('held fetch rejected late')); });
+    const fetchImpl = async (url, options) => {
+      fetchSignal = options.signal;
+      return held;
+    };
+    return { fetchImpl, release: () => release(), signalAborted: () => fetchSignal?.aborted === true };
+  };
+  const waitFor = async (predicate) => {
+    const deadline = Date.now() + 5000;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error('timed out waiting for the timeout timer to fire');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
+  // Case A: timer fired, then caller aborts, then the fetch rejection is
+  // processed late. Caller abort must win.
+  {
+    const held = makeHeldFetch();
+    const transport = createMcpHttpTransport({ endpoint: 'https://example.com/mcp', requestTimeoutMs: 10, fetchImpl: held.fetchImpl });
+    await transport.start();
+    const controller = new AbortController();
+    const pending = transport.request('race-abort', {}, { signal: controller.signal });
+    await waitFor(held.signalAborted);
+    controller.abort();
+    held.release();
+    await assert.rejects(pending, (error) => error.code === 'MCP_REQUEST_ABORTED');
+    await transport.close();
+  }
+
+  // Case B: timer fired, no caller abort, fetch rejection processed late.
+  // This proves the timeout flag itself was set (not just the abort
+  // path), so the two outcomes are distinguished by the caller-abort
+  // flag alone.
+  {
+    const held = makeHeldFetch();
+    const transport = createMcpHttpTransport({ endpoint: 'https://example.com/mcp', requestTimeoutMs: 10, fetchImpl: held.fetchImpl });
+    await transport.start();
+    const pending = transport.request('race-timeout');
+    await waitFor(held.signalAborted);
+    held.release();
+    await assert.rejects(pending, (error) => error.code === 'MCP_REQUEST_TIMEOUT');
+    await transport.close();
+  }
+});
