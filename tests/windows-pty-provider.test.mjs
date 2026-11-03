@@ -261,3 +261,47 @@ test('Windows PTY ConPTY normalizes case-variant env and reads caller value', { 
     assert.match(joined, /a-9/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('Windows PTY ConPTY resize reports PTY_RESIZE_UNSUPPORTED on a live session instead of faking a size', { skip: SKIP_OFF_WINDOWS }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
+  try {
+    // Windows-native resize coverage, and the gap left by the PR #37
+    // slice: the #37 Windows provider tests all skipped on win32 and
+    // the POSIX resize tests carry no "Windows" token, so the Windows
+    // CI name-pattern run executed zero new #37 tests on Windows.
+    // This test's title contains "Windows", so the CI pattern selects
+    // it, and on win32 it is NOT skipped: it spawns the real ConPTY
+    // helper, waits for the child's ready marker (so the resize is
+    // attempted on a provably live session, not a dead one), and
+    // requires the honest PTY_RESIZE_UNSUPPORTED rejection (no
+    // persistent control channel exists yet). On Linux it is skipped
+    // by platform, which the runner reports as skipped rather than
+    // passed -- selection and execution stay distinguishable in the
+    // run record.
+    const provider = createWindowsPtyProvider();
+    const outputs = [];
+    let resolveExit;
+    let exitedFlag = false;
+    const exited = new Promise((resolve) => { resolveExit = resolve; });
+    const controller = new AbortController();
+    const handle = await provider({
+      root, argv: ['cmd.exe', '/d', '/c', 'echo pty-ready-resize & ping -n 60 127.0.0.1'], cwd: '.', signal: controller.signal,
+      onOutput: (value) => { outputs.push(value.text); },
+      onExit: (result) => { exitedFlag = true; resolveExit(result); },
+    });
+    try {
+      const deadline = Date.now() + 30_000;
+      while (!/pty-ready-resize/.test(outputs.join(''))) {
+        if (Date.now() > deadline) throw new Error('timed out waiting for ConPTY child ready marker');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.equal(exitedFlag, false, 'child must not have exited before resize');
+      await assert.rejects(handle.resize(120, 40), (error) => error.code === 'PTY_RESIZE_UNSUPPORTED');
+      await assert.rejects(handle.resize(80, 24), (error) => error.code === 'PTY_RESIZE_UNSUPPORTED');
+    } finally {
+      controller.abort();
+      await handle.cancel().catch(() => {});
+      await withTimeout(exited, 30_000, 'ConPTY child exit after cancel').catch(() => {});
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

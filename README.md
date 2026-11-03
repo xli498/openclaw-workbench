@@ -4,7 +4,7 @@
 
 > 这是独立的、非官方 OpenClaw 项目，不会自动修改 OpenClaw 配置。当前版本是可测试的 Runtime 产品基线，不是已经接管生产环境的完整控制面。
 
-产品核心的可验收闭环是：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具 → 审批提案 → 验证与脱敏审计。`Streamable HTTP MCP Bridge` 已作为独立的本机回环服务实现；公网隧道仅有受控 CLI 适配器、真实公网部署未验证，LSP 已实现只读客户端切片之上的文档同步、诊断、经审批编辑提案与 documentChanges 提案化，持久 PTY 已实现 POSIX 显式注入 provider 的 resize 通道（默认仍 pty:false）与 Windows ConPTY 已由 Windows CI 执行测试验证（Windows resize 仍未接线），不能用诊断或一次性命令执行冒充这些能力。
+产品核心的可验收闭环是：模型注册 → 真实模型请求 → 规范化 Chat 回合 → 只读工具 → 审批提案 → 验证与脱敏审计。`Streamable HTTP MCP Bridge` 已作为独立的本机回环服务实现；公网隧道仅有受控 CLI 适配器、真实公网部署未验证，LSP 已实现文档同步、诊断、经审批编辑提案与 documentChanges 提案化（真实语言服务器接入仍未核），持久 PTY 已实现 POSIX 显式注入 provider 的 resize 通道（默认仍 pty:false）与 Windows ConPTY 已由 Windows job 中被选中执行的测试验证（PR #45，测试 229–236）（Windows resize 仍未接线），不能用诊断或一次性命令执行冒充这些能力。
 
 ## 当前可运行入口
 
@@ -158,7 +158,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 控制面提供 `GET /v1/terminal/sessions`、`POST /v1/terminal/sessions`、`GET /v1/terminal/sessions/:id/output`、`POST /v1/terminal/sessions/:id/input` 和 `POST /v1/terminal/sessions/:id/cancel`。创建、输入和取消都需要独立 `X-Approval-Token`；命令仍经过 argv、cwd 和只读策略门禁。输出按游标增量读取并有硬上限，输入原文不写入快照。
 
-当前默认实现使用受控命令 runner 作为非 PTY fallback，返回 `capabilities: { pty: false, input: false, incrementalOutput: false }`，因此不会把一次性命令冒充交互终端。POSIX PTY provider 需要宿主显式注入并单独完成进程树、权限和秘密环境复审；Windows ConPTY provider 已由 Windows CI 执行测试验证 spawn/输出/输入/取消/退出码（Windows resize 仍未接线）。服务重启后未完成会话只进入 `manual_review`，不会自动重放。
+当前默认实现使用受控命令 runner 作为非 PTY fallback，返回 `capabilities: { pty: false, input: false, incrementalOutput: false }`，因此不会把一次性命令冒充交互终端。POSIX PTY provider 需要宿主显式注入并单独完成进程树、权限和秘密环境复审；Windows ConPTY provider 已由 Windows job 中被选中执行的测试验证（PR #45）spawn/输出/输入/取消/退出码（Windows resize 仍未接线）。服务重启后未完成会话只进入 `manual_review`，不会自动重放。
 
 `GET /v1/audit?limit=<n>` 只读返回最近的脱敏审计事件，最多 500 条；控制台可查看并导出这份脱敏 JSON。未显式注入 audit 时，服务会惰性写入工作区 `.openclaw-workbench/audit.jsonl`；命令预览、完整错误文本、环境变量、凭据和绝对路径不会通过该接口返回。
 
