@@ -290,6 +290,13 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   root = realpathSync(root);
   eventBus ??= createEventBus({ root });
   if (typeof token !== 'string' || token.length < 16) throw new Error('token must be at least 16 characters');
+  // The approval credential must be independent of the Bearer credential:
+  // reusing the same value would collapse the two-factor HTTP check into one.
+  // This is about HTTP identity only. The internal `approved: true` argument
+  // passed to executeRecovery / approve helpers below is a separate, trusted
+  // in-process call made only after the HTTP approval-token check has passed;
+  // it is not an HTTP identity and must not be described as one.
+  if (typeof approvalToken === 'string' && approvalToken === token) throw new Error('approval token must differ from bearer token');
   if (!['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error('host must be loopback');
   const proposals = new Map();
   const configProposals = new Map();
@@ -461,6 +468,14 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const liveStreams = new Set();
   const bridges = new Set();
   let shutdownRequested = false;
+  // Observable shutdown failure state. Only the fixed code SHUTDOWN_FAILED
+  // is stored here (never the raw exception object, its message, or its
+  // code, which may itself carry sensitive text), and it is never written
+  // into an HTTP response. A failed callback resets `shutdownRequested` so a
+  // later, still Bearer-gated request may retry; a successful callback keeps
+  // the flag set, so success is invoked at most once.
+  let shutdownError = null;
+  let lastShutdownFailure = null;
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
     const requestId = requestIdOf(request.headers['x-request-id']);
@@ -475,10 +490,29 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       if (request.method === 'GET' && url.pathname === '/health') return json(response, 200, { ok: true, service: 'openclaw-workbench' });
       if (request.method === 'POST' && url.pathname === '/v1/shutdown') {
         if (typeof onShutdown !== 'function') return json(response, 404, { error: 'SHUTDOWN_UNAVAILABLE', message: 'shutdown is unavailable' });
+        // 202 表示接受关停请求，不代表关停完成：回调在响应之后异步执行。
         json(response, 202, { accepted: true });
         if (!shutdownRequested) {
           shutdownRequested = true;
-          setImmediate(() => { void Promise.resolve().then(onShutdown).catch(() => {}); });
+          setImmediate(() => {
+            Promise.resolve()
+              .then(onShutdown)
+              .then(() => {
+                shutdownError = null;
+                lastShutdownFailure = null;
+              })
+              .catch(async (error) => {
+                const code = 'SHUTDOWN_FAILED';
+                lastShutdownFailure = Object.freeze({ code, at: new Date().toISOString() });
+                shutdownError = code;
+                // A failed callback allows later Bearer-gated requests to
+                // retry, in sequence. Concurrent requests that arrived while
+                // this callback was in flight already returned 202 without
+                // invoking it again.
+                shutdownRequested = false;
+                try { await effectiveAudit?.append?.({ type: 'shutdown.failed', actor: 'system', code }); } catch { /* failure state is already recorded above */ }
+              });
+          });
         }
         return;
       }
@@ -1104,6 +1138,8 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           }
           const approved = transition(proposal.action, 'approved', { expectedHash: proposal.action.actionHash });
           await effectiveAudit?.append?.({ type: 'transaction.recovery.approved', actor: 'user', actionId: approved.id, actionHash: approved.actionHash, transactionId: proposal.transactionId, operation: proposal.mode, files: proposal.impact.files.map((file) => file.relativePath) });
+          // `approved: true` here is the internal trusted call after the HTTP
+          // approval-token check above has passed; it is not HTTP identity.
           const result = await executeRecovery({ root, manifest, manifestPath: proposal.manifestPath, expectedManifestHash: proposal.manifestHash, expectedReportHash: proposal.reportHash, mode: proposal.mode, approved: true, audit: effectiveAudit, renameFile: __testHooks?.recoveryRenameFile, updateManifest: __testHooks?.recoveryUpdateManifest });
           const executing = transition(approved, 'executing');
           const verified = transition(executing, 'verified');
@@ -1291,6 +1327,11 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   return Object.freeze({
     server,
     startup: startupState,
+    // Queryable shutdown failure state (sanitized code only, or null).
+    // `shutdownError` is the latest failure code; `lastShutdownFailure` is
+    // the frozen { code, at } record. Neither is ever sent in a response.
+    get shutdownError() { return shutdownError; },
+    get lastShutdownFailure() { return lastShutdownFailure; },
     createMcpBridge,
     async listen() { await new Promise((resolve) => server.listen(port, host, resolve)); return server.address(); },
     async close() {
