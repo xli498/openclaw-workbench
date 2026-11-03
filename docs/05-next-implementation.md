@@ -92,8 +92,8 @@
 - **LSP 全量剩余**：真实语言服务器接入未验证；`documentChanges` 的 create/rename/delete 类编辑仍被拒绝而非提案化；didChange 编码对齐（UTF-8/UTF-32 服务器）未验证。下一步：接真实语言服务器实测后再切片。
 - **PTY 剩余**：Windows ConPTY 生成、输入/输出 pump、cancel、退出码未验证（Windows 测试按设计跳过）；Windows resize 未接线（PTY_RESIZE_UNSUPPORTED）。下一步：在 Windows CI/受控 Windows 环境实测 ConPTY 路径后，再补命名管道控制通道做 Windows resize。
 - **OpenClaw channel / Gateway 生命周期**：未实现（仅探针与帮助面实测）。下一步：在受控隔离环境以隔离 profile 起本地回环网关，实测 gateway status/probe/health 的裸跑输出（尤其 --json 形态）与 channels list/status 的空配置行为，拿到真实输出样本后才设计生命周期接入；凡涉及登录、配对、token、写真实配置的验证，须用户明确授权后另行受控验证。
-- **streamable HTTP 剩余**：进程内回放缓冲重启即失；无服务端状态快照端点。下一步：如需跨重启续接，设计持久化回放缓冲与快照语义（仍守审批与 allowlist）。
-- **MCP 管理剩余**：面板全量配置编辑器未实现；提案拒绝/撤销入口缺失（后端无 deny/cancel 路由）；更新后重新启用无面板入口。下一步：在管理面 API 上补上述入口。
+- **streamable HTTP 剩余（第三轮口径已部分闭合，见第四轮与文末第五轮清单）**：桥接服务端 tools/list、tools/call 与 GET SSE 分支均已实现，客户端 transport 亦已有 initialize、GET SSE 订阅与 DELETE 会话终止（不再是仅受限 POST）；进程内回放缓冲重启即失已由第四轮 replayStorePath 持久化闭合。仍剩余：服务端状态快照端点等完整语义仍按 MCP 2025-06-18 逐项核对中（仍守审批与 allowlist）。
+- **MCP 管理剩余（第三轮口径已由第四轮闭合，见“第四轮闭环已完成 · MCP 管理完整化”）**：面板全量配置编辑器、后端 deny/cancel 路由与更新后重新启用入口均已实现；本项不再列为未闭合项（文末第五轮清单亦不再列 MCP 管理项）。
 - **公网隧道真实部署验证**：未验证（见上）。下一步：仅在 TLS 建链可通的环境重跑哑元 quick 试验，验证前不称生产可用。
 
 ## 第四轮闭环已完成（2026-11-01，PR #42–#44）
