@@ -76,13 +76,13 @@ console.log({ host: address.address, port: address.port });
 // 进程退出时调用 await bridge.stop()；app.close() 也会停止子 Bridge。
 ```
 
-Bridge 只允许 `127.0.0.1`、`::1` 或 `localhost` 绑定。每个请求仍必须携带独立的 `Authorization: Bearer <MCP token>`；可选 path token 位于路径中，只作路由定位，不能替代 Bearer，也不能放入查询参数、日志、终端历史或仓库。启用它时不要输出或传播完整 endpoint。默认拒绝带 `Origin` 的跨域请求。只读工作区工具立即执行，`workspace.patch` 与 `workspace.command` 只返回审批提案，必须回到控制面使用独立审批 token 才能生效。
+Bridge 只允许 `127.0.0.1`、`::1` 或 `localhost` 绑定。每个请求仍必须携带独立的 `Authorization: Bearer <MCP token>`；可选 path token 位于路径中，只作路由定位，不能替代 Bearer。调用方不得把 path token 或 Bearer 放入查询参数、日志、终端历史或仓库（服务端按路径名路由、不把查询参数当作认证来源，但目前不主动拒绝带查询串的请求）。path token 默认自 Bridge 构造起 5 分钟内有效，过期后新请求返回不回显 token 的 404，已建立的 SSE 不随过期立即关闭。启用它时不要输出或传播完整 endpoint。默认拒绝所有携带 `Origin` 的请求（无 Origin 的请求放行，没有同源特例）。只读工作区工具立即执行，`workspace.patch` 与 `workspace.command` 只返回审批提案、不应用业务 patch、不执行提议命令，必须回到控制面使用独立审批 token 才能生效；该保证适用于默认／控制面注册表，宿主直接注入自定义 registry 属于可信扩展，其内部副作用不在本保证内（提案本身的持久化／审计元数据写入不属于业务 patch 应用）。
 
 运行 `npm run smoke:mcp-bridge` 可在临时本地工作区验证初始化、工具调用、审批边界、SSE、回放与攻击拦截，不需要真实模型、OpenClaw 登录态或 token。公网 Tunnel 适配器只提供显式启动的受控 CLI 生命周期，不能替代本机 Bridge 的 loopback 绑定、Bearer 认证或审批；未完成实际公网部署验证前，不要把 endpoint 当作生产地址。
 
 ### 公网 Tunnel 适配器（实验性、显式启动）
 
-`createBridgeTunnelAdapter` 只提供受控外部 CLI 的生命周期边界，不会自动启动公网隧道，也不会替代本机 Bridge 的 loopback 绑定或审批。当前允许的 provider 标识为 `cloudflare-quick`、`cloudflare-named`、`ngrok` 和 `ngrok-fixed`；Named 模式要求安全的 `tunnelName`，固定域名模式要求不带协议或路径的 `hostname`。调用方必须显式注入 CLI、端口、Bearer token 以及不可信 stdout 的 `parsePublicUrl`。适配器使用 `shell:false`，Bearer 只放在子进程环境变量，不放入参数或 URL；每次 `start()` / `reset()` 生成新的随机路由路径，`reset()` 先停止旧进程，使旧地址失效。`status()`、状态回调和审计不含公网 URL 或 token，公网 URL 只在 `start()` 返回值和进程内 `endpoint()` 中短暂可用。真实 Cloudflare/ngrok 启动、域名绑定、TLS、设备配对和公网部署仍需单独验证。
+`createBridgeTunnelAdapter` 只提供受控外部 CLI 的生命周期边界，不会自动启动公网隧道，也不会替代本机 Bridge 的 loopback 绑定或审批。当前允许的 provider 标识为 `cloudflare-quick`、`cloudflare-named`、`ngrok` 和 `ngrok-fixed`；Named 模式要求安全的 `tunnelName`，固定域名模式要求不带协议或路径的 `hostname`。调用方必须显式注入 CLI、端口、Bearer token 以及不可信 stdout 的 `parsePublicUrl`。适配器使用 `shell:false`，Bearer 只放在子进程环境变量：适配器主动构造的参数不含 token，构造时拒绝含 token 的附加参数，解析出的公网 URL 若含 token 会被丢弃；`authHeaders()` 与 `endpoint()` 是调用方显式取用完整敏感值的接口，调用方不得记录或持久化它们。每次 `start()` / `reset()` 生成新的随机路由路径；`reset()` 先请求停止旧进程并轮换进程内 endpoint，旧地址在网络侧是否失效取决于外部 CLI／隧道服务，本适配器不保证撤销。`status()` 与状态回调不含公网 URL 或 token（`start()` 返回值与进程内 `endpoint()` 除外）。真实 Cloudflare/ngrok 启动、域名绑定、TLS、设备配对和公网部署仍需单独验证。
 
 ```js
 import { createBridgeTunnelAdapter } from 'openclaw-workbench';
@@ -93,7 +93,7 @@ const tunnel = createBridgeTunnelAdapter({
   parsePublicUrl: (line) => line.match(/https:\/\/[^\\s]+/)?.[0],
 });
 const { endpoint } = await tunnel.start(); // 不要记录或持久化 endpoint
-// await tunnel.reset(); // 旧路由和旧隧道失效
+// await tunnel.reset(); // 进程内路由已轮换，网络侧旧地址失效未经验证
 ```
 
 主路径按 Ask → Plan → Code 理解：
@@ -106,7 +106,7 @@ const { endpoint } = await tunnel.start(); // 不要记录或持久化 endpoint
 
 ## 本地控制面 API
 
-`createWorkbenchServer` 提供默认仅监听 `127.0.0.1` 的本地 HTTP 控制面：`GET /health`、`GET /v1/status`、创建 Patch/Command 提案以及明确批准执行提案。请求体限制为 256 KiB；配置 `token` 后所有请求必须携带 `Authorization: Bearer <token>`。该 API 不绑定公网地址、不接管 Gateway，也不把状态持久化到网络数据库；会话、提案和本地事件分别写入工作区的原子 JSON 快照。服务重启后未完成会话/提案只进入 `manual_review`，不会自动调用模型或执行命令。
+`createWorkbenchServer` 提供默认仅监听 `127.0.0.1` 的本地 HTTP 控制面：`GET /health`、`GET /v1/status`、创建 Patch/Command 提案以及明确批准执行提案。请求体限制为 256 KiB；配置 `token` 后所有请求必须携带 `Authorization: Bearer <token>`。该 API 不绑定公网地址、不接管 Gateway，也不把状态持久化到网络数据库；会话、提案和本地事件分别写入工作区的原子 JSON 快照。服务重启后按对象分别处理，不笼统降级：持久化普通提案非终态只进入 `manual_review`；恢复审批提案只存内存、重启后消失；事务清单已完成状态可自动收敛为 `committed`（仅清单状态收敛，不重新执行 `resume`/`rollback`）；不会自动调用模型或执行命令。
 
 启动入口只扫描并报告未完成事务；仅对文件已全部达到 `afterHash` 的事务自动标记为 `committed`，不会自动执行 `resume` 或 `rollback`。非法清单会被隔离为结构化错误，其他事务继续扫描。控制面还提供只读 `GET /v1/recovery`，返回每个未完成事务的检查报告与 `requires_approval`、`mark_committed` 或 `blocked` 判定；该接口不会执行恢复或审批。审批时冲突返回 `409`，缺少独立凭据/事务或提案不存在/提案超限分别返回 `403`、`404`、`429`；服务端应用、部分补偿、最终状态落盘或扫描失败返回 `500`。恢复失败审计和清单只含安全错误码、受控通用说明与相对文件路径，不包含绝对路径、审批凭据或原始 provider/OS 错误。工作区可通过只读 `GET /v1/workspace/tree` 浏览、`GET /v1/workspace/read?path=<relativePath>` 读取单个文件，越界、敏感路径和符号链接逃逸都会被拒绝。
 
@@ -156,7 +156,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 ## 持久终端会话
 
-控制面提供 `GET /v1/terminal/sessions`、`POST /v1/terminal/sessions`、`GET /v1/terminal/sessions/:id/output`、`POST /v1/terminal/sessions/:id/input` 和 `POST /v1/terminal/sessions/:id/cancel`。创建、输入和取消都需要独立 `X-Approval-Token`；命令仍经过 argv、cwd 和只读策略门禁。输出按游标增量读取并有硬上限，输入原文不写入快照。
+控制面提供 `GET /v1/terminal/sessions`、`POST /v1/terminal/sessions`、`GET /v1/terminal/sessions/:id/output`、`POST /v1/terminal/sessions/:id/input` 和 `POST /v1/terminal/sessions/:id/cancel`。创建、输入和取消都需要独立 `X-Approval-Token`；命令仍经过 argv、cwd 和只读策略门禁。输出按游标增量读取；管理器构造参数 `maxOutputBytes` 上限为 4 MiB，但单次 `create` 可另传 `maxOutputBytes`（底层校验上限为 16 MiB），因此 4 MiB 不是单次会话输出的硬上限。输入原文不写入快照。
 
 当前默认实现使用受控命令 runner 作为非 PTY fallback，返回 `capabilities: { pty: false, input: false, incrementalOutput: false }`，因此不会把一次性命令冒充交互终端。POSIX PTY provider 需要宿主显式注入并单独完成进程树、权限和秘密环境复审；Windows ConPTY provider 已由 Windows CI 执行测试验证 spawn/输出/输入/取消/退出码（Windows resize 仍未接线）。服务重启后未完成会话只进入 `manual_review`，不会自动重放。
 
@@ -188,7 +188,7 @@ Patch 垂直切片的调用顺序为：`createPatchProposal` 生成绑定工作�
 
 `GET /v1/models` 查看 Workbench 的本地模型档案；`POST /v1/models` 创建档案提案，使用独立 `x-approval-token` 调用 `/v1/models/<actionId>/approve` 才会登记。档案只保存 provider、protocol、model、能力列表、无密钥的 `env:`/`keychain:` SecretRef 引用和健康摘要；新档案默认 `enabled:false`，不会保存 API key 或 SecretRef 解析值。
 
-`GET /v1/models/<profileId>/health` 是只读、非联网健康摘要，默认返回 `NOT_CONFIGURED`。需要真实连接测试时，调用 `POST /v1/models/<profileId>/health`，请求必须带独立 `x-approval-token`，并在 JSON body 中提交当前 `configHash`；服务只执行一次有超时、取消和响应大小上限的 OpenAI-compatible `GET <endpoint>/models`，固定拒绝 HTTP、回环/私网/metadata endpoint 且不跟随重定向。SecretRef 仅在内存中解析为请求头，解析值不会进入模型档案、审计、响应或快照。Windows 默认使用 Windows Credential Manager 保存 `keychain:` 密钥，非 Windows 开发环境使用进程内存储且不会持久化；Credential Manager 的单条凭据内容限制为 2560 字节。当前不执行聊天补全，也不支持真实 Anthropic/Responses 调用。
+`GET /v1/models/<profileId>/health` 是只读、非联网健康摘要，默认返回 `NOT_CONFIGURED`。需要真实连接测试时，调用 `POST /v1/models/<profileId>/health`，请求必须带独立 `x-approval-token`，并在 JSON body 中提交当前 `configHash`；服务只执行一次有超时、取消和响应大小上限的 OpenAI-compatible `GET <endpoint>/models`，在探针执行层固定拒绝 HTTP、回环/私网/metadata endpoint 且不跟随重定向。分层口径：配置保存层只要求 endpoint 为 `http(s)` 且不含凭据或敏感查询，允许保存 HTTP 与私网地址；上述 HTTPS 与主机/DNS 检查只在探针／runner 实际发起请求时才生效，不是配置保存层的阻断条件。SecretRef 仅在内存中解析为请求头，解析值不会进入模型档案、审计、响应或快照。Windows 默认使用 Windows Credential Manager 保存 `keychain:` 密钥，非 Windows 开发环境使用进程内存储且不会持久化；Credential Manager 的单条凭据内容限制为 2560 字节。当前不执行聊天补全，也不支持真实 Anthropic/Responses 调用。
 
 `POST /v1/secrets` 只返回凭据名称和配置状态，不返回密钥值；同名写入默认拒绝覆盖。只有显式 `overwrite:true` 的轮换和 `DELETE /v1/secrets/<name>` 才能使用独立 `x-approval-token`，并写入不含密钥值的 `secret.configured`/`secret.deleted` 审计事件。
 
