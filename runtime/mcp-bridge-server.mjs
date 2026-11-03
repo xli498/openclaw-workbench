@@ -474,8 +474,13 @@ export function createMcpBridgeServer({
   }
 
   async function handle(request, response) {
-    const pathname = new URL(request.url, `http://${host}`).pathname;
     try {
+      // Parse against a fixed loopback base: only the pathname is used,
+      // so the configured (validated) listen host must never be able to
+      // break request parsing -- a bare IPv6 host such as ::1 is not a
+      // legal URL authority without brackets. Parsing stays inside the
+      // try so a malformed URL is answered, never an unhandled rejection.
+      const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
       if (pathname !== endpoint || (expiresPathTokenAt !== null && clock() >= expiresPathTokenAt)) return responseError(response, 404, 'MCP_ENDPOINT_NOT_FOUND');
       if (!originAllowed(request, origins)) return responseError(response, 403, 'MCP_ORIGIN_FORBIDDEN');
       if (!hasBearer(request, token)) return responseError(response, 401, 'MCP_UNAUTHORIZED');
