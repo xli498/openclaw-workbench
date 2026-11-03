@@ -134,6 +134,10 @@ export function createBridgeTunnelAdapter({
         if (typeof parsed === 'string' && !parsed.includes(token) && /^https:\/\//.test(parsed) && parsed.length <= 2048) {
           const candidate = new URL(parsed);
           if (candidate.protocol !== 'https:' || candidate.username || candidate.password || candidate.search || candidate.hash || (fixedHostname && candidate.hostname.toLowerCase() !== fixedHostname)) continue;
+          // Re-check the normalized origin: URL parsing lowercases the host,
+          // so a token spelled in another case would otherwise survive the
+          // case-sensitive raw-string check above and be retained in origin.
+          if (candidate.origin.toLowerCase().includes(token.toLowerCase())) continue;
           publicUrl = candidate.origin;
           urlWaiter?.resolve(publicUrl);
           urlWaiter = null;
@@ -172,7 +176,13 @@ export function createBridgeTunnelAdapter({
       const thisGeneration = ++generation;
       setState('starting');
       try {
-        child = spawnImpl(command, currentArgs(), {
+        // Final argv check at start: construction-time validation only covers
+        // caller-supplied args, while provider-derived entries (named tunnel
+        // / fixed hostname) reach argv through currentArgs(). A token-shaped
+        // name or hostname must be rejected here, before any spawn.
+        const argv = currentArgs();
+        if (command.includes(token) || argv.some((arg) => arg.includes(token))) fail('TUNNEL_ARGS_INVALID', 'tunnel arguments must not contain the bearer token');
+        child = spawnImpl(command, argv, {
           shell: false,
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe'],
