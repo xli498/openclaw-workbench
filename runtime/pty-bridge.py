@@ -7,6 +7,23 @@ the master, and exits with the child's exit code. It never prints the
 target argv, environment, or any secret material; on stdin EOF it sends
 SIGHUP to the child instead of waiting forever.
 
+Signal handling (Q31-4): pty.fork() puts the child in a new session and
+process group, so a SIGTERM sent to the helper's own (detached) process
+group by the provider cannot reach the child at all. The helper therefore
+installs SIGTERM/SIGINT handlers that forward the signal to the child's
+process group (which covers the child's own descendants in the normal
+non-job-control case), and a watchdog escalates to SIGKILL to that group
+1 second after a forwarded SIGTERM if the group still exists. The helper
+only exits after the child is reaped, so the provider's exit event can
+never again clear an escalation while the tree is still alive.
+Stated limitation: this kills the child's process group, not every
+possible descendant -- a descendant that calls setsid() into its own
+session, or a process stuck in uninterruptible (D-state) sleep that no
+signal including SIGKILL can interrupt, is not guaranteed dead. The
+waitpid after EOF is likewise bounded (see _waitpid_bounded): after the
+deadline the helper SIGKILLs the child group and gives up waiting rather
+than blocking forever.
+
 Resize channel (fd3): the provider opens one extra pipe as the helper's
 fd3. A daemon thread reads fd3 in "<cols> <rows>" lines and applies each
 valid line to the pty with TIOCSWINSZ, then sends SIGWINCH to the child.
@@ -29,6 +46,7 @@ import struct
 import sys
 import termios
 import threading
+import time
 
 MAX_COLS = 500
 MAX_ROWS = 200
@@ -102,6 +120,55 @@ def _resize_loop(master_fd, child_pid):
             pass
 
 
+def _kill_child_group(pid, sig):
+    # The pty child is a session leader, so its process group id equals
+    # its pid. A group kill reaches its descendants in the normal
+    # non-job-control case; fall back to the single pid when the group
+    # is already gone or was changed.
+    try:
+        os.killpg(pid, sig)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def _waitpid_bounded(pid, timeout=2.0):
+    # The old code waited on waitpid(pid, 0) with no deadline: a child
+    # that closed its pty slave but kept running (e.g. after redirecting
+    # its std fds away) left the helper blocked forever once EOF broke
+    # the main loop. Poll with WNOHANG, escalate to SIGKILL at the
+    # deadline, then poll again briefly; never block indefinitely.
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return None
+        if wpid == pid:
+            return status
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    _kill_child_group(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return None
+        if wpid == pid:
+            return status
+        if time.monotonic() >= deadline:
+            # Best effort only: a D-state process cannot be killed by
+            # any signal. Do not hang the helper (and its provider)
+            # forever waiting for it; it will be reaped by init.
+            return None
+        time.sleep(0.02)
+
+
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "--":
@@ -114,6 +181,33 @@ def main():
             os.execvp(argv[0], argv)
         except OSError:
             os._exit(127)
+    # Forward SIGTERM/SIGINT to the child's process group: the
+    # provider's group kill cannot reach this session at all. The
+    # handler only forwards and arms the watchdog; it never exits the
+    # helper itself, so the child is reaped before the helper exits.
+    term_event = threading.Event()
+
+    def _forward(signum, _frame):
+        term_event.set()
+        _kill_child_group(pid, signum)
+
+    def _watchdog():
+        # Wait indefinitely for the first forwarded signal: a timeout
+        # here would silently drop the escalation for a late cancel.
+        # The 1s escalation runs before the provider's own (longer)
+        # helper-group fallback, so the child group is killed before
+        # anything can SIGKILL this helper itself. If the child already
+        # exited and its group is gone, both kills are harmless no-ops;
+        # if descendants still hold the group (and the pty slave) open,
+        # the group kill removes them.
+        term_event.wait()
+        time.sleep(1.0)
+        _kill_child_group(pid, signal.SIGKILL)
+
+    signal.signal(signal.SIGTERM, _forward)
+    signal.signal(signal.SIGINT, _forward)
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
     resize_thread = threading.Thread(target=_resize_loop, args=(fd, pid),
                                      daemon=True)
     resize_thread.start()
@@ -140,10 +234,7 @@ def main():
                     break
                 os.write(fd, data)
     finally:
-        try:
-            _, status = os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
+        status = _waitpid_bounded(pid)
         try:
             os.close(fd)
         except OSError:

@@ -23,7 +23,10 @@ test('PTY resize changes stty size through the provider handle', { skip: SKIP },
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-pty-resize-'));
   let handle;
   try {
-    const provider = createPosixPtyProvider();
+    // sh is not on the provider's default executable allowlist (Q31-3):
+    // this resize-mechanics test opts into it explicitly. The default
+    // allowlist is covered by the PTY allowlist test in pty-provider.
+    const provider = createPosixPtyProvider({ allowedExecutables: ['sh'] });
     const outputs = [];
     let exitResult;
     handle = await provider({

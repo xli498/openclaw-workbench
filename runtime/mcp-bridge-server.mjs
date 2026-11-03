@@ -594,6 +594,9 @@ export function createMcpBridgeServer({
   }
 
   function broadcast(sessionId, notification) {
+    // Q28-5: expire idle sessions first. Without this, a session that
+    // passed its idle timeout but had not yet been swept by the timer
+    // could be revived by a broadcast (which refreshes lastActivity).
     // Same expiry rule as the HTTP path (requireSession): broadcasting
     // to an idle-expired session must fail, not silently refresh its
     // lastActivity and resurrect it. A live broadcast still refreshes
