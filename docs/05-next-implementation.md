@@ -72,7 +72,7 @@
 
 - **LSP 全量**：未实现。下一步：在只读切片上补文档同步（didOpen/didChange/didClose）、诊断接入与经审批的编辑路径（applyEdit 仍须走 Patch 审批），并支持多语言服务器配置。
 - **PTY 窗口尺寸与 Windows PTY**：未实现。下一步：仅在明确需要时做 resize 协议（宿主注入的尺寸通道）与 Windows ConPTY 方案，默认仍保持 pty:false。
-- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针已完成）。`createGatewayLifecycle` 的 probe() 在作者报告的开发环境中因 openclaw 未安装而报告 CLI_NOT_FOUND；CI 环境的探针结果待证——CI 通过不能证明探针码为 CLI_NOT_FOUND，真实探针测试接受 CLI_NOT_FOUND 与 GATEWAY_PROBE_FAILED 两种结果，故此前“本机与 CI 环境实测为 CLI_NOT_FOUND”的写法已收窄，不再断言 CI 结果。start() 无显式注入适配器时明确拒绝，绝不猜测或硬编码 OpenClaw 私有协议；`createGatewayAdapter` 仍只有回环 WebSocket 传输边界且禁公网。下一步：先在已安装 OpenClaw 的受控环境实测稳定集成接口与 docs/01 的 Gateway WebSocket、设备配对、scope 升级清单，再设计生命周期接入。
+- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针已完成）。`createGatewayLifecycle` 的 probe() 在作者报告的开发环境中因 openclaw 未安装而报告 CLI_NOT_FOUND；CI 环境的探针结果待证——CI 通过不能证明探针码为 CLI_NOT_FOUND，真实探针测试接受 CLI_NOT_FOUND、GATEWAY_PROBE_FAILED、GATEWAY_PROBE_TIMEOUT、GATEWAY_PROBE_LIMIT 四种结果，故此前“本机与 CI 环境实测为 CLI_NOT_FOUND”的写法已收窄，不再断言 CI 结果。start() 无显式注入适配器时明确拒绝，绝不猜测或硬编码 OpenClaw 私有协议；`createGatewayAdapter` 仍只有回环 WebSocket 传输边界且禁公网。下一步：先在已安装 OpenClaw 的受控环境实测稳定集成接口与 docs/01 的 Gateway WebSocket、设备配对、scope 升级清单，再设计生命周期接入。
 - **完整 streamable HTTP 会话语义的剩余项**：未全部开放。下一步：按 MCP `2025-06-18` 补服务端对客户端请求的断线续接（Last-Event-ID 回放）与 HTTP 工具执行路由的完整语义，仍须守住审批与 allowlist。
 - **MCP 管理桌面面板**：未实现。下一步：在已完成的管理面 API 上补桌面控制台面板，仍须守住审批与配置漂移失效。
 - **公网隧道真实部署验证**：未验证，已按受控规则停下（不是漏做）。核查：本机与 CI 均无 cloudflared/ngrok CLI；真实验证需要下载第三方隧道二进制，且 named/fixed 模式需要账号凭证与域名绑定，超出受控范围；适配器本身已用 mock CLI 验过（shell:false、Bearer 仅放环境变量、随机路由、reset 失效旧路由、状态/审计不含 URL 与 token）。下一步：仅在已安装 cloudflared 且操作者明确批准的前提下，对哑元回环服务做一次短时 quick-tunnel 试验、立即关闭、只记录通过/失败（不记录 URL），验证前不称生产可用。
