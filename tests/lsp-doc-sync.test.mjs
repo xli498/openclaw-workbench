@@ -192,7 +192,10 @@ test('applyEdit with handler yields only a frozen proposal and leaves the target
       return report.lastApplyEditResponse !== null;
     }, 'applyEdit response to be recorded');
     const report = await hoverReport(client, targetUri);
-    assert.deepEqual(report.lastApplyEditResponse, { result: { applied: true, note: 'proposal-only' } });
+    // The handler claims applied:true, but this client never writes a
+    // file: the receipt to the server must be applied:false, and the
+    // old assertion that blessed the forwarded applied:true is gone.
+    assert.deepEqual(report.lastApplyEditResponse, { result: { applied: false } });
     assert.ok(seenProposal, 'handler received a proposal');
     assert.ok(Object.isFrozen(seenProposal));
     assert.equal(seenProposal.label, 'mock-edit');
@@ -397,6 +400,102 @@ test('position encoding: UTF-8 server negotiation converts didChange locally, fo
     assert.deepEqual(await client.shutdown(), { status: 'closed' });
   } finally {
     await client.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('diagnostics: Bearer and URI rules proven separately on samples longer than the old truncation cap', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-diag2-'));
+  const uri = `file://${root}/d.txt`;
+  const diagFixture = new URL('./fixtures/mock-lsp-diag2-server.mjs', import.meta.url).pathname;
+  const notified = [];
+  const client = createLspClient({
+    command: process.execPath, args: [diagFixture], root,
+    onNotification: (frame) => { notified.push(frame); },
+  });
+  try {
+    await client.start();
+    client.didOpen(uri, 'plaintext', 'hello');
+    await waitFor(() => client.getDiagnostics(uri).length === 4, 'diag2 diagnostics to arrive');
+    const stored = client.getDiagnostics(uri);
+    // Bearer rule, proven alone: entry 0 carries a Bearer token and no
+    // URL userinfo; its tail survives, so the token vanished by rule,
+    // not because the message was cut to 20 chars as in the old test.
+    assert.equal(stored[0].message.includes('A'.repeat(60)), false);
+    assert.ok(stored[0].message.includes('[redacted]'));
+    assert.ok(stored[0].message.endsWith('x'.repeat(60)));
+    assert.ok(stored[0].message.length > 20);
+    // URI-userinfo rule, proven alone: entry 1 carries userinfo and no
+    // Bearer token; its tail likewise survives.
+    assert.equal(stored[1].message.includes('diaguser'), false);
+    assert.equal(stored[1].message.includes('diagpass123'), false);
+    assert.ok(stored[1].message.includes('://[redacted]@'));
+    assert.ok(stored[1].message.endsWith('y'.repeat(60)));
+    // Quoted credential value with spaces is consumed whole: no half
+    // of the value may survive past the closing quote.
+    assert.equal(stored[2].message.includes('alpha'), false);
+    assert.equal(stored[2].message.includes('beta'), false);
+    assert.equal(stored[2].message.includes('gamma'), false);
+    assert.ok(stored[2].message.includes('[redacted]'));
+    assert.ok(stored[2].message.endsWith('z'.repeat(60)));
+    // code/source are bounded and redacted, not stored verbatim.
+    assert.equal(stored[3].code, 'C'.repeat(128));
+    assert.equal(stored[3].source, 'S'.repeat(128));
+    assert.equal(stored[3].code.includes('should-not-leak-code'), false);
+    assert.equal(stored[3].source.includes('should-not-leak-source'), false);
+    // onNotification receives the sanitized copy, never the raw frame,
+    // and the out-of-root diagnostic is not forwarded at all.
+    const diagFrames = notified.filter((frame) => frame.method === 'textDocument/publishDiagnostics');
+    assert.equal(diagFrames.length, 1, 'only the in-root notification is forwarded');
+    assert.deepEqual(diagFrames[0].params, { uri, diagnostics: stored });
+    const forwarded = JSON.stringify(diagFrames[0]);
+    for (const leak of ['A'.repeat(60), 'diagpass123', 'alpha', 'should-not-leak']) assert.equal(forwarded.includes(leak), false);
+    assert.equal(notified.some((frame) => frame.params?.uri === 'file:///etc/passwd'), false);
+    assert.deepEqual(await client.shutdown(), { status: 'closed' });
+  } finally {
+    await client.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('collectWorkspaceEditProposal: same-URI version conflicts rejected, equal versions merge', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-proposal-ver-'));
+  try {
+    const uri = `file://${root}/a.txt`;
+    const edit = (line) => ({ range: { start: { line, character: 0 }, end: { line, character: 1 } }, newText: 'x' });
+    // Two different non-null versions for one URI: the later version
+    // constraint used to be silently dropped; now it is rejected.
+    assert.throws(() => collectWorkspaceEditProposal({
+      documentChanges: [
+        { textDocument: { uri, version: 4 }, edits: [edit(0)] },
+        { textDocument: { uri, version: 5 }, edits: [edit(1)] },
+      ],
+    }, { root }), { code: 'LSP_EDIT_INVALID' });
+    // Equal versions merge and keep the version.
+    const merged = collectWorkspaceEditProposal({
+      documentChanges: [
+        { textDocument: { uri, version: 4 }, edits: [edit(0)] },
+        { textDocument: { uri, version: 4 }, edits: [edit(1)] },
+      ],
+    }, { root });
+    assert.equal(merged.files[0].version, 4);
+    assert.equal(merged.files[0].edits.length, 2);
+    // Null then version adopts the version; version then null keeps it.
+    const adopted = collectWorkspaceEditProposal({
+      documentChanges: [
+        { textDocument: { uri }, edits: [edit(0)] },
+        { textDocument: { uri, version: 7 }, edits: [edit(1)] },
+      ],
+    }, { root });
+    assert.equal(adopted.files[0].version, 7);
+    const kept = collectWorkspaceEditProposal({
+      documentChanges: [
+        { textDocument: { uri, version: 7 }, edits: [edit(0)] },
+        { textDocument: { uri }, edits: [edit(1)] },
+      ],
+    }, { root });
+    assert.equal(kept.files[0].version, 7);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

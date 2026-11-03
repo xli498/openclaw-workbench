@@ -26,7 +26,12 @@ const SECRET_FLAG_PATTERN = /(?:^|\s)(?:--?|\/)(?:token|password|secret|api[-_ ]
 const ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const URL_USERINFO_PATTERN = /:\/\/[^/\s:]+:[^@\s]+@/g;
 const BEARER_TOKEN_PATTERN = /bearer\s+[A-Za-z0-9._\-~+/=]+/gi;
-const CREDENTIAL_ASSIGN_PATTERN = /([A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[ _-]?key)[A-Za-z0-9_.\-]*\s*[:=]\s*)[^\s,;]+/gi;
+// Credential-assignment values must cover quoted values in full:
+// with a bare [^\s,;]+ value, secret="a b" redacted only `"a` and
+// left ` b"` behind. The quoted alternatives come first so a quoted
+// value (including spaces) is consumed whole; unquoted values keep
+// the old terminators.
+const CREDENTIAL_ASSIGN_PATTERN = /([A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[ _-]?key)[A-Za-z0-9_.\-]*\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi;
 
 export const LSP_READ_ONLY_METHODS = Object.freeze([
   'initialize',
@@ -249,7 +254,10 @@ function redactDiagnosticMessage(message) {
 
 // Keep only the allowlisted diagnostic fields; drop everything else the
 // server sent. Returns a frozen record, or null when the entry has no
-// usable string message.
+// usable string message. code/source are bounded and redacted like
+// messages: previously they were stored verbatim at any length, so a
+// server could smuggle credential or path material through them past
+// the message filter.
 function sanitizeDiagnostic(diagnostic, maxMessageChars) {
   if (!diagnostic || typeof diagnostic !== 'object' || Array.isArray(diagnostic) || typeof diagnostic.message !== 'string') return null;
   const record = { message: redactDiagnosticMessage(diagnostic.message).slice(0, maxMessageChars) };
@@ -259,8 +267,9 @@ function sanitizeDiagnostic(diagnostic, maxMessageChars) {
     record.range = copyRange(diagnostic.range);
   }
   if (Number.isSafeInteger(diagnostic.severity)) record.severity = diagnostic.severity;
-  if (typeof diagnostic.code === 'string' || Number.isSafeInteger(diagnostic.code)) record.code = diagnostic.code;
-  if (typeof diagnostic.source === 'string') record.source = diagnostic.source;
+  if (Number.isSafeInteger(diagnostic.code)) record.code = diagnostic.code;
+  else if (typeof diagnostic.code === 'string') record.code = redactDiagnosticMessage(diagnostic.code).slice(0, 128);
+  if (typeof diagnostic.source === 'string') record.source = redactDiagnosticMessage(diagnostic.source).slice(0, 128);
   return Object.freeze(record);
 }
 
@@ -324,7 +333,16 @@ export function collectWorkspaceEditProposal(input, { root } = {}) {
     const normalized = edits.map(validateTextEdit);
     const existing = byUri.get(uri);
     if (existing) {
-      if (existing.version === null) existing.version = version;
+      // A version is a constraint on the document state the edits were
+      // written against. Keeping only the first non-null version
+      // silently dropped later constraints, so edits written against
+      // a different version would merge as if they agreed. Equal
+      // versions merge; a null side adopts the other's version; two
+      // different non-null versions conflict and are rejected.
+      if (version !== null) {
+        if (existing.version === null) existing.version = version;
+        else if (existing.version !== version) fail('LSP_EDIT_INVALID', 'LSP workspace edit document versions conflict for the same URI');
+      }
       existing.edits.push(...normalized);
     } else {
       byUri.set(uri, { uri, version, edits: [...normalized] });
@@ -468,16 +486,22 @@ export function createLspClient({
     try { send(error ? { jsonrpc: '2.0', id, error } : { jsonrpc: '2.0', id, result: result ?? null }); } catch {}
   }
 
+  // Returns the frozen sanitized records, or null when the frame is
+  // malformed or out of root. A null return means "discarded": the
+  // caller must not forward the raw frame anywhere, or the screening
+  // above would be bypassed for onNotification consumers.
   function handlePublishDiagnostics(params) {
-    if (!params || typeof params !== 'object' || Array.isArray(params) || typeof params.uri !== 'string' || !Array.isArray(params.diagnostics)) return;
-    try { resolveLspUri(params.uri, rootPath); } catch { return; } // Out-of-root diagnostics are discarded, never stored.
+    if (!params || typeof params !== 'object' || Array.isArray(params) || typeof params.uri !== 'string' || !Array.isArray(params.diagnostics)) return null;
+    try { resolveLspUri(params.uri, rootPath); } catch { return null; } // Out-of-root diagnostics are discarded, never stored.
     const stored = [];
     for (const diagnostic of params.diagnostics) {
       if (stored.length >= maxDiagnosticsPerUri) break;
       const clean = sanitizeDiagnostic(diagnostic, maxDiagnosticMessageChars);
       if (clean) stored.push(clean);
     }
-    diagnostics.set(params.uri, Object.freeze(stored));
+    const frozen = Object.freeze(stored);
+    diagnostics.set(params.uri, frozen);
+    return frozen;
   }
 
   function handleFrame(frame) {
@@ -508,8 +532,18 @@ export function createLspClient({
             sendResponse(frame.id, null, { code: -32602, message: 'Invalid params' });
             return;
           }
+          // The handler only queues proposal data; this client never
+          // writes a file, and this package contains no wiring that
+          // turns a proposal into a Patch proposal, runs independent
+          // approval, and lands it on disk. Approval-before-landing is
+          // therefore a caller contract, not a connected chain in this
+          // package, and must not be claimed as one. Whatever the
+          // handler returns, the receipt to the server is
+          // applied:false: forwarding a handler's applied:true would
+          // tell the server the edit landed while the target file is
+          // still untouched.
           Promise.resolve().then(() => editProposalHandler(proposal))
-            .then((result) => sendResponse(frame.id, result === undefined ? { applied: false } : result))
+            .then(() => sendResponse(frame.id, { applied: false }))
             .catch(() => sendResponse(frame.id, null, { code: -32603, message: 'Internal error' }));
         } else {
           sendResponse(frame.id, null, { code: -32601, message: 'Method not found' });
@@ -524,7 +558,15 @@ export function createLspClient({
       return;
     }
     if (typeof frame.method === 'string') {
-      if (frame.method === 'textDocument/publishDiagnostics') handlePublishDiagnostics(frame.params);
+      if (frame.method === 'textDocument/publishDiagnostics') {
+        // onNotification receives the SANITIZED copy, never the raw
+        // frame: forwarding the raw frame would hand unscreened
+        // diagnostics (credential material, unbounded code/source,
+        // non-allowlisted fields) straight to the callback.
+        const sanitized = handlePublishDiagnostics(frame.params);
+        if (sanitized !== null) onNotification?.({ ...frame, params: { uri: frame.params.uri, diagnostics: sanitized } });
+        return;
+      }
       onNotification?.(frame);
     }
   }

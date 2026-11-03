@@ -1053,6 +1053,12 @@ stopRuntime.addEventListener('click', async () => {
   catch (error) { setFeedback(projectFeedback, error.message || 'Runtime 停止失败。', 'error'); await refreshRuntime(); }
 });
 
+async function secretActionHash(operation, name, version) {
+  const input = JSON.stringify({ type: `secret.${operation}`, sessionId: 'secret', workspaceRevision: version, target: name, preview: null, risk: 'high' });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 saveModel.addEventListener('click', async () => {
   const id = modelIdInput.value.trim();
   const provider = modelProviderInput.value.trim();
@@ -1073,7 +1079,8 @@ saveModel.addEventListener('click', async () => {
   let profileProposed = false;
   const secretName = `workbench.model.${id}`;
   try {
-    await modelRequest('POST', '/v1/secrets', { name: secretName, value: apiKey });
+    const configured = (await modelRequest('GET', `/v1/secrets/${encodeURIComponent(secretName)}`)).configured === true;
+    await modelRequest('POST', '/v1/secrets', { name: secretName, value: apiKey, actionHash: await secretActionHash('create', secretName, configured ? 'present' : 'absent') });
     secretStored = true;
     modelApiKeyInput.value = '';
     const result = await modelRequest('POST', '/v1/models', {
@@ -1091,7 +1098,10 @@ saveModel.addEventListener('click', async () => {
     setFeedback(modelFeedback, '密钥已保存到 Windows 凭据管理器；模型档案等待人工批准。', 'success');
   } catch (error) {
     if (secretStored && !profileProposed) {
-      try { await modelRequest('DELETE', `/v1/secrets/${encodeURIComponent(secretName)}`, null, true); } catch {}
+      try {
+        const configured = (await modelRequest('GET', `/v1/secrets/${encodeURIComponent(secretName)}`)).configured === true;
+        await modelRequest('DELETE', `/v1/secrets/${encodeURIComponent(secretName)}`, { actionHash: await secretActionHash('delete', secretName, configured ? 'present' : 'absent') }, true);
+      } catch {}
     }
     const message = error.message || '模型配置失败。';
     setFeedback(modelFeedback, apiKey && message.includes(apiKey) ? '模型配置失败，错误内容已隐藏。' : message, 'error');

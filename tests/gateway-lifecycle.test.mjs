@@ -38,7 +38,7 @@ test('Gateway lifecycle real probe never throws and never guesses a protocol', a
   const probe = await lifecycle.probe();
   assert.equal(probe.cli, 'openclaw');
   assert.equal(typeof probe.available, 'boolean');
-  if (!probe.available) assert.ok(['CLI_NOT_FOUND', 'GATEWAY_PROBE_FAILED'].includes(probe.code));
+  if (!probe.available) assert.ok(['CLI_NOT_FOUND', 'GATEWAY_PROBE_FAILED', 'GATEWAY_PROBE_TIMEOUT', 'GATEWAY_PROBE_LIMIT'].includes(probe.code));
   await assert.rejects(lifecycle.start(), (error) => error.code === 'GATEWAY_LIFECYCLE_NOT_IMPLEMENTED');
 });
 
@@ -100,7 +100,7 @@ test('Gateway lifecycle real spawn path times out a hanging mock CLI instead of 
     const lifecycle = createGatewayLifecycle({ cliCommand: cliPath, probeTimeoutMs: 300 });
     const probe = await lifecycle.probe();
     assert.equal(probe.available, false);
-    assert.equal(probe.code, 'GATEWAY_PROBE_FAILED');
+    assert.equal(probe.code, 'GATEWAY_PROBE_TIMEOUT');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -110,7 +110,7 @@ test('Gateway lifecycle real spawn path caps mock CLI output instead of bufferin
     const lifecycle = createGatewayLifecycle({ cliCommand: cliPath, maxOutputBytes: 64 });
     const probe = await lifecycle.probe();
     assert.equal(probe.available, false);
-    assert.equal(probe.code, 'GATEWAY_PROBE_FAILED');
+    assert.equal(probe.code, 'GATEWAY_PROBE_LIMIT');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -136,4 +136,41 @@ test('Gateway lifecycle start passes arguments through to an injected adapter an
   assert.equal(lifecycle.getState(), 'ready');
   assert.deepEqual(await lifecycle.stop('arg-b'), { status: 'stopped' });
   assert.deepEqual(seen, [['start', 'arg-a', { flag: true }], ['stop', 'arg-b']]);
+});
+
+test('Gateway probe classifies timeout, output limit, and internal failure distinctly', async () => {
+  const timedOut = createGatewayLifecycle({ spawnFn: async () => { throw Object.assign(new Error('probe timed out'), { code: 'GATEWAY_PROBE_TIMEOUT' }); } });
+  assert.deepEqual(await timedOut.probe(), { available: false, cli: 'openclaw', code: 'GATEWAY_PROBE_TIMEOUT' });
+  const capped = createGatewayLifecycle({ spawnFn: async () => { throw Object.assign(new Error('probe output too large'), { code: 'GATEWAY_PROBE_LIMIT' }); } });
+  assert.deepEqual(await capped.probe(), { available: false, cli: 'openclaw', code: 'GATEWAY_PROBE_LIMIT' });
+  const internal = createGatewayLifecycle({ spawnFn: async () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } });
+  assert.deepEqual(await internal.probe(), { available: false, cli: 'openclaw', code: 'GATEWAY_PROBE_FAILED' });
+  const plain = createGatewayLifecycle({ spawnFn: async () => { throw new Error('boom'); } });
+  assert.deepEqual(await plain.probe(), { available: false, cli: 'openclaw', code: 'GATEWAY_PROBE_FAILED' });
+});
+
+test('Gateway probe redacts before truncating, so a credential past the cut cannot leak', async () => {
+  // The URL userinfo straddles the 256-char cut: 'http://probeuser:'
+  // and the first 8 password chars sit inside the cut, but the '@'
+  // that the redaction pattern needs sits past it. Truncate-first
+  // would cut before the '@', the pattern would no longer match, and
+  // the credential fragment before the cut would leak verbatim.
+  const firstLine = `openclaw 1.0.0 ${'x'.repeat(215)} http://probeuser:probepass999@example.com/x`;
+  assert.ok(firstLine.indexOf('@') > 256, 'test setup: @ must sit past the truncation point');
+  assert.ok(firstLine.indexOf('probeuser') < 256, 'test setup: userinfo must start inside the cut');
+  const lifecycle = createGatewayLifecycle({ spawnFn: async () => ({ code: 0, stdout: `${firstLine}\nsecond line\n` }) });
+  const probe = await lifecycle.probe();
+  assert.equal(probe.available, true);
+  assert.ok(probe.version.length <= 256);
+  assert.match(probe.version, /^openclaw 1\.0\.0/);
+  assert.equal(probe.version.includes('probeuser'), false);
+  assert.equal(probe.version.includes('probepas'), false);
+  assert.equal(probe.version.includes('probepass999'), false);
+});
+
+test('Gateway lifecycle constructor rejects a null adapter and an adapter without stop()', async () => {
+  // Null used to throw a raw TypeError when .start was read off it.
+  assert.throws(() => createGatewayLifecycle({ channelAdapter: null }), (error) => error.code === 'GATEWAY_ADAPTER_INVALID');
+  assert.throws(() => createGatewayLifecycle({ channelAdapter: { start: async () => {} } }), (error) => error.code === 'GATEWAY_ADAPTER_INVALID');
+  assert.throws(() => createGatewayLifecycle({ channelAdapter: { start: async () => {}, stop: 'not-a-function' } }), (error) => error.code === 'GATEWAY_ADAPTER_INVALID');
 });
