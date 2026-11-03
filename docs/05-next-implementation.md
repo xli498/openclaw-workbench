@@ -100,7 +100,7 @@
 
 - **LSP documentChanges 提案化（已完成）**：create/rename/delete 类编辑从拒绝改为只产冻结提案数据，落盘仍走 Patch 提案＋独立审批；positionEncodings 协商与 UTF-16 转换已合；pyright 实测 hover/definition 通过（UTF-8/32 对齐由 mock 与纯转换器验证，非 pyright）。
 - **MCP 管理完整化（已完成）**：后端 deny/cancel 路由（审批 token＋actionHash 绑定，拒绝后不得再批准）；桌面面板补全量配置编辑器（仅 env 键名，不含密钥值）、拒绝/撤销按钮与更新后重新启用入口。
-- **Streamable 持久回放（已完成）**：快照只含事件内容与游标（会话 id 仅 SHA-256 哈希，不含 token）；重启后旧会话按过期处理、不静默复活；跨重启续接须显式 resumeSession（新会话 id、一次性）。
+- **Streamable 持久回放（已完成）**：快照含事件内容与游标（会话索引使用 SHA-256；不单独持久化 Bridge 认证值，事件内容不自动脱敏）；重启后旧会话按过期处理、不静默复活；跨重启续接须显式 resumeSession（新会话 id、一次性）。
 
 ## 第五轮闭环已完成（2026-11-02，GPT Work 审查交叉核对，PR #45）
 
@@ -151,10 +151,10 @@
 
 - 单端点 Streamable HTTP 会话：`initialize` 协商、`tools/list`、`tools/call` 使用 `Mcp-Session-Id` 与 `MCP-Protocol-Version`；`notify`（202/204）、`DELETE` 关闭会话。
 - GET SSE 订阅与 Last-Event-ID 续接：每会话有界回放缓冲（默认 100 条，`evt-N` 递增 id）；过期／截断／超前／非法 id 返回 410 `MCP_EVENT_EXPIRED` 或 400 `MCP_EVENT_ID_INVALID` 且不含事件内容；跨会话回放隔离；Bearer／会话检查优先于回放。
-- 持久回放 `replayStorePath`：快照只含事件内容与游标，会话 id 仅 SHA-256 哈希，不含 token；重启后旧会话按过期处理、不静默复活；关闭会话留 tombstone、永不复活；跨重启续接须调用方显式 `resumeSession`（新会话 id、一次性）。
+- 持久回放 `replayStorePath`：快照含事件内容与游标（会话索引使用 SHA-256；不单独持久化 Bridge 认证值，事件内容不自动脱敏）；重启后旧会话按过期处理、不静默复活；关闭会话留 tombstone、永不复活；跨重启续接须调用方显式 `resumeSession`（新会话 id、一次性）。
 - 空闲会话过期（HTTP 路径）：`requireSession` 先执行过期判定；过期会话处处 404。
 - 显式 `broadcast`：服务端自动推送只来自显式调用，工具执行不自动产生广播；`patch`／`command` 仍只返回待审批提案。
-- 审批与 allowlist 全程未动：Bridge 不替代控制面审批，工具调用仍命中 allowlist。
+- 审批与 allowlist 本轮未修改：Bridge 不替代控制面审批，工具调用仍命中 allowlist。
 
 本轮提交的修复及新增测试（全部 open、未合，见上表，尚待复核；三项主题分离，#49／#50 同文件不同函数，当前修改 hunk 不重叠；合并顺序及更新后的 CI 要求见上文）：
 
