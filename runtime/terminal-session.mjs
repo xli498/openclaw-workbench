@@ -22,7 +22,29 @@ const TERMINAL_STATES = new Set(['running', 'exited', 'cancelled', 'timed_out', 
 // "//" after a scheme or "=" is left alone so URLs such as http://... are not
 // mangled; a path must start at the string start or after a delimiter, so a
 // relative segment such as "a/b" is not treated as absolute.
-const ABSOLUTE_PATH_PATTERN = /(^|[\s=:"'([{;,}\]])(?:[A-Za-z]:[\\/]|\\\\|\/(?!\/))[^\s\r\n'"]*/g;
+// Delimiter/terminator notes (redline fixes for the s1 review):
+// - DELIM adds the previously missing `<`, `>`, `|`, `&`, `)` (and backtick),
+//   so `>/tmp/x`, `</tmp/x`, `|/tmp/x`, `&/tmp/x` no longer pass through.
+// - TERM terminates a token at `<>|&),;}]` and backtick as well, so a closing
+//   `)` is no longer swallowed into the placeholder.
+// - A token may continue across a space-separated segment when that segment
+//   itself contains a separator (`/opt/private dir/file`), the only
+//   space-in-path shape recognisable without knowing the path in advance.
+//   Longer space runs whose middle segments carry no separator
+//   (e.g. `/tmp/x my dir/file`) remain a documented residual: the tail after
+//   the first separator-less segment is relative-looking and cannot be told
+//   apart from prose.
+// - Forward-slash UNC (`//server/share/...`) is matched separately with a
+//   delimiter set that excludes `:`, so `http://...` (where `//` follows a
+//   scheme colon) is never treated as UNC, while a genuine UNC token at a
+//   token boundary is redacted instead of being exempted wholesale.
+const PATH_TERM = '\\s\'"<>|&),;\\]}`';
+const PATH_DELIM = '\\s=:"\'([{;,<>&|)}\\]`';
+const PATH_DELIM_NO_COLON = '\\s="\'([{;,<>&|)}\\]`';
+const PATH_TOKEN = `[^${PATH_TERM}]*`;
+const PATH_CONT = `(?:[ \\t]+[^${PATH_TERM}]*[\\\\/][^${PATH_TERM}]*)*`;
+const ABSOLUTE_PATH_PATTERN = new RegExp(`(^|[${PATH_DELIM}])(?:[A-Za-z]:[\\\\/]|\\\\\\\\|\\/(?!\\/))${PATH_TOKEN}${PATH_CONT}`, 'g');
+const UNC_PATH_PATTERN = new RegExp(`(^|[${PATH_DELIM_NO_COLON}])\\/\\/[^${PATH_TERM}\\/]+\\/(?:${PATH_TOKEN}${PATH_CONT})`, 'g');
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -57,7 +79,7 @@ function safeError(error, fallback = 'SESSION_FAILED') {
 }
 
   function stripAbsolutePaths(value) {
-    return value.replace(ABSOLUTE_PATH_PATTERN, '$1[path redacted]');
+    return value.replace(UNC_PATH_PATTERN, '$1[path redacted]').replace(ABSOLUTE_PATH_PATTERN, '$1[path redacted]');
   }
 
   function truncateText(value, maxLength) {
@@ -141,14 +163,67 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
   // argv is deliberately NOT rewritten here: the live command still needs
   // the real arguments; only outward-facing copies (public view, persisted
   // snapshot, restored record) go through this function.
-  const rootVariants = [...new Set([rootPath, rootPath.replaceAll('\\', '/')])].filter((variant) => variant.length > 1);
+  // Workspace-root replacement, boundary-checked and alias-tolerant. The old
+  // code replaced the root text with no start/end boundary, so a sibling
+  // such as `<root>2/file` lost only its root prefix and leaked the `2/file`
+  // tail, and a root occurring mid-token leaked its prefix. The root is now
+  // rebuilt from its segments joined by a one-or-two-separator class, so
+  // mixed (`C:/work\proj`) and doubled (`C:\\work\\proj`) separator spellings
+  // of the same root match, and drive/UNC roots additionally match
+  // case-insensitively and under the `\\?\` long-path prefix. The match must
+  // start at the string start or after a delimiter and must end at the string
+  // end, a separator, or a terminator. Separator classes are composed from
+  // String.fromCharCode(92) so no backslash-literal escaping level can drift.
+  // The in-memory record argv is deliberately NOT rewritten here: the live
+  // command still needs the real arguments; only outward-facing copies go
+  // through this function.
+  // Order (Q4 Must): root replacement FIRST, then the generic strip, then
+  // secret redaction. The old secret-first order destroyed a space-containing
+  // root that appeared as a secret value (`key=<spaced-root>/file` was cut
+  // at the space by the secret rule, so the root could no longer match and
+  // the tail leaked). Secret redaction now runs with `[path redacted]`
+  // placeholders held aside, so it cannot mangle a placeholder that follows
+  // a key (`key=[path redacted]` stays intact instead of becoming
+  // `key=[redacted] redacted]`).
+  const BS = String.fromCharCode(92);
+  const SEP = `[${BS}${BS}/]`;
+  const SEP12 = `(?:[${BS}${BS}/]{1,2})`;
+  const LONG_PREFIX = `${BS}${BS}${BS}${BS}${BS}?${BS}${BS}`;
+  const rootPattern = (() => {
+    const segments = rootPath.split(/[\\/]+/).filter(Boolean);
+    if (!segments.length) return null;
+    const joined = segments.map(escapeRegExp).join(SEP12);
+    const isDrive = /^[A-Za-z]:/.test(segments[0]);
+    const isUnc = rootPath.startsWith(`${BS}${BS}`);
+    let head;
+    if (isDrive) head = `(?:${LONG_PREFIX})?${joined}`;
+    else if (isUnc) head = `(?:${LONG_PREFIX}UNC${SEP12}|${BS}${BS}${BS}${BS})${joined}`;
+    else head = `${SEP12}${joined}`;
+    // No separate start-delimiter group: the head itself begins with a
+    // separator (or a drive/UNC prefix), which already anchors the first
+    // segment; only the end boundary needs the lookahead, so a root embedded
+    // mid-token still has the root itself hidden while a sibling name such
+    // as `<root>2/...` is never partially replaced.
+    const source = `${head}(?:${SEP}${PATH_TOKEN}${PATH_CONT})?(?=$|[${PATH_TERM}]|${SEP})`;
+    // Sibling pass: the same root followed by name-extension characters
+    // (`<root>2/...`, `<root>-backup/...`). The boundary lookahead above
+    // rightly refuses these, but without a sibling pass a space-containing
+    // sibling root would then leak its tail through the generic strip (which
+    // stops at the space). The extension class excludes separators and list
+    // punctuation, so an exact root or a list-adjacent root never fires here.
+    const siblingSource = `${head}[A-Za-z0-9_.\-]+(?:${SEP}${PATH_TOKEN}${PATH_CONT})?`;
+    return { source, siblingSource, flags: (isDrive || isUnc) ? 'gi' : 'g' };
+  })();
+  function redactSecretsPreservingPlaceholders(value) {
+    return value.split('[path redacted]').map((part) => redactText(part, Number.MAX_SAFE_INTEGER)).join('[path redacted]');
+  }
   function redactStoredPath(value, maxLength) {
     if (typeof value !== 'string') return redactOutput(value, maxLength);
-    let output = redactText(value, Number.MAX_SAFE_INTEGER);
-    for (const variant of rootVariants) {
-      output = output.replace(new RegExp(`${escapeRegExp(variant)}(?:[\\/][^\\s\\r\\n'"]*)?`, 'g'), '[path redacted]');
-    }
-    return truncateText(stripAbsolutePaths(output), maxLength);
+    let output = value;
+    if (rootPattern) output = output.replace(new RegExp(rootPattern.siblingSource, rootPattern.flags), '[path redacted]').replace(new RegExp(rootPattern.source, rootPattern.flags), '[path redacted]');
+    output = stripAbsolutePaths(output);
+    output = redactSecretsPreservingPlaceholders(output);
+    return truncateText(output, maxLength);
   }
   const records = new Map();
   const runtimes = new Map();
