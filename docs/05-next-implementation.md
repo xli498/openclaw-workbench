@@ -83,15 +83,15 @@
 - **LSP 全量切片（文档同步、诊断、经审批编辑、多语言配置已完成）**：didOpen/didChange/didClose（含版本追踪、UTF-16 增量变更、workspace-root URI  enforcement、内容上限）、publishDiagnostics 收集（白名单字段、脱敏、每 URI 封顶）、`collectWorkspaceEditProposal`（只产冻结提案数据，create/rename/delete 拒绝，落盘仍走 Patch 提案＋独立审批）、多语言服务器注册表（配置-only，复用命令/参数/环境校验）。未验证：真实语言服务器与 Windows。
 - **PTY（POSIX resize 已完成；Windows ConPTY 代码已合但未验证）**：POSIX helper 经 fd3 控制通道接受 `cols rows` 行并用 TIOCSWINSZ + SIGWINCH 生效，provider 句柄与 terminal-session 均透传 resize（cols 1–500、rows 1–200）；Windows ConPTY provider 与 PowerShell P/Invoke helper 已合入，文件头标 WINDOWS_PTY_STATUS: UNVERIFIED，Windows 测试在 Windows CI 上按设计跳过，故 ConPTY 生成、输入/输出 pump、cancel、退出码均未验证；Windows resize 明确为 PTY_RESIZE_UNSUPPORTED，留待后续切片（需持久控制通道）。
 - **MCP 管理桌面面板（已完成，后端 0 改动）**：桌面控制台新增 MCP 面板，复用已合管理面 API：只显示名称/启用状态/工具名与 authorized 标记，不显示配置原文、命令参数与密钥引用；update/remove 只生成提案，批准后需重新启用。收窄口径：面板更新目前只改显示名称；后端无拒绝入口，面板只提供批准；漂移失效依赖面板见过的旧 configHash 或提案返回 MCP_CONFLICT。
-- **Gateway（探针测试加强与帮助面实测已完成；生命周期仍未闭合）**：官方 openclaw CLI 2026.10.9 已在受控 VM 家目录装上（605M，含 344 个包），只读 --help 实测确认 gateway/channels/顶层命令名存在；但未实测到稳定、公开的集成接口输出（无运行网关时无法观测 --json 形态与 RPC 协议），故未编写任何生命周期接入代码，start() 无显式注入适配器时仍拒绝。新增探针测试 6 项与调研纪要 docs/gateway-lifecycle-wb3-research.md。
+- **Gateway（探针测试加强；生命周期仍未闭合；帮助面宣称已撤回，真实 CLI 尚未验证）**：原句称官方 openclaw CLI 2026.10.9 已在受控 VM 家目录装上（605M，含 344 个包）且只读 --help 实测确认 gateway/channels/顶层命令名存在，但仓库内无时间、环境、CLI 路径与原始输出一级的记录，且 #39 自带的调研纪要（docs/gateway-lifecycle-wb3-research.md）明写 /tmp 两次安装均失败（ENOSPC，tmpfs 512M 上限）、本轮无任何真实 --version/--help 实测结果，命令名仅为第三方候选清单；故本轮改按“真实 CLI 尚未验证”处理，命令名不得据此写协议代码。限定：家目录安装说法与 /tmp 失败是两次不同尝试，本项依据是证据不足＋与所引纪要冲突，不是证明后来安装为假。未实测到稳定、公开的集成接口输出（无运行网关时无法观测 --json 形态与 RPC 协议），故未编写任何生命周期接入代码，start() 无显式注入适配器时仍拒绝。新增探针测试 6 项（mock CLI，非真实 CLI）与调研纪要 docs/gateway-lifecycle-wb3-research.md。
 - **公网隧道真实部署验证（未闭合，已按受控规则停下）**：cloudflared 已从官方渠道下载到 /tmp（约 40.3MB），哑元回环服务本身可达；但 quick-tunnel 两次建链均失败（TLS 握手异常类别，带代理与直连均同），未建立可用隧道，试验后进程均已确认退出、无长期 endpoint 残留。下一步：仅在隧道建链端点 TLS 握手能正常通过的环境中重跑哑元 quick 试验，或由操作者明确批准其他受控路径；不改 named/fixed、不接真实工作区。
-- **并行时序 flaky（已确定性修复，非阈值蒙混）**：MCP HTTP 超时测试的 slow 服务改为永不响应（超时必赢）、非超时断言改用 generous-timeout 传输、洪泛测试改为轮询等服务端观测到关闭；运行时修了显式调用方 abort 优先于超时计时器的错误映射（abortedByCaller 标志）。全量本地（代理变量清空）：542 项、527 通过、0 失败、15 跳过（Windows-only）。
+- **并行时序 flaky（已调整映射与测试时序，竞态回归证据仍待补齐）**：MCP HTTP 超时测试的 slow 服务改为永不响应（超时必赢）、非超时断言改用 generous-timeout 传输、洪泛测试改为轮询等服务端观测到关闭；运行时修了显式调用方 abort 优先于超时计时器的错误映射（abortedByCaller 标志）。全量本地（代理变量清空）：542 项、527 通过、0 失败、15 跳过（Windows-only）。（以上计数为执行方自报。）
 
 ## 仍未闭合项（截至第三轮闭环，2026-11-01，写明原因与下一步，不冒充完成）
 
 - **LSP 全量剩余**：真实语言服务器接入未验证；`documentChanges` 的 create/rename/delete 类编辑仍被拒绝而非提案化；didChange 编码对齐（UTF-8/UTF-32 服务器）未验证。下一步：接真实语言服务器实测后再切片。
 - **PTY 剩余**：Windows ConPTY 生成、输入/输出 pump、cancel、退出码未验证（Windows 测试按设计跳过）；Windows resize 未接线（PTY_RESIZE_UNSUPPORTED）。下一步：在 Windows CI/受控 Windows 环境实测 ConPTY 路径后，再补命名管道控制通道做 Windows resize。
-- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针与帮助面实测）。下一步：在受控隔离环境以隔离 profile 起本地回环网关，实测 gateway status/probe/health 的裸跑输出（尤其 --json 形态）与 channels list/status 的空配置行为，拿到真实输出样本后才设计生命周期接入；凡涉及登录、配对、token、写真实配置的验证，须用户明确授权后另行受控验证。
+- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针；真实 CLI 帮助面未验证）。下一步：在受控隔离环境以隔离 profile 起本地回环网关，实测 gateway status/probe/health 的裸跑输出（尤其 --json 形态）与 channels list/status 的空配置行为，拿到真实输出样本后才设计生命周期接入；凡涉及登录、配对、token、写真实配置的验证，须用户明确授权后另行受控验证。
 - **streamable HTTP 剩余（第三轮口径已部分闭合，见第四轮与文末第五轮清单）**：桥接服务端 tools/list、tools/call 与 GET SSE 分支均已实现，客户端 transport 亦已有 initialize、GET SSE 订阅与 DELETE 会话终止（不再是仅受限 POST）；进程内回放缓冲重启即失已由第四轮 replayStorePath 持久化闭合。仍剩余：服务端状态快照端点等完整语义仍按 MCP 2025-06-18 逐项核对中（仍守审批与 allowlist）。
 - **MCP 管理剩余（第三轮口径已由第四轮闭合，见“第四轮闭环已完成 · MCP 管理完整化”）**：面板全量配置编辑器、后端 deny/cancel 路由与更新后重新启用入口均已实现；本项不再列为未闭合项（文末第五轮清单亦不再列 MCP 管理项）。
 - **公网隧道真实部署验证**：未验证（见上）。下一步：仅在 TLS 建链可通的环境重跑哑元 quick 试验，验证前不称生产可用。
@@ -110,13 +110,13 @@
 - **Q3 高项（已验证）**：provider 改为 exit 只记状态、close 收齐 stdio 后刷新两个 decoder 再结算；231 断言 error.childExitCode === 42（启动失败再也不能冒充真 42）；233 先等就绪标记、断言取消前未退出、再取消；新增大输出（100 行＋唯一尾标记）测试，尾标记须在 onExit 解析时已在输出中。
 - **Q3 中、低项（已验证）**：provider 注册 stdin error 监听；taskkill 加 5 秒有限 timeout 并保存结果；环境合并按 Windows 不区分大小写规范化键，helper 按 OrdinalIgnoreCase 排序环境块；全部 cmd 测试 argv 加 /d（AutoRun 未断言为原因，仅作加固）。
 - **Windows CI 验证结果（PR #45 最终 head cbaea26，run 41391398892，job 125103384548）**：test (22.19.0) success、test (24.x) success、windows-compatibility success；Windows PTY 测试 229–236 全部通过（229 PS 可用、230 echo、231 exit 42、232 input、233 cancel、234 尾标记、235 提前结束写、236 环境规范化）。PR #45 以合并 commit d810db0 合入 main，wb4-pty 分支已删。
-- **本地测试说明**：最终全量本地为 557 项中 532 通过、2 失败、23 跳过；2 项失败均为 DNS 地址固定并保留 TLS 验证的 HTTPS 传输测试的 ERR_PROXY_TUNNEL 代理隧道超时，已在基线 1f440e7 的 worktree 上复现同一失败，与本次改动文件无关；Windows-only 测试在 Linux 上按设计跳过，从未声称本地跑过。
+- **本地测试说明**：最终全量本地为 557 项中 532 通过、2 失败、23 跳过；2 项失败均为 DNS 地址固定并保留 TLS 验证的 HTTPS 传输测试的 ERR_PROXY_TUNNEL 代理隧道超时，已在基线 1f440e7 的 worktree 上复现同一失败，与本次改动文件无关；Windows-only 测试在 Linux 上按设计跳过，从未声称本地跑过。（以上计数为执行方自报。）
 
 ## 仍未闭合项（截至第五轮闭环，2026-11-02，写明原因与下一步，不冒充完成）
 
 - **Windows ConPTY resize**：仅有命名管道控制通道的设计文档（~/workspace/wb4-work/windows-pty-resize-design.md，不进仓库），PTY_RESIZE_UNSUPPORTED 仍在。下一步：在已验证的 ConPTY 执行路径上补实现 PR＋绿色 Windows 执行测试（含 $Host.UI.RawUI.WindowSize 观测验证）。
 - **LSP 全量剩余**：真实语言服务器接入未验证；UTF-8/UTF-32 编码对齐仅由 mock 与纯转换器验证。下一步：接真实语言服务器实测后再切片。
-- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针与帮助面实测）。channel add/login/logout、scope 升级、设备配对、持久化运行时 token、gateway install/start 均未做（授权边界止步）。下一步：凭用户授权的非密钥登录/配对路径，或可注入的已验证 channel 适配器，再推进。
+- **OpenClaw channel / Gateway 生命周期**：未实现（仅探针；真实 CLI 帮助面未验证）。channel add/login/logout、scope 升级、设备配对、持久化运行时 token、gateway install/start 均未做（授权边界止步）。下一步：凭用户授权的非密钥登录/配对路径，或可注入的已验证 channel 适配器，再推进。
 - **公网隧道真实部署验证**：未验证。quick-tunnel 两次建链均失败（TLS 握手异常类别，带代理与直连均同；已排查时钟偏差约 3 秒、DNS CGNAT sinkhole 答案、公共解析器 UDP 53 被拦）。下一步：仅在能到达真实 Cloudflare 边缘的可 clean egress 主机上重跑哑元 quick 试验，验证前不称生产可用。
 - **Streamable 剩余**：回放缓冲持久化已实现（replayStorePath），但服务端状态快照端点等完整语义仍按 MCP 2025-06-18 逐项核对中。下一步：按协议逐项补齐并加红队测试，仍守审批与 allowlist。
 
@@ -183,8 +183,18 @@
 
 ## 仍未闭合项（截至第六轮 docs 同步，2026-11-02，最新清单；此前各轮清单为历史快照）
 
-- **Gateway 生命周期**：未实现（仅探针与帮助面实测）。下一步：凭用户授权的非密钥登录／配对路径，或可注入的已验证 channel 适配器，再推进；凡涉及登录、配对、token、写真实配置的验证，须用户明确授权后另行受控验证。
+- **Gateway 生命周期**：未实现（仅探针；真实 CLI 帮助面未验证）。下一步：凭用户授权的非密钥登录／配对路径，或可注入的已验证 channel 适配器，再推进；凡涉及登录、配对、token、写真实配置的验证，须用户明确授权后另行受控验证。
 - **公网隧道真实部署验证**：未验证。quick-tunnel 两次建链均失败（TLS 握手异常类别，带代理与直连均同；已排查时钟偏差约 3 秒、DNS CGNAT sinkhole 答案、公共解析器 UDP 53 被拦）。下一步：仅在能到达真实 Cloudflare 边缘的可 clean egress 主机上重跑哑元 quick 试验，验证前不称生产可用。
 - **Streamable 部分／未实现／未闭合项的逐项裁决**：见上表（POST SSE 续接、多版本协商、`notifications/cancelled`、服务端主动请求、多 GET 流扇出、服务端状态快照 HTTP 端点、快照留存无界、外部截断整文件丢失、快照文件权限），每项须单独裁决采纳／不采纳／排期，不得打包默认通过。
 - **#47／#48／#49／#50／#51 的合并门**：见上表。#47 等第一批审查结论与交叉核对；#48 等 Codex 窗口复核结论交叉核对＋CI pyright 安装步；#49–#51 等复核结论与交叉核对，建议顺序 #49 → #50 → #51，每合一个重看 CI。
 - **承接项（不重列已闭合项）**：LSP 真实服务器接入在 #48 合入前仍算未验证（CI 安装步缺失时测试跳过）；Windows resize 在 #47 合入前仍为 `PTY_RESIZE_UNSUPPORTED`；MCP 管理面板全量编辑器与 deny/cancel 路由已在第四轮闭合，不再重列。
+
+## P2 跟进修复（2026-11-03，PR #37–#41 跟进，分支 wb-p2-s6；未合并）
+
+- **Windows 验证口径（Q37-4）**：Windows job 成功本身不等于 ConPTY 验证；验证只认被 Windows job 的测试名过滤表选中且在 win32 上实际执行的测试。#37 head 实查：Windows provider 3 项测试在 win32 上全部跳过（Linux-only 断言），PTY resize 6 项测试标题均无过滤 token（`PTY resize…`／`terminal session manager…`），故 #37 在 Windows 上实际执行的新测试为零；PR #45 之后才由测试 229–236 在 Windows job 中实际执行（run 41391398892，job 125103384548）。本轮补的 Windows ConPTY resize 用例标题含 `Windows`，命中过滤表，且在 win32 上不跳过：它在真实 ConPTY 会话存活（就绪标记已见、未退出）时调用 `handle.resize()`，要求诚实的 PTY_RESIZE_UNSUPPORTED 拒绝，不伪造尺寸。本地同 head 过滤表实测（Linux，`--test-name-pattern="Windows"`）：windows-pty-provider 文件 12 项中 3 项通过（Linux-only 断言）、9 项被选中但按平台跳过（含新增 resize 用例）；pty-resize 文件 6 项均未被选中（标题无 token）。Linux 上的“跳过”不等于 Windows 上的“执行”，本轮新增用例在 Windows 上的执行须以本 PR 的 Windows job 日志为准，不得由 CI 绿推定。（本地数字为执行方自报。）
+- **MCP 面板批准竞态（Q38-4）**：批准回调改为批准前捕获待批准提案、审批期间置 busy（批准／拒绝／撤销／刷新四入口均禁用）、完成后仅当待批准提案仍为同一 action id 时才清空；等待期间提交的新提案不再被错清、反馈取捕获时的 operation，等待期间被清空的 pending 不再因事后重读抛错而把已成功的批准报成“审批失败”。延迟批准切换／清空测试已补（tests/desktop-mcp-panel.test.mjs）。口径说明：#38 时代“面板只有刷新、提交更新提案、批准三个入口”是当时的事实；主线后续（第四轮）已补后端 deny/cancel 路由与面板拒绝／撤销按钮、更新后重新启用入口，故本轮不再把“重新启用、拒绝／撤销未接入”写进文档，文档写的是现行已接入状态＋本次竞态修复，不宣称闭环已完成（Windows resize、Gateway 生命周期等仍未闭合，见上）。
+- **Gateway 宣称撤回（Q39-1）与 docs/05 措辞更正（Q41-3）**：第三轮 Gateway 小节原“家目录装上（605M，344 个包）、--help 实测确认命令名存在”已改为“真实 CLI 尚未验证”保守口径，理由是证据不足＋与 #39 自带调研纪要冲突（该纪要明写 /tmp 两次安装均失败、无真实 --version/--help 实测）；限定：家目录说法与 /tmp 失败是两次不同尝试，本项不是证明后来安装为假。仓库内其余重复“帮助面实测”的句子已同步改为“真实 CLI 帮助面未验证”；未找到时间、环境、CLI 路径与原始输出一级的可核证据，故未补证据句。
+- **MCP HTTP 取消／超时竞态回归测试（Q40-3）**：补受控 fetchImpl＋信号观测的确定性测试（tests/mcp-http-transport.test.mjs）：fetch 持有其拒绝直至测试释放，测试在观测到控制器信号已中止（即超时计时器已触发）后才执行调用方 abort，再释放拒绝；调用方 abort 必须胜出（MCP_REQUEST_ABORTED），无调用方 abort 时必须报超时（MCP_REQUEST_TIMEOUT）。旧实现（超时优先映射）在新测试 Case A 上失败，反向验证见 PR 描述。至此第三轮 flaky 小节的“竞态回归证据仍待补齐”由本轮新测试覆盖。
+- **#40 head Windows 失败定位（Q40-5）**：已定位，非偶发。证据：PR #40 head 0c0d23 的 Windows job（run 41320912864，job 124890723042）第 6 步“Windows runtime compatibility”失败，全量 pattern 运行 219 通过、4 失败，失败全部在 tests/gateway-lifecycle.test.mjs 的 4 项 mock CLI spawn 测试（#50 探针首行、#51 非零退出、#52 挂起超时、#53 输出上限），堆栈均为 spawn 无扩展名 shebang 脚本在 Windows 上 ENOENT → 探针报 CLI_NOT_FOUND（预期 GATEWAY_PROBE_FAILED／available=true）。根因文件即该测试文件的 mock CLI 生成方式。修复已由主线后续提交 282bd12 落地（Windows 下改用 .cmd 垫片＋经 cmd.exe 路由，仍 shell:false），主线 head 的 Windows job 已成功；本轮不重复改该文件，本 PR 的 Windows job 为复验，复验结果以 job 日志为准。
+- **README 与计数口径（Q41-2）**：README L7 过期措辞已更新：LSP 不再写“只读客户端切片之上”，改为文档同步、诊断、经审批编辑提案与 documentChanges 提案化，真实语言服务器接入等包外后端事实保留“未核”；ConPTY 表述改为“Windows job 中被选中执行的测试验证（PR #45，测试 229–236）”，不再以 job 成功笼统代验证。第三轮 flaky 句已改为“已调整映射与测试时序，竞态回归证据仍待补齐”，并由本轮第 4 项新测试覆盖（见上）；第三轮与第五轮的本地计数字句均已注明“执行方自报”。
+- **分支保护**：历史配置未实查（本 PR 描述亦同）。
