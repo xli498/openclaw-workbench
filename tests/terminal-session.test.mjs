@@ -315,6 +315,86 @@ test('恢复持久化终端会话时再次脱敏绝对路径输出', async () =>
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('终端会话审批门禁只接受严格 true，非布尔真值不得启动 provider 或 runner', async () => {
+  const root = await fixture('ocw-terminal-session-approval-strict-');
+  let providerStarts = 0;
+  const providerManager = createTerminalSessionManager({ root, sessionProvider: () => { providerStarts += 1; return { cancel() {} }; } });
+  try {
+    for (const approved of [1, 'yes', {}]) {
+      await assert.rejects(() => providerManager.create({ argv: ['pwd'], approved }), (error) => error.code === 'APPROVAL_REQUIRED');
+    }
+    assert.equal(providerStarts, 0);
+  } finally {
+    await providerManager.close();
+  }
+  const runnerRoot = await fixture('ocw-terminal-session-approval-strict-runner-');
+  let runnerCalls = 0;
+  const runnerManager = createTerminalSessionManager({ root: runnerRoot, runCommand: async () => { runnerCalls += 1; return { code: 0, stdout: 'ok\n', stderr: '', cwd: runnerRoot }; } });
+  try {
+    await assert.rejects(() => runnerManager.create({ argv: ['pwd'], approved: 1 }), (error) => error.code === 'APPROVAL_REQUIRED');
+    assert.equal(runnerCalls, 0);
+  } finally {
+    await runnerManager.close();
+    await rm(root, { recursive: true, force: true });
+    await rm(runnerRoot, { recursive: true, force: true });
+  }
+});
+
+test('已是 manual_review 的快照恢复时统一清零能力位并保留原复核原因', async () => {
+  const root = await fixture('ocw-terminal-session-manual-review-caps-');
+  const id = '00000000-0000-4000-8000-000000000030';
+  const directory = path.join(root, '.openclaw-workbench', 'terminal-sessions');
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, `${id}.json`), JSON.stringify({ version: 1, id, status: 'manual_review', argv: ['pwd'], cwd: '.', capabilities: { pty: true, input: true, incrementalOutput: true }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), outputBytes: 0, chunks: [], error: { code: 'SESSION_STORE_FAILURE' } }), 'utf8');
+    const manager = createTerminalSessionManager({ root });
+    await manager.restore();
+    const restored = await manager.get(id);
+    assert.equal(restored.status, 'manual_review');
+    assert.deepEqual(restored.capabilities, { pty: false, input: false, incrementalOutput: false });
+    assert.equal(restored.error.code, 'SESSION_STORE_FAILURE');
+    const onDisk = JSON.parse(await readFile(path.join(directory, `${id}.json`), 'utf8'));
+    assert.deepEqual(onDisk.capabilities, { pty: false, input: false, incrementalOutput: false });
+    await manager.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('永不返回的 PTY provider 不会挂住创建，会话在超时内收敛且能力位为 false', async () => {
+  const root = await fixture('ocw-terminal-session-provider-hang-');
+  const manager = createTerminalSessionManager({ root, sessionProvider: () => new Promise(() => {}) });
+  try {
+    const startedAt = Date.now();
+    const session = await manager.create({ argv: ['pwd'], timeoutMs: 30, approved: true });
+    assert.ok(Date.now() - startedAt < 5000);
+    assert.equal(session.status, 'timed_out');
+    assert.equal(session.error.code, 'TIMEOUT');
+    assert.deepEqual(session.capabilities, { pty: false, input: false, incrementalOutput: false });
+  } finally {
+    await manager.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('迟到返回的 PTY 句柄会被取消且不更新已终态会话的能力位', async () => {
+  const root = await fixture('ocw-terminal-session-provider-late-');
+  let lateCancelled = 0;
+  const manager = createTerminalSessionManager({
+    root,
+    sessionProvider: () => new Promise((resolve) => setTimeout(() => resolve({ cancel() { lateCancelled += 1; }, capabilities: { pty: true, input: true, incrementalOutput: true } }), 80)),
+  });
+  try {
+    const session = await manager.create({ argv: ['pwd'], timeoutMs: 20, approved: true });
+    assert.equal(session.status, 'timed_out');
+    await wait(200);
+    assert.deepEqual((await manager.get(session.id)).capabilities, { pty: false, input: false, incrementalOutput: false });
+    assert.equal(lateCancelled, 1);
+  } finally {
+    await manager.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 // Regression for the s1 review finding (Q23-4): the public view redacted
 // argv through the path-aware helper, but the persisted snapshot and the
 // restore path used the secret-only helper, so absolute paths survived on

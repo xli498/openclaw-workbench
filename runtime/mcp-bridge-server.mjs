@@ -9,6 +9,8 @@ const PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024;
 const DEFAULT_MAX_SESSIONS = 32;
+const DEFAULT_MAX_REQUEST_IDS_PER_SESSION = 1024;
+const DEFAULT_MAX_STREAMS_PER_SESSION = 16;
 const DEFAULT_MAX_REPLAY_EVENTS = 100;
 const DEFAULT_IDLE_SESSION_MS = 15 * 60 * 1000;
 const EVENT_ID_PATTERN = /^evt-[1-9][0-9]{0,14}$/;
@@ -143,6 +145,8 @@ export function createMcpBridgeServer({
   maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
   maxSessions = DEFAULT_MAX_SESSIONS,
+  maxRequestIdsPerSession = DEFAULT_MAX_REQUEST_IDS_PER_SESSION,
+  maxStreamsPerSession = DEFAULT_MAX_STREAMS_PER_SESSION,
   maxReplayEvents = DEFAULT_MAX_REPLAY_EVENTS,
   idleSessionMs = DEFAULT_IDLE_SESSION_MS,
   allowedOrigins = [],
@@ -164,7 +168,7 @@ export function createMcpBridgeServer({
   if (typeof token !== 'string' || token.length < 16) throw new McpBridgeError('MCP_AUTH_CONFIG_INVALID', 'bridge bearer token must be at least 16 characters');
   if (!LOOPBACK_HOSTS.has(host)) throw new McpBridgeError('MCP_BIND_INVALID', 'bridge host must be loopback');
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new McpBridgeError('MCP_PORT_INVALID', 'bridge port is invalid');
-  for (const [name, value, maximum] of [['maxBodyBytes', maxBodyBytes, 4 * 1024 * 1024], ['maxResponseBytes', maxResponseBytes, 4 * 1024 * 1024], ['maxSessions', maxSessions, 256], ['maxReplayEvents', maxReplayEvents, 1000], ['idleSessionMs', idleSessionMs, 24 * 60 * 60 * 1000], ['pathTokenTtlMs', pathTokenTtlMs, 24 * 60 * 60 * 1000]]) {
+  for (const [name, value, maximum] of [['maxBodyBytes', maxBodyBytes, 4 * 1024 * 1024], ['maxResponseBytes', maxResponseBytes, 4 * 1024 * 1024], ['maxSessions', maxSessions, 256], ['maxRequestIdsPerSession', maxRequestIdsPerSession, 100_000], ['maxStreamsPerSession', maxStreamsPerSession, 256], ['maxReplayEvents', maxReplayEvents, 1000], ['idleSessionMs', idleSessionMs, 24 * 60 * 60 * 1000], ['pathTokenTtlMs', pathTokenTtlMs, 24 * 60 * 60 * 1000]]) {
     if (!Number.isSafeInteger(value) || value < 1 || value > maximum) throw new McpBridgeError('MCP_CONFIG_INVALID', `${name} is invalid`);
   }
   if (!Array.isArray(allowedOrigins) || allowedOrigins.some((origin) => typeof origin !== 'string' || !origin || origin.length > 512)) throw new McpBridgeError('MCP_ORIGIN_CONFIG_INVALID', 'allowed origins are invalid');
@@ -344,6 +348,12 @@ export function createMcpBridgeServer({
     if (id === null) return;
     const owner = requestOwners.get(id);
     if (owner !== undefined) fail('MCP_REQUEST_REPLAY', 'MCP request id was already used');
+    // Bounded replay protection: the per-session claimed-id set is capped,
+    // so the global requestOwners map is bounded by
+    // maxSessions * maxRequestIdsPerSession and cannot grow without bound
+    // on a long-lived session. Eviction is deliberately NOT used: dropping
+    // a still-protected id would silently reopen replay for it.
+    if (session.requestIds.size >= maxRequestIdsPerSession) fail('MCP_REQUEST_ID_LIMIT', 'MCP request id limit reached for this session');
     requestOwners.set(id, session.id);
     session.requestIds.add(id);
   }
@@ -390,6 +400,10 @@ export function createMcpBridgeServer({
   //   protocolVersion != 2025-06-18      -> 400 MCP_PROTOCOL_INVALID
   //   session table full                 -> 429 MCP_SESSION_LIMIT
   //   otherwise                          -> 200 + new mcp-session-id
+  //   claimed request ids per session are capped
+  //     (maxRequestIdsPerSession, default 1024) -> 429 MCP_REQUEST_ID_LIMIT
+  //   live SSE streams per session are capped
+  //     (maxStreamsPerSession, default 16) -> 429 MCP_STREAM_LIMIT
   // POST request (id present; id is claimed before dispatch and is NOT
   // released when dispatch fails, so a retry with the same id is a
   // replay, not a second execution):
@@ -469,6 +483,7 @@ export function createMcpBridgeServer({
         const session = requireSession(request);
         const accept = String(request.headers.accept ?? '').toLowerCase();
         if (!accept.includes('text/event-stream')) return responseError(response, 406, 'MCP_ACCEPT_INVALID');
+        if (session.streams.size >= maxStreamsPerSession) return responseError(response, 429, 'MCP_STREAM_LIMIT');
         const replay = request.headers['last-event-id'] === undefined ? [] : resolveReplay(session, request.headers['last-event-id']);
         response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
         response.write(': connected\n\n');
@@ -532,7 +547,7 @@ export function createMcpBridgeServer({
         : code === 'MCP_EVENT_EXPIRED' ? 410
           : code === 'MCP_SESSION_NOT_FOUND' ? 404
             : code === 'MCP_REQUEST_REPLAY' ? 409
-              : code === 'MCP_SESSION_LIMIT' ? 429
+              : code === 'MCP_SESSION_LIMIT' || code === 'MCP_REQUEST_ID_LIMIT' || code === 'MCP_STREAM_LIMIT' ? 429
                 : ['MCP_ORIGIN_FORBIDDEN'].includes(code) ? 403
                   : ['MCP_JSON_INVALID', 'MCP_JSONRPC_INVALID', 'MCP_PROTOCOL_INVALID', 'MCP_SESSION_REQUIRED', 'MCP_SESSION_FIXATION', 'MCP_NOTIFICATION_INVALID', 'MCP_EVENT_ID_INVALID'].includes(code) ? 400
                     : 500;

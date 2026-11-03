@@ -353,8 +353,31 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     }, record.timeoutMs);
     try {
       if (sessionProvider) {
-        runtime.handle = await sessionProvider({ root: rootPath, argv: [...record.argv], cwd: record.cwd, timeoutMs: record.timeoutMs, maxOutputBytes: record.maxOutputBytes, signal: controller.signal, onOutput, onExit });
+        // Bounded provider establishment: the wait for the async provider
+        // handle is bounded by the session timeoutMs, so a provider that
+        // never resolves cannot hang create()/close() forever. The
+        // session-timeout timer can also fire first; either way a handle
+        // that arrives after the session left 'running' is cancelled and
+        // must never update capability bits (late-handle guard below).
+        let providerTimer = null;
+        const providerPromise = Promise.resolve().then(() => sessionProvider({ root: rootPath, argv: [...record.argv], cwd: record.cwd, timeoutMs: record.timeoutMs, maxOutputBytes: record.maxOutputBytes, signal: controller.signal, onOutput, onExit }));
+        const providerTimeout = new Promise((_, reject) => { providerTimer = setTimeout(() => reject(new TerminalSessionError('PROVIDER_TIMEOUT', 'terminal session provider timed out')), record.timeoutMs); });
+        try {
+          runtime.handle = await Promise.race([providerPromise, providerTimeout]);
+        } catch (error) {
+          if (providerTimer) clearTimeout(providerTimer);
+          // A late handle must still be cleaned up, never adopted.
+          void providerPromise.then((late) => { try { if (late && typeof late.cancel === 'function') void Promise.resolve(late.cancel()).catch(() => {}); } catch {} }).catch(() => {});
+          throw error;
+        }
+        if (providerTimer) clearTimeout(providerTimer);
         if (!runtime.handle || typeof runtime.handle !== 'object') fail('PROVIDER_INVALID', 'terminal session provider returned an invalid handle');
+        if (record.status !== 'running' || runtimes.get(record.id) !== runtime) {
+          const late = runtime.handle;
+          runtime.handle = null;
+          if (late && typeof late.cancel === 'function') void Promise.resolve(late.cancel()).catch(() => {});
+          return;
+        }
         record.capabilities = { pty: runtime.handle.capabilities?.pty === true, input: runtime.handle.capabilities?.input === true, incrementalOutput: runtime.handle.capabilities?.incrementalOutput === true };
         if (runtime.cancelRequested && typeof runtime.handle.cancel === 'function') void Promise.resolve(runtime.handle.cancel()).catch(() => {});
       } else {
@@ -387,13 +410,18 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
         digests.set(id, snapshot.digest);
         records.set(id, record);
         if (record.status === 'running') { record.status = 'manual_review'; record.capabilities = { pty: false, input: false, incrementalOutput: false }; record.error = { code: 'SESSION_INTERRUPTED' }; record.updatedAt = new Date(clock()).toISOString(); await persist(record); }
+        // A snapshot that is ALREADY manual_review gets the same zeroed
+        // capabilities: a stale snapshot must never restore live-looking
+        // capability bits. Its existing review reason (record.error) is
+        // preserved, not overwritten with SESSION_INTERRUPTED.
+        else if (record.status === 'manual_review' && (record.capabilities.pty || record.capabilities.input || record.capabilities.incrementalOutput)) { record.capabilities = { pty: false, input: false, incrementalOutput: false }; record.updatedAt = new Date(clock()).toISOString(); await persist(record); }
       } catch { /* malformed records are ignored and never executed */ }
     }
     return Object.freeze({ sessions: records.size });
   }
 
   async function create({ id, argv, cwd = '.', timeoutMs = DEFAULT_TIMEOUT_MS, maxOutputBytes: requestedOutputBytes = maxOutputBytes, approved = false } = {}) {
-    if (!approved) fail('APPROVAL_REQUIRED', 'terminal session requires explicit approval');
+    if (approved !== true) fail('APPROVAL_REQUIRED', 'terminal session requires explicit approval');
     if (closing) fail('SESSION_CLOSING', 'terminal session manager is closing');
     try { validateCommandLimits({ argv, timeoutMs, maxOutputBytes: requestedOutputBytes }); }
     catch (error) { throw new TerminalSessionError(error.code, error.message, error.details); }

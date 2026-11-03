@@ -77,3 +77,53 @@ test('provider list exposes all explicit tunnel variants', async () => {
   const { BRIDGE_TUNNEL_PROVIDERS } = await import('../runtime/bridge-tunnel.mjs');
   assert.deepEqual([...BRIDGE_TUNNEL_PROVIDERS].sort(), ['cloudflare-named', 'cloudflare-quick', 'ngrok', 'ngrok-fixed']);
 });
+
+test('tunnel adapter uses the construction-time args copy, not a later-mutated array', async () => {
+  const calls = [];
+  const mutableArgs = ['tunnel', '--url'];
+  const adapter = createBridgeTunnelAdapter({ provider: 'cloudflare-quick', command: 'cloudflared', args: mutableArgs, localPort: 43123, token: TOKEN, startTimeoutMs: 100, spawnImpl: (command, args, options) => { calls.push({ command, args, options }); const child = fakeChild(); queueMicrotask(() => child.stdout.emit('data', '2026-01-01 https://random.example.trycloudflare.com\n')); return child; }, parsePublicUrl: (line) => line.match(/https:\/\/[^\s]+/)?.[0] });
+  mutableArgs.push('--evil-flag');
+  mutableArgs[0] = 'replaced';
+  const result = await adapter.start();
+  assert.equal(result.state, 'ready');
+  assert.deepEqual(calls[0].args.slice(0, 2), ['tunnel', '--url']);
+  assert.equal(calls[0].args[2], '--url');
+  assert.match(calls[0].args[3], /^http:\/\/127\.0\.0\.1:43123\//);
+  assert.equal(calls[0].args.includes('--evil-flag'), false);
+  assert.equal(calls[0].args.includes('replaced'), false);
+  await adapter.stop();
+});
+
+test('tunnel adapter rejects args count, args length, token-bearing args, and control-character tokens', () => {
+  assert.throws(() => createBridgeTunnelAdapter({ provider: 'ngrok', command: 'ngrok', args: Array.from({ length: 33 }, () => 'x'), localPort: 1, token: TOKEN, parsePublicUrl() {} }), { code: 'TUNNEL_ARGS_INVALID' });
+  assert.throws(() => createBridgeTunnelAdapter({ provider: 'ngrok', command: 'ngrok', args: ['x'.repeat(513)], localPort: 1, token: TOKEN, parsePublicUrl() {} }), { code: 'TUNNEL_ARGS_INVALID' });
+  assert.throws(() => createBridgeTunnelAdapter({ provider: 'ngrok', command: 'ngrok', args: [`--leak=${TOKEN}`], localPort: 1, token: TOKEN, parsePublicUrl() {} }), { code: 'TUNNEL_ARGS_INVALID' });
+  assert.throws(() => createBridgeTunnelAdapter({ provider: 'ngrok', command: 'ngrok', localPort: 1, token: 'token-with-\ttab-0123', parsePublicUrl() {} }), { code: 'TUNNEL_AUTH_INVALID' });
+  assert.throws(() => createBridgeTunnelAdapter({ provider: 'ngrok', command: 'ngrok', localPort: 1, token: 'token-with-\x7f-del-0123', parsePublicUrl() {} }), { code: 'TUNNEL_AUTH_INVALID' });
+});
+
+test('tunnel adapter discards a parsed public URL that embeds the bearer token', async () => {
+  const adapter = createBridgeTunnelAdapter({ provider: 'cloudflare-quick', command: 'cloudflared', localPort: 43123, token: TOKEN, startTimeoutMs: 100, spawnImpl: () => { const child = fakeChild(); queueMicrotask(() => child.stdout.emit('data', `https://public.example.test/${TOKEN}\n`)); return child; }, parsePublicUrl: (line) => line.match(/https:\/\/[^\s]+/)?.[0] });
+  await assert.rejects(() => adapter.start(), { code: 'TUNNEL_URL_TIMEOUT' });
+  assert.equal(adapter.endpoint(), null);
+  await adapter.stop();
+});
+
+test('tunnel adapter rejects a token-shaped named tunnel or fixed hostname at start, before spawn', async () => {
+  const tokenName = 'fake-token-1234567890';
+  const named = createBridgeTunnelAdapter({ provider: 'cloudflare-named', command: 'cloudflared', localPort: 43123, token: tokenName, tunnelName: tokenName, startTimeoutMs: 100, spawnImpl: () => { throw new Error('spawn must not be called'); }, parsePublicUrl: (line) => line.match(/https:\/\/[^\s]+/)?.[0] });
+  await assert.rejects(() => named.start(), { code: 'TUNNEL_ARGS_INVALID' });
+  const tokenHost = 'fake-token-1234567890.example.com';
+  let spawned = false;
+  const fixed = createBridgeTunnelAdapter({ provider: 'ngrok-fixed', command: 'ngrok', localPort: 43123, token: tokenHost, hostname: tokenHost, startTimeoutMs: 100, spawnImpl: () => { spawned = true; return fakeChild(); }, parsePublicUrl: (line) => line.match(/https:\/\/[^\s]+/)?.[0] });
+  await assert.rejects(() => fixed.start(), { code: 'TUNNEL_ARGS_INVALID' });
+  assert.equal(spawned, false);
+});
+
+test('tunnel adapter discards a normalized origin that contains the bearer token in a different case', async () => {
+  const token = 'fake-token-1234567890';
+  const adapter = createBridgeTunnelAdapter({ provider: 'cloudflare-quick', command: 'cloudflared', localPort: 43123, token, startTimeoutMs: 100, spawnImpl: () => { const child = fakeChild(); queueMicrotask(() => child.stdout.emit('data', 'https://FAKE-TOKEN-1234567890.example.com\n')); return child; }, parsePublicUrl: (line) => line.match(/https:\/\/[^\s]+/)?.[0] });
+  await assert.rejects(() => adapter.start(), { code: 'TUNNEL_URL_TIMEOUT' });
+  assert.equal(adapter.endpoint(), null);
+  await adapter.stop();
+});
