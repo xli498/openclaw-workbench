@@ -283,6 +283,14 @@ export function createMcpBridgeServer({
   loadReplaySnapshots();
 
   function resumeSession(oldSessionId) {
+    // Expiry is enforced here, not only on the HTTP path: without this,
+    // a live-but-idle-expired session would answer ACTIVE (it is still
+    // in the table until the timer runs) and could never be resumed,
+    // while its snapshot quietly aged past the idle window.
+    // expireSessions() reuses the HTTP path's full-session scan (it
+    // walks every live session); this call adds scan frequency, it is
+    // not a target-only or O(1) check.
+    expireSessions();
     if (typeof oldSessionId !== 'string' || !oldSessionId) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
     if (sessions.has(oldSessionId)) fail('MCP_SESSION_ACTIVE', 'MCP session is still live; resume is only for dormant snapshots');
     const snapshot = replaySnapshots.get(snapshotKey(oldSessionId));
@@ -566,6 +574,13 @@ export function createMcpBridgeServer({
   }
 
   function broadcast(sessionId, notification) {
+    // Same expiry rule as the HTTP path (requireSession): broadcasting
+    // to an idle-expired session must fail, not silently refresh its
+    // lastActivity and resurrect it. A live broadcast still refreshes
+    // lastActivity, as before. As in resumeSession, expireSessions()
+    // reuses the HTTP path's full-session scan; this call adds scan
+    // frequency, it is not a target-only or O(1) check.
+    expireSessions();
     if (typeof sessionId !== 'string' || !sessions.has(sessionId)) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
     if (!plainObject(notification) || typeof notification.method !== 'string' || !notification.method || notification.method.length > 128 || /[\0\r\n]/.test(notification.method) || (notification.params !== undefined && !plainObject(notification.params))) fail('MCP_NOTIFICATION_INVALID', 'MCP broadcast notification is invalid');
     const session = sessions.get(sessionId);
