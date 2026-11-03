@@ -210,6 +210,62 @@ test('tunnel reports failure and withdraws the endpoint when the ready process e
   await adapter.stop();
 });
 
+test('tunnel idle stop leaves the adapter startable, including after a reset', async () => {
+  const { adapter } = setup();
+  const stopped = await adapter.stop();
+  assert.equal(stopped.state, 'idle');
+  const stoppedAgain = await adapter.stop();
+  assert.equal(stoppedAgain.state, 'idle');
+  // A reset must not be needed to recover from an idle stop, but it
+  // must also work from that state: previously neither cleared the
+  // stale stop promise and every later start reported TUNNEL_BUSY.
+  await adapter.reset();
+  const first = await adapter.start();
+  assert.equal(first.state, 'ready');
+  await adapter.stop();
+  await adapter.stop();
+  const second = await adapter.start();
+  assert.equal(second.state, 'ready');
+  await adapter.stop();
+});
+
+test('tunnel start racing a reset after its stop settles is busy and the post-reset start uses the new route', async () => {
+  const children = [];
+  const calls = [];
+  const adapter = createBridgeTunnelAdapter({
+    provider: 'cloudflare-quick', command: 'cloudflared', localPort: 43123, token: TOKEN, startTimeoutMs: 1000, stopTimeoutMs: 1000,
+    spawnImpl: (command, args) => {
+      calls.push({ command, args });
+      const child = controllableChild({ exitOnKill: false });
+      children.push(child);
+      child.kill = () => { child.killCalls += 1; setTimeout(() => { child.emit('exit', 0); child.emit('close', 0); }, 30); };
+      queueMicrotask(() => child.stdout.emit('data', 'https://reset-race.example.test\n'));
+      return child;
+    },
+    parsePublicUrl: extractUrl,
+  });
+  const first = await adapter.start();
+  assert.equal(first.state, 'ready');
+  const stopping = adapter.stop();
+  // Attach before reset(): this continuation is queued ahead of
+  // reset's post-stop continuation, so on the old code it runs while
+  // reset still has not rotated the route and the start succeeds with
+  // the old route; with reset holding busy it must be TUNNEL_BUSY.
+  let raced = null;
+  stopping.then(() => { raced = adapter.start(); raced.catch(() => {}); });
+  const resetResult = await adapter.reset();
+  assert.equal(resetResult.state, 'idle');
+  await assert.rejects(raced, { code: 'TUNNEL_BUSY' });
+  const second = await adapter.start();
+  assert.equal(second.state, 'ready');
+  const lastArgs = calls[calls.length - 1].args;
+  const target = lastArgs[lastArgs.indexOf('--url') + 1];
+  const route = new URL(target).pathname.slice(1);
+  assert.equal(second.endpoint, `https://reset-race.example.test/${route}`);
+  assert.equal(adapter.endpoint(), second.endpoint);
+  await adapter.stop();
+});
+
 test('tunnel start fails fast when the process exits before reporting a URL', async () => {
   const adapter = createBridgeTunnelAdapter({
     provider: 'cloudflare-quick', command: 'cloudflared', localPort: 43123, token: TOKEN, startTimeoutMs: 5000, stopTimeoutMs: 1000,

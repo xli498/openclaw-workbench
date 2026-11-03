@@ -90,6 +90,7 @@ export function createBridgeTunnelAdapter({
   let outputBuffer = '';
   let startPromise = null;
   let stopPromise = null;
+  let resetPromise = null;
   let urlWaiter = null;
 
   function publicState() {
@@ -167,8 +168,10 @@ export function createBridgeTunnelAdapter({
   async function start() {
     if (state === 'ready') return Object.freeze({ ...publicState(), endpoint: publicUrl ? `${publicUrl}/${routePath}` : null });
     // Busy is decided BEFORE any promise is stored: a busy rejection
-    // must never linger in startPromise and poison later starts.
-    if (state === 'starting' || state === 'stopping' || stopPromise || startPromise) fail('TUNNEL_BUSY', 'tunnel lifecycle is busy');
+    // must never linger in startPromise and poison later starts. A
+    // reset in flight also holds the lifecycle busy for its whole
+    // duration, including the stop-completion to route-rotation window.
+    if (state === 'starting' || state === 'stopping' || stopPromise || startPromise || resetPromise) fail('TUNNEL_BUSY', 'tunnel lifecycle is busy');
     startPromise = (async () => {
       try {
         // A previous stop that timed out leaves its child handle behind
@@ -221,12 +224,25 @@ export function createBridgeTunnelAdapter({
   }
   async function stop() {
     if (stopPromise) return stopPromise;
+    // Idle fast path BEFORE any promise is stored: the IIFE below runs
+    // synchronously up to its first await, so an idle shortcut inside it
+    // would complete (and run its finally clearing stopPromise) before
+    // the outer assignment, leaving the already-resolved promise stored
+    // forever and every later start() reporting TUNNEL_BUSY. Handling
+    // the idle case here, without creating a promise, removes that
+    // ordering hazard entirely. The remaining IIFE paths always hit an
+    // await before completing, so their finally clears correctly.
+    if (state === 'idle' && !child) {
+      ++generation;
+      urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
+      urlWaiter = null;
+      return publicState();
+    }
     stopPromise = (async () => {
       try {
         ++generation;
         urlWaiter?.reject(new BridgeTunnelError('TUNNEL_RESET', 'tunnel was reset'));
         urlWaiter = null;
-        if (state === 'idle' && !child) return publicState();
         // Serialize with an in-flight start: stop runs synchronously
         // into 'stopping' first, so a concurrent start() sees busy
         // instead of racing the start's failure handling.
@@ -250,9 +266,22 @@ export function createBridgeTunnelAdapter({
     return stopPromise;
   }
   async function reset() {
-    await stop();
-    routePath = randomSecretPath();
-    return publicState();
+    if (resetPromise) return resetPromise;
+    // Reset holds busy for its whole duration: without resetPromise, a
+    // start continuation queued ahead of reset's post-stop continuation
+    // could spawn with the old routePath before reset rotates it,
+    // leaving the spawned tunnel and the reported endpoint on different
+    // routes. start() checks resetPromise, so such a start is rejected
+    // with TUNNEL_BUSY instead. Concurrent reset() calls share the one
+    // in-flight reset, mirroring stop().
+    resetPromise = (async () => {
+      try {
+        await stop();
+        routePath = randomSecretPath();
+        return publicState();
+      } finally { resetPromise = null; }
+    })();
+    return resetPromise;
   }
   return Object.freeze({ start, stop, reset, status: publicState, provider, authHeaders: () => Object.freeze({ authorization: `Bearer ${token}` }), endpoint: () => publicUrl ? `${publicUrl}/${routePath}` : null });
 }
