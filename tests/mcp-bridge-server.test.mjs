@@ -213,3 +213,67 @@ test('MCP bridge shares the control-plane proposal store so a Code proposal rema
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('MCP bridge caps claimed request ids per session instead of growing without bound', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-bridge-id-cap-'));
+  const bridge = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), maxRequestIdsPerSession: 2 });
+  const address = await bridge.start();
+  try {
+    const initialized = await initialize(address);
+    assert.equal(initialized.response.status, 200);
+    const sessionId = initialized.response.headers.get('mcp-session-id');
+    const sessionHeaders = { 'mcp-session-id': sessionId, 'mcp-protocol-version': VERSION };
+    for (const id of ['cap-ping-1', 'cap-ping-2']) {
+      const ping = await post(address, { jsonrpc: '2.0', id, method: 'ping', params: {} }, sessionHeaders);
+      assert.equal(ping.response.status, 200);
+    }
+    const over = await post(address, { jsonrpc: '2.0', id: 'cap-ping-3', method: 'ping', params: {} }, sessionHeaders);
+    assert.equal(over.response.status, 429);
+    assert.equal(over.body.error, 'MCP_REQUEST_ID_LIMIT');
+  } finally {
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP bridge caps live SSE streams per session', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-bridge-stream-cap-'));
+  const bridge = createMcpBridgeServer({ root, token: TOKEN, registry: createToolRegistry({ root }), maxStreamsPerSession: 1 });
+  const address = await bridge.start();
+  try {
+    const initialized = await initialize(address);
+    const sessionId = initialized.response.headers.get('mcp-session-id');
+    const streamHeaders = headers({ accept: 'text/event-stream', 'mcp-session-id': sessionId, 'mcp-protocol-version': VERSION });
+    const first = await fetch(endpoint(address), { headers: streamHeaders });
+    assert.equal(first.status, 200);
+    try {
+      const second = await fetch(endpoint(address), { headers: streamHeaders });
+      assert.equal(second.status, 429);
+      assert.equal((await second.json()).error, 'MCP_STREAM_LIMIT');
+    } finally {
+      await first.body.cancel();
+    }
+  } finally {
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('MCP bridge still requires Bearer on the correct path-token route and never echoes the token', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-bridge-path-bearer-'));
+  const pathToken = 'path-token-route-012345';
+  const bridge = createMcpBridgeServer({ root, token: TOKEN, pathToken, registry: createToolRegistry({ root }) });
+  const address = await bridge.start();
+  const pathname = bridge.endpointPath();
+  try {
+    const missing = await fetch(endpoint(address, pathname), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 'no-bearer', method: 'initialize', params: { protocolVersion: VERSION, capabilities: {}, clientInfo: { name: 't', version: '1' } } }) });
+    assert.equal(missing.status, 401);
+    assert.equal((await missing.text()).includes(pathToken), false);
+    const wrong = await fetch(endpoint(address, pathname), { method: 'POST', headers: headers({ authorization: 'Bearer wrong-token-012345' }), body: JSON.stringify({ jsonrpc: '2.0', id: 'wrong-bearer', method: 'initialize', params: { protocolVersion: VERSION, capabilities: {}, clientInfo: { name: 't', version: '1' } } }) });
+    assert.equal(wrong.status, 401);
+    assert.equal((await wrong.text()).includes(pathToken), false);
+  } finally {
+    await bridge.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
