@@ -4,11 +4,20 @@ import path from 'node:path';
 // Second LSP slice: document sync, diagnostics intake, an approval-gated
 // edit-proposal path, and a multi-server registry live in companion modules.
 // This client stays read-only on disk: it never writes a file itself.
-// The first slice's guarantees still hold: only allowlisted methods are
-// ever sent; server-initiated requests are never auto-executed; commands
-// and arguments are refused when they contain shell or credential material;
+// The first slice's guarantees still hold, with one correction: the
+// request path sends only methods that are BOTH caller-allowlisted AND
+// not on the non-overridable forbidden list below (Q30-2). A custom
+// allowedMethods value can add further read methods, but it can never
+// re-enable a forbidden write/execute method, so the old absolute claim
+// that "any allowlisted method may be sent" no longer stands -- the
+// allowlist is intersected with the forbidden list at construction.
+// Server-initiated requests are never auto-executed; commands and
+// arguments are refused when they contain shell or credential material;
 // environment values are never logged, never stored in snapshots, and
-// never included in error text.
+// never included in error text. The spawned server inherits only an
+// explicit base environment (PATH/HOME/LANG/LC_ALL/TMPDIR) plus the
+// caller-validated env entries, never the whole parent environment
+// (Q30-4).
 //
 // Edit proposals produced here are NOT applied by this client. A proposal
 // is data for the repository's existing Patch proposal + independent
@@ -38,6 +47,36 @@ export const LSP_READ_ONLY_METHODS = Object.freeze([
   'textDocument/completion',
   'workspace/symbol',
 ]);
+
+// Q30-2: non-overridable forbidden methods. A caller-supplied
+// allowedMethods array is intersected with this list at construction:
+// any entry here makes construction fail, so no caller can smuggle a
+// write or execute method past the read-only gate by passing a custom
+// allowlist. Entries are methods that mutate state, execute commands,
+// or carry edits/commands back from the server: the client never sends
+// them as requests, whatever the caller allowlists.
+export const LSP_FORBIDDEN_METHODS = Object.freeze([
+  'workspace/applyEdit',
+  'workspace/executeCommand',
+  'workspace/didChangeConfiguration',
+  'workspace/didChangeWatchedFiles',
+  'textDocument/didOpen',
+  'textDocument/didChange',
+  'textDocument/didClose',
+  'textDocument/didSave',
+  'textDocument/willSaveWaitUntil',
+  'textDocument/rename',
+  'textDocument/prepareRename',
+  'textDocument/formatting',
+  'textDocument/rangeFormatting',
+  'textDocument/onTypeFormatting',
+  'textDocument/codeAction',
+]);
+
+// Q30-4: the only parent-environment keys a spawned server inherits.
+// Everything else the server sees must come from the caller-validated
+// env argument, never from a blanket process.env spread.
+const LSP_BASE_ENV_KEYS = Object.freeze(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']);
 
 export class LspClientError extends Error {
   constructor(code, message, details = {}) {
@@ -73,7 +112,12 @@ function safeEnv(value) {
   if (entries.length > 128) fail('LSP_ENV_INVALID', 'LSP env has too many entries');
   const env = {};
   for (const [key, val] of entries) {
-    if (!ENV_PATTERN.test(key) || typeof val !== 'string' || val.length > 4096 || /[\0\r\n]/.test(val)) fail('LSP_ENV_INVALID', 'LSP env entry is invalid');
+    // Q30-4: env values get the same shell/credential-material checks as
+    // commands and args. A value smuggling `$(...)`, a shell separator,
+    // or a credential assignment (token=/password=, a URL userinfo) is
+    // refused before spawn instead of being handed to the server.
+    if (!ENV_PATTERN.test(key) || typeof val !== 'string' || val.length > 4096 || /[\0\r\n]/.test(val)
+      || SHELL_PATTERN.test(val) || SECRET_PATTERN.test(val) || SECRET_FLAG_PATTERN.test(val)) fail('LSP_ENV_INVALID', 'LSP env entry is invalid');
     env[key] = val;
   }
   return env;
@@ -424,6 +468,12 @@ export function createLspClient({
   const rootPath = path.resolve(root);
   const serverEnv = safeEnv(env);
   if (!Array.isArray(allowedMethods) || allowedMethods.length === 0 || allowedMethods.some((m) => typeof m !== 'string')) fail('LSP_METHODS_INVALID', 'LSP allowed methods are invalid');
+  // Q30-2: the forbidden list is non-overridable -- a custom allowlist
+  // containing a forbidden method fails construction outright, rather
+  // than silently dropping the entry and sending the rest.
+  for (const method of allowedMethods) {
+    if (LSP_FORBIDDEN_METHODS.includes(method)) fail('LSP_METHOD_NOT_ALLOWED', 'LSP method is forbidden even when allowlisted');
+  }
   const allowed = new Set(allowedMethods);
   for (const [name, value] of [['requestTimeoutMs', requestTimeoutMs], ['maxFrameBytes', maxFrameBytes], ['maxDocumentBytes', maxDocumentBytes], ['maxDiagnosticsPerUri', maxDiagnosticsPerUri], ['maxDiagnosticMessageChars', maxDiagnosticMessageChars]]) {
     if (!Number.isSafeInteger(value) || value < 1) fail('LSP_CONFIG_INVALID', `${name} must be a positive safe integer`);
@@ -567,7 +617,13 @@ export function createLspClient({
 
   async function start() {
     if (state === 'ready') return Object.freeze({ status: 'ready' });
-    child = spawn(serverCommand, serverArgs, { cwd: rootPath, shell: false, env: { ...process.env, ...serverEnv }, stdio: ['pipe', 'pipe', 'ignore'] });
+    // Q30-4: no blanket parent-environment inheritance. The child gets
+    // only the explicit base keys from the parent plus caller-validated
+    // entries, so a stray parent secret (or a poisoned parent variable)
+    // can never reach the server implicitly.
+    const baseEnv = {};
+    for (const key of LSP_BASE_ENV_KEYS) if (process.env[key] !== undefined) baseEnv[key] = process.env[key];
+    child = spawn(serverCommand, serverArgs, { cwd: rootPath, shell: false, env: { ...baseEnv, ...serverEnv }, stdio: ['pipe', 'pipe', 'ignore'] });
     child.stdout.on('data', onData);
     child.once('exit', onExit);
     child.once('error', onExit);

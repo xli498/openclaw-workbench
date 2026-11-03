@@ -530,6 +530,10 @@ export function createMcpBridgeServer({
   }
 
   function broadcast(sessionId, notification) {
+    // Q28-5: expire idle sessions first. Without this, a session that
+    // passed its idle timeout but had not yet been swept by the timer
+    // could be revived by a broadcast (which refreshes lastActivity).
+    expireSessions();
     if (typeof sessionId !== 'string' || !sessions.has(sessionId)) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
     if (!plainObject(notification) || typeof notification.method !== 'string' || !notification.method || notification.method.length > 128 || /[\0\r\n]/.test(notification.method) || (notification.params !== undefined && !plainObject(notification.params))) fail('MCP_NOTIFICATION_INVALID', 'MCP broadcast notification is invalid');
     const session = sessions.get(sessionId);

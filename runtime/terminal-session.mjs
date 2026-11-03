@@ -291,14 +291,29 @@ export function createTerminalSessionManager({ root, sessionProvider, runCommand
     creating.add(creation);
     try {
       const safeWorkingDirectory = safeCwd(cwd);
+      // Q31-3: the stable-cwd handle used to be closed before persist
+      // and start, so the actual spawn ran on a bare path string with a
+      // check-then-use window. The handle is now held open until
+      // start() returns (for a provider session that is after the
+      // provider has spawned, since the provider re-resolves the cwd
+      // through realpath itself). Residual limitation, stated plainly:
+      // Node spawn takes a path, not an fd, so a concurrent rename of
+      // the directory between validation and spawn is not eliminated
+      // for the provider path; what is eliminated is a symlink escape
+      // planted before validation, which the canonical real path now
+      // rejects. The non-pty path is stronger: runControlledCommand
+      // re-validates and spawns via its own held fd path (procPath).
       const stable = await openStableCwd(rootPath, safeWorkingDirectory);
-      await stable.handle.close().catch(() => {});
-      const now = new Date(clock()).toISOString();
+      try {
+        const now = new Date(clock()).toISOString();
         const record = { id: safeId, status: 'running', argv: [...argv], cwd: safeWorkingDirectory, timeoutMs: safeTimeout(timeoutMs), maxOutputBytes: requestedOutputBytes, capabilities: { pty: false, input: false, incrementalOutput: false }, createdAt: now, updatedAt: now, outputBytes: 0, chunks: [] };
-      records.set(safeId, record);
-      try { await persist(record); await start(record); }
-      catch (error) { records.delete(safeId); throw error; }
-      return publicRecord(record);
+        records.set(safeId, record);
+        try { await persist(record); await start(record); }
+        catch (error) { records.delete(safeId); throw error; }
+        return publicRecord(record);
+      } finally {
+        await stable.handle.close().catch(() => {});
+      }
     } finally {
       reservations.delete(safeId);
       resolveCreation();

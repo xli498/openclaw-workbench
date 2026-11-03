@@ -226,11 +226,24 @@ export function createMcpHttpTransport({
         if (id !== null) lastEventId = id;
         if (frame && typeof frame.method === 'string' && frame.id !== undefined) {
           if (onRequest) {
+            // Q28-3: a server-request reply is an outbound frame like any
+            // other, so it gets the same maxFrameBytes check, and a reply
+            // failure is never swallowed: it is reported to onError when
+            // one is registered, and otherwise closes the subscription
+            // with a rejected closedPromise so the failure is visible to
+            // the caller instead of vanishing into a caught promise.
             Promise.resolve().then(() => onRequest(frame)).then(async (result) => {
               if (result === undefined) return;
               const body = JSON.stringify({ jsonrpc: '2.0', id: frame.id, result });
-              await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-session-id': sessionId, ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal }).catch(() => {});
-            }).catch(() => {});
+              if (frameBytes(body) > maxFrameBytes) throw new McpHttpTransportError('MCP_FRAME_LIMIT', 'MCP response frame exceeded the configured limit');
+              const reply = await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-session-id': sessionId, ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal });
+              if (!reply || !reply.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server request reply failed');
+            }).catch((error) => {
+              const report = error instanceof McpHttpTransportError ? error : new McpHttpTransportError('MCP_REQUEST_FAILED', 'MCP server request reply failed');
+              if (onError) {
+                try { onError(report); } catch { controller.abort(); finish(report); }
+              } else { controller.abort(); finish(report); }
+            });
           }
           onMessage?.(frame);
           return;
@@ -239,11 +252,18 @@ export function createMcpHttpTransport({
         onMessage?.(frame);
       },
     });
+    // Q28-4: onError runs inside try/finally so a throwing error
+    // callback can never strand closedPromise: the rejection (or the
+    // clean resolution) always executes. The callback's own throw is
+    // swallowed here -- finish is also called from a detached stream
+    // task, where a rethrown callback error would surface as an
+    // unhandled rejection instead of reaching any caller.
     const finish = (error) => {
       if (closed) return;
       closed = true;
       subscriptions.delete(handle);
-      if (error) { onError?.(error); rejectClosed(error); } else resolveClosed(Object.freeze({ status: 'closed', lastEventId }));
+      try { if (error) onError?.(error); } catch {}
+      finally { if (error) rejectClosed(error); else resolveClosed(Object.freeze({ status: 'closed', lastEventId })); }
     };
     const handle = Object.freeze({
       close: () => { controller.abort(); finish(null); },
@@ -300,6 +320,11 @@ export function createMcpHttpTransport({
       if (!response || !(response.ok || response.status === 404)) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP session termination failed');
       sessionId = null;
       protocolVersion = null;
+      // Q28-4: terminating the session also closes its live SSE
+      // subscriptions; previously a caller had to close the stream
+      // manually first, and the DELETE-then-stream link was untested.
+      // A failed DELETE leaves the session (and its streams) in place.
+      for (const subscription of [...subscriptions]) subscription.close();
       return Object.freeze({ status: 'terminated' });
     } finally { clearTimeout(timer); activeControllers.delete(controller); }
   }
