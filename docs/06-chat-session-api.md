@@ -28,7 +28,7 @@ Content-Type: application/json
 
 - API 默认仅监听 `127.0.0.1`。
 - 配置 Bearer Token 后所有接口都需要认证。
-- Chat 会话快照见下文“会话安全恢复”：历史、`active` 与 `closed` 会话在启动时恢复，快照记录为 `running` 的会话降级为 `manual_review`，不会重放中断回合。
+- Chat 会话快照见下文“会话安全恢复”：历史、`active` 与 `closed` 会话在启动时恢复，快照中 `running: true` 的记录降级为 `manual_review`，不会重放中断回合。
 - `Code` 模式不会绕过 Patch 审批；文件修改必须走已有的 `createPatchProposal` → `approveAndApplyPatch`。
 - 当前不实现公网 Bridge、MCP Server 管理或自动修改 OpenClaw 配置。
 
