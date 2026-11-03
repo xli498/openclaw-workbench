@@ -8,6 +8,7 @@ import { createWorkbenchServer } from '../runtime/http-server.mjs';
 import { createModelRunner } from '../runtime/model-runner.mjs';
 import { createSecretResolver } from '../runtime/secret-resolver.mjs';
 import { createMemorySecretBackend, createWindowsCredentialStore } from '../runtime/secret-store.mjs';
+import { secretActionHash } from '../runtime/secret-action.mjs';
 import { createMockOpenAIProvider } from './mock-provider.mjs';
 
 const TOKEN = 'keychain-product-token-012345';
@@ -50,7 +51,7 @@ async function setup() {
   });
   const app = createWorkbenchServer({ root, token: TOKEN, approvalToken: APPROVAL, secretStore, secretResolver, modelRunner });
   const address = await app.listen();
-  const saved = await request(address, '/v1/secrets', { method: 'POST', body: JSON.stringify({ name: 'workbench.model.keychain', value: SECRET }) });
+  const saved = await request(address, '/v1/secrets', { method: 'POST', body: JSON.stringify({ name: 'workbench.model.keychain', value: SECRET, actionHash: secretActionHash({ operation: 'create', name: 'workbench.model.keychain', version: 'absent' }) }) });
   assert.equal(saved.status, 200);
   const registered = await request(address, '/v1/models', { method: 'POST', body: JSON.stringify({
     sessionId: 'setup', id: 'keychain-primary', provider: 'local-mock', protocol: 'openai-compatible', model: 'mock-model', endpoint: 'https://mock.provider.test/v1', capabilities: ['text', 'tool_calling'], secretRef: 'keychain:workbench.model.keychain',
