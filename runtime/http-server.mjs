@@ -369,8 +369,9 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const liveStreams = new Set();
   const bridges = new Set();
   let shutdownRequested = false;
-  // Observable shutdown failure state. Only a sanitized code is stored here
-  // (never the raw exception object or its message), and it is never written
+  // Observable shutdown failure state. Only the fixed code SHUTDOWN_FAILED
+  // is stored here (never the raw exception object, its message, or its
+  // code, which may itself carry sensitive text), and it is never written
   // into an HTTP response. A failed callback resets `shutdownRequested` so a
   // later, still Bearer-gated request may retry; a successful callback keeps
   // the flag set, so success is invoked at most once.
@@ -402,13 +403,13 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
                 lastShutdownFailure = null;
               })
               .catch(async (error) => {
-                const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'SHUTDOWN_FAILED';
+                const code = 'SHUTDOWN_FAILED';
                 lastShutdownFailure = Object.freeze({ code, at: new Date().toISOString() });
                 shutdownError = code;
-                // Allow exactly one safe retry: the next Bearer-gated request
-                // may trigger the callback again. Concurrent requests that
-                // arrived while this callback was in flight already returned
-                // 202 without invoking it again.
+                // A failed callback allows later Bearer-gated requests to
+                // retry, in sequence. Concurrent requests that arrived while
+                // this callback was in flight already returned 202 without
+                // invoking it again.
                 shutdownRequested = false;
                 try { await effectiveAudit?.append?.({ type: 'shutdown.failed', actor: 'system', code }); } catch { /* failure state is already recorded above */ }
               });

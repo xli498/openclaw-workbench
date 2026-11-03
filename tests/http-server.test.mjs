@@ -1528,8 +1528,8 @@ test('Runtime shutdown 并发只触发一次成功回调，回调失败记录可
       assert.equal(first.status, 202);
       assert.deepEqual(first.body, { accepted: true });
       await waitFor(() => app.lastShutdownFailure !== null);
-      assert.equal(app.shutdownError, 'SHUTDOWN_TEST_FAILURE');
-      assert.equal(app.lastShutdownFailure.code, 'SHUTDOWN_TEST_FAILURE');
+      assert.equal(app.shutdownError, 'SHUTDOWN_FAILED');
+      assert.equal(app.lastShutdownFailure.code, 'SHUTDOWN_FAILED');
       assert.equal(JSON.stringify(app.lastShutdownFailure).includes('TOPSECRET'), false);
       assert.equal(JSON.stringify(first.body).includes('TOPSECRET'), false);
       // An unauthenticated request must not trigger the retry (Bearer 门控).
@@ -1538,7 +1538,7 @@ test('Runtime shutdown 并发只触发一次成功回调，回调失败记录可
       await new Promise((resolve) => setTimeout(resolve, 50));
       assert.equal(invocations, 1);
       assert.notEqual(app.lastShutdownFailure, null);
-      // Flag reset allows one safe retry; that success is then at-most-once.
+      // Flag reset allows later Bearer-gated retries; that success is then at-most-once.
       mode = 'succeed';
       const retry = await request(address, '/v1/shutdown', { method: 'POST' });
       assert.equal(retry.status, 202);
@@ -1551,6 +1551,36 @@ test('Runtime shutdown 并发只触发一次成功回调，回调失败记录可
       assert.equal(third.status, 202);
       await new Promise((resolve) => setTimeout(resolve, 50));
       assert.equal(invocations, 2);
+    } finally { await app.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('Runtime shutdown 将合法字符形式的敏感失败码统一映射为固定码，getter 与审计均不含敏感内容', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-http-shutdown-code-'));
+  try {
+    const audit = { events: [], async append(event) { this.events.push(event); } };
+    const app = createWorkbenchServer({
+      root,
+      token: 'test-token-012345',
+      approvalToken: 'approve-token-012345',
+      audit,
+      onShutdown: async () => { throw Object.assign(new Error('boom'), { code: 'FAKE_SECRET_1234567890' }); },
+    });
+    const address = await app.listen();
+    try {
+      const first = await request(address, '/v1/shutdown', { method: 'POST' });
+      assert.equal(first.status, 202);
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (app.lastShutdownFailure !== null && audit.events.some((event) => event.type === 'shutdown.failed')) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(app.shutdownError, 'SHUTDOWN_FAILED');
+      assert.equal(app.lastShutdownFailure.code, 'SHUTDOWN_FAILED');
+      const failed = audit.events.find((event) => event.type === 'shutdown.failed');
+      assert.notEqual(failed, undefined);
+      assert.equal(failed.code, 'SHUTDOWN_FAILED');
+      assert.equal(JSON.stringify(audit.events).includes('FAKE_SECRET_1234567890'), false);
+      assert.equal(JSON.stringify(app.lastShutdownFailure).includes('FAKE_SECRET_1234567890'), false);
     } finally { await app.close(); }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
