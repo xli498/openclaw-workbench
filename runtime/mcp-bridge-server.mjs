@@ -202,14 +202,48 @@ export function createMcpBridgeServer({
     if (!Number.isSafeInteger(entry.lastActivity) || entry.lastActivity < 0) return false;
     if (typeof entry.closed !== 'boolean' || !Array.isArray(entry.events) || entry.events.length > maxReplayEvents) return false;
     if (entry.closed && entry.events.length !== 0) return false;
+    // A snapshot is only the writer's own shape, checked end to end:
+    // event ids must match their sequence (evt-N <=> sequence N), the
+    // buffer must be contiguous (a gap means a lost or forged event, and
+    // resolveReplay would otherwise treat a never-buffered sequence as
+    // a valid resume cursor), and the cursor must follow the last event
+    // (or be 1 for an open session that never broadcast). A closed
+    // tombstone keeps its cursor with an empty buffer, so it is exempt
+    // from the open-session cursor rule, but never from the other rules.
+    // The encoded frame must be exactly a broadcast notification:
+    // jsonrpc 2.0, a method, an object params (when present), and no
+    // id/result/error keys, so a corrupted snapshot cannot smuggle a
+    // JSON-RPC response — or a request a client would answer — into a
+    // replay stream. The encoded text must also be a single line: the
+    // replay writer splices it verbatim into one SSE `data:` line, so
+    // a raw CR or LF in it (for example pretty-printed JSON) would
+    // split the frame. Its size limit is UTF-8 bytes, matching the
+    // writer's boundedJson, not JS string length, so a multibyte frame
+    // cannot slip past the limit. The method check rejects only
+    // NUL/CR/LF — TAB, ESC, DEL still pass, exactly as broadcast
+    // does — so it must not be described as "no control characters".
+    // Anything failing any of these checks drops the
+    // whole entry; a valid entry in the same file is unaffected.
+    let previousSequence = null;
     for (const event of entry.events) {
       if (!plainObject(event) || typeof event.id !== 'string' || !EVENT_ID_PATTERN.test(event.id)
         || !Number.isSafeInteger(event.sequence) || event.sequence < 1
-        || typeof event.encoded !== 'string' || event.encoded.length > maxResponseBytes) return false;
+        || event.id !== `evt-${event.sequence}`
+        || (previousSequence !== null && event.sequence !== previousSequence + 1)
+        || typeof event.encoded !== 'string' || Buffer.byteLength(event.encoded, 'utf8') > maxResponseBytes
+        || /[\r\n]/.test(event.encoded)) return false;
+      previousSequence = event.sequence;
       try {
         const parsed = JSON.parse(event.encoded);
-        if (!plainObject(parsed) || typeof parsed.method !== 'string') return false;
+        if (!plainObject(parsed) || parsed.jsonrpc !== '2.0' || typeof parsed.method !== 'string' || !parsed.method || parsed.method.length > 128 || /[\0\r\n]/.test(parsed.method)
+          || (parsed.params !== undefined && !plainObject(parsed.params))
+          || parsed.id !== undefined || parsed.result !== undefined || parsed.error !== undefined) return false;
       } catch { return false; }
+    }
+    if (entry.events.length === 0) {
+      if (!entry.closed && entry.nextEventSequence !== 1) return false;
+    } else if (entry.nextEventSequence !== previousSequence + 1) {
+      return false;
     }
     return true;
   }
@@ -219,7 +253,9 @@ export function createMcpBridgeServer({
     try { parsed = JSON.parse(readFileSync(replayStoreFile, 'utf8')); } catch { return; }
     if (!plainObject(parsed) || parsed.version !== 1 || !Array.isArray(parsed.snapshots)) return;
     for (const entry of parsed.snapshots) {
-      if (validSnapshotEntry(entry)) replaySnapshots.set(entry.key, entry);
+      // First valid entry for a key wins: a later duplicate must never
+      // silently shadow an earlier snapshot for the same session hash.
+      if (validSnapshotEntry(entry) && !replaySnapshots.has(entry.key)) replaySnapshots.set(entry.key, entry);
     }
   }
   // Best-effort by design: persistence must never break broadcasting or
@@ -247,6 +283,14 @@ export function createMcpBridgeServer({
   loadReplaySnapshots();
 
   function resumeSession(oldSessionId) {
+    // Expiry is enforced here, not only on the HTTP path: without this,
+    // a live-but-idle-expired session would answer ACTIVE (it is still
+    // in the table until the timer runs) and could never be resumed,
+    // while its snapshot quietly aged past the idle window.
+    // expireSessions() reuses the HTTP path's full-session scan (it
+    // walks every live session); this call adds scan frequency, it is
+    // not a target-only or O(1) check.
+    expireSessions();
     if (typeof oldSessionId !== 'string' || !oldSessionId) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
     if (sessions.has(oldSessionId)) fail('MCP_SESSION_ACTIVE', 'MCP session is still live; resume is only for dormant snapshots');
     const snapshot = replaySnapshots.get(snapshotKey(oldSessionId));
@@ -530,6 +574,13 @@ export function createMcpBridgeServer({
   }
 
   function broadcast(sessionId, notification) {
+    // Same expiry rule as the HTTP path (requireSession): broadcasting
+    // to an idle-expired session must fail, not silently refresh its
+    // lastActivity and resurrect it. A live broadcast still refreshes
+    // lastActivity, as before. As in resumeSession, expireSessions()
+    // reuses the HTTP path's full-session scan; this call adds scan
+    // frequency, it is not a target-only or O(1) check.
+    expireSessions();
     if (typeof sessionId !== 'string' || !sessions.has(sessionId)) fail('MCP_SESSION_NOT_FOUND', 'MCP session was not found');
     if (!plainObject(notification) || typeof notification.method !== 'string' || !notification.method || notification.method.length > 128 || /[\0\r\n]/.test(notification.method) || (notification.params !== undefined && !plainObject(notification.params))) fail('MCP_NOTIFICATION_INVALID', 'MCP broadcast notification is invalid');
     const session = sessions.get(sessionId);
