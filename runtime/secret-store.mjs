@@ -76,23 +76,37 @@ function validateName(name) {
 }
 
 // Q24-1: Windows credential target names must be unambiguous in
-// (service, name). The previous encoding, `OpenClawWorkbench:<service>:<name>`,
+// (service, name). The original encoding, `OpenClawWorkbench:<service>:<name>`,
 // collided whenever either side contained a colon: (a:b, c) and (a, b:c)
 // both produced `OpenClawWorkbench:a:b:c`. The length-prefixed encoding
-// below is injective: each field is preceded by its length in UTF-16 code
-// units (JavaScript string length), so a field boundary can only be read
-// one way and no two distinct (service, name) pairs share a target.
+// below is injective within its own namespace: each field is preceded by
+// its length in UTF-16 code units (JavaScript string length), so a field
+// boundary can only be read one way and no two distinct (service, name)
+// pairs share a target.
+// wb10 fix for #56 Q1: length-prefixing alone did not end the collision,
+// because the length-prefixed scheme still shared the `OpenClawWorkbench:`
+// namespace with the old colon-joined scheme: new-format (a, b) and
+// old-format (1:a, 1:b) both produced `OpenClawWorkbench:1:a:1:b`, and
+// the base service/name patterns allow colons, so old-format entries
+// with colons can genuinely exist. The `OpenClawWorkbench.v2:` namespace
+// below is disjoint from the old scheme by construction: every
+// old-scheme target has ':' immediately after `OpenClawWorkbench`,
+// while every v2 target has '.' there, so no old-format entry can ever
+// equal a v2 target, whatever colons the service/name contain.
 // Encoding happens here, in the JS backend, so get/set/has/delete all use
 // the identical target for a pair; the PowerShell helper receives the
 // finished target verbatim and never re-splits it. Targets written under
-// the old colon-joined scheme are left orphaned in the credential store:
-// they are not migrated and not read back (see the PR description).
-// The in-memory backend is unaffected: it already keys on a NUL
-// separator, which neither service nor name can contain.
+// either old scheme (colon-joined, or length-prefixed under the old
+// namespace) are left orphaned in the credential store: they are not
+// migrated and not read back, so credentials stored by older versions
+// are unreachable from this version (see the PR description / upgrade
+// note, which must ship with the merge/release notes). The in-memory
+// backend is unaffected: it already keys on a NUL separator, which
+// neither service nor name can contain.
 export function encodeCredentialTarget(service, name) {
   validateService(service);
   validateName(name);
-  return `OpenClawWorkbench:${service.length}:${service}:${name.length}:${name}`;
+  return `OpenClawWorkbench.v2:${service.length}:${service}:${name.length}:${name}`;
 }
 
 function validateSecret(secret) {

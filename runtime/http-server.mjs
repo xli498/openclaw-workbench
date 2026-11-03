@@ -336,15 +336,37 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
     secretQueue = run.then(() => undefined, () => undefined);
     return run;
   }
-  // Q24-5: per-secret write counter for secrets written through this
-  // server instance only: name -> { version, createdAt }. It is
-  // deliberately in-memory and not persisted: after a restart this
-  // server no longer knows the current version of a backend secret
+  // Q24-5: per-secret write record for secrets written through this
+  // server instance only: name -> { version, generation, createdAt }.
+  // It is deliberately in-memory and not persisted: after a restart
+  // this server no longer knows the current write of a backend secret
   // (another workspace may have written the shared credential target
   // in the meantime), so attribution checks then fail safe to
   // 'retained'. A version entry alone never grants attribution; a
   // proposal snapshot also requires the secret to exist at snapshot
   // time (see the model-registration handler).
+  // wb10 fix for #56 Q3: `generation` is a fresh random UUID minted on
+  // every successful write and never reused. The old integer `version`
+  // alone was not a reliable write generation: DELETE cleared it, so a
+  // delete+recreate minted version 1 again and an old proposal's
+  // cancel could delete the new value; a restart reset it to 1, so a
+  // post-restart rewrite could likewise be deleted by cancelling a
+  // pre-restart proposal. A timestamp comparison alone would not fix
+  // this either (equal timestamps and clock skew are both possible),
+  // so cleanup requires the generation token AND the exact createdAt
+  // string of the attributed write to match the current write.
+  // wb10 policy gate for #56 Q3 ("unknown -> retained" convergence,
+  // pending a coordinator ruling on whether it is acceptable as the
+  // long-term contract): even when every gate below holds, automatic
+  // cleanup stays disabled, because this server cannot prove
+  // exclusive creation across workspaces: the credential backend is
+  // shared, another workspace's reference is invisible here, and a
+  // proposal merely referencing a secret is not proof it created it.
+  // Manual deletion via DELETE /v1/secrets remains the deletion path.
+  // If the coordinator later rules that same-server attribution under
+  // the generation gates below is sufficient, flipping this flag is
+  // the only change needed to re-enable automatic cleanup.
+  const SECRET_AUTO_CLEANUP_ENABLED = false;
   const secretVersions = new Map();
   function secretVersionEntry(name) {
     return secretVersions.get(name) ?? null;
@@ -371,29 +393,40 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const currentWorkspaceRevision = async (options) => (await createWorkspace(root)).workspaceRevision(options);
   // Q24-5: attribution-gated proposal-secret cleanup. This function
   // does NOT prove a secret is orphaned, and its result must never be
-  // described that way: it only deletes when every gate below holds,
-  // and retains otherwise. Gates, all evaluated inside the secret
-  // lock so a new reference cannot land between the check and the
-  // delete:
+  // described that way. Gates, all evaluated inside the secret lock
+  // so a new reference cannot land between the check and the delete:
   //   1. the cancelled/failed proposal carries a secretAttribution
   //      record for its own id and this secret name (recorded at
   //      model-registration time: proposal id + secret name + the
-  //      version counter + the creation timestamp of that version);
-  //   2. the server's current version counter for the name still
-  //      equals the attributed version, i.e. the secret has not been
-  //      overwritten through this server since attribution;
+  //      write's version counter + its never-reused generation token
+  //      + the creation timestamp of that write);
+  //   2. the server's current write record for the name still matches
+  //      the attributed write exactly -- same version counter, same
+  //      generation token, same createdAt string -- i.e. the secret
+  //      has not been overwritten, deleted+recreated, or rewritten
+  //      after a restart since attribution (a timestamp check alone
+  //      would not be a reliable generation, so the token is the
+  //      binding factor and createdAt is a secondary exact match);
   //   3. no registered model profile references the secret;
   //   4. no other non-terminal model proposal references it.
   // Anything unknown retains: a proposal persisted before attribution
-  // existed has no record (attribution unknown -> retained); after a
-  // restart the in-memory version counter is empty (current version
-  // unknown -> retained); a secret created by another workspace never
-  // gains a version entry in this server, so a proposal that merely
-  // references a cross-workspace shared secret has no attribution and
-  // is retained. A failed backend delete retains the secret and
-  // reports 'failed'; the version entry is dropped only on a
-  // confirmed delete. The secret value is never written to audit
-  // events or logs by this path (only the secret name is).
+  // existed has no record (attribution unknown -> retained); a
+  // pre-fix snapshot without a generation token fails gate 1
+  // (generation unknown -> retained); after a restart the in-memory
+  // write record is empty (current write unknown -> retained); a
+  // secret created by another workspace never gains a write record in
+  // this server, so a proposal that merely references a
+  // cross-workspace shared secret has no attribution and is retained.
+  // wb10 policy gate (#56 Q3, "unknown -> retained" convergence):
+  // even when gates 1-4 all hold, cleanup returns 'retained' while
+  // SECRET_AUTO_CLEANUP_ENABLED is false, because same-server gates
+  // cannot prove exclusive creation across workspaces (another
+  // workspace's reference is invisible here). The delete branch below
+  // is therefore the re-enable path for a future coordinator ruling,
+  // not currently reachable: a failed backend delete would retain the
+  // secret and report 'failed', and the write record would be dropped
+  // only on a confirmed delete. The secret value is never written to
+  // audit events or logs by this path (only the secret name is).
   async function cleanupModelProposalSecret(proposal) {
     const secretRef = proposal?.profile?.secretRef;
     if (typeof secretRef !== 'string' || !secretRef.startsWith('keychain:')) return 'not_needed';
@@ -402,9 +435,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
     return withSecretLock(async () => {
       const attribution = proposal?.secretAttribution;
       if (!attribution || attribution.proposalId !== proposal?.action?.id || attribution.secretName !== secretName
-        || !Number.isSafeInteger(attribution.version) || typeof attribution.createdAt !== 'string') return 'retained';
+        || !Number.isSafeInteger(attribution.version) || typeof attribution.generation !== 'string' || !attribution.generation
+        || typeof attribution.createdAt !== 'string') return 'retained';
       const current = secretVersionEntry(secretName);
-      if (!current || current.version !== attribution.version) return 'retained';
+      if (!current || current.version !== attribution.version || current.generation !== attribution.generation || current.createdAt !== attribution.createdAt) return 'retained';
       const referencedByRegistry = modelRegistry.list().some((profile) => profile.secretRef === secretRef);
       const referencedByPendingProposal = modelProposalStore.list().some((record) => {
         const candidate = record?.proposal;
@@ -415,6 +449,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           && candidate?.profile?.secretRef === secretRef;
       });
       if (referencedByRegistry || referencedByPendingProposal) return 'retained';
+      if (!SECRET_AUTO_CLEANUP_ENABLED) return 'retained';
       try {
         const deleted = await effectiveSecretStore.delete(secretName);
         if (deleted === false) return 'not_found';
@@ -473,7 +508,10 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
           if (exists && !overwrite) throw new SecretResolverError('SECRET_ALREADY_CONFIGURED', 'secret is already configured; rotate it explicitly');
           await effectiveSecretStore.set(input.name, input.value);
           const previous = secretVersionEntry(input.name);
-          secretVersions.set(input.name, { version: (previous?.version ?? 0) + 1, createdAt: new Date().toISOString() });
+          // wb10 #56 Q3: mint a fresh, never-reused generation token
+          // for this write; a later delete+recreate or a post-restart
+          // rewrite can never re-mint an earlier write's token.
+          secretVersions.set(input.name, { version: (previous?.version ?? 0) + 1, generation: randomUUID(), createdAt: new Date().toISOString() });
         });
         if (effectiveAudit) await effectiveAudit.append({ type: 'secret.configured', actor: 'user', secretName: input.name, operation: overwrite ? 'overwrite' : 'create' });
         return json(response, 200, { name: input.name, configured: true });
@@ -544,11 +582,16 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         // version entry from a write through this server; otherwise
         // the field is omitted and later cleanup retains (attribution
         // unknown). The stored record shape is { proposalId,
-        // secretName, version, createdAt } alongside the existing
-        // { action, profile } fields, so snapshots written before
-        // this change (no such field) still restore and validate.
+        // secretName, version, generation, createdAt } alongside the
+        // existing { action, profile } fields, so snapshots written
+        // before this change (no generation field) still restore and
+        // validate but fail the cleanup generation gate and retain.
         // The field is internal: publicModelProposal does not expose
-        // it, and it contains no secret value.
+        // it, and it contains no secret value. Note the snapshot
+        // still does not prove the proposal created the secret -- it
+        // only records which write through this server the proposal
+        // was registered against -- which is why the cleanup policy
+        // gate retains even on a full match (see above).
         let proposal;
         modelReservations.add(action.id);
         try {
@@ -564,7 +607,7 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
               const secretName = profile.secretRef.slice('keychain:'.length);
               const current = secretVersionEntry(secretName);
               if (secretName && current && await hasSecret(secretName)) {
-                secretAttribution = Object.freeze({ proposalId: action.id, secretName, version: current.version, createdAt: current.createdAt });
+                secretAttribution = Object.freeze({ proposalId: action.id, secretName, version: current.version, generation: current.generation, createdAt: current.createdAt });
               }
             }
             const candidate = Object.freeze({ action, profile, ...(secretAttribution ? { secretAttribution } : {}) });
