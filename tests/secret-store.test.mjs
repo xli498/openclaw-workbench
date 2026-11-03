@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { createWindowsCredentialStore, createMemorySecretBackend, createPowerShellCredentialBackend } from '../runtime/secret-store.mjs';
+import { createWindowsCredentialStore, createMemorySecretBackend, createPowerShellCredentialBackend, encodeCredentialTarget } from '../runtime/secret-store.mjs';
 
 test('secret store exposes set/get/delete/has without exposing values in metadata', async () => {
   const store = createWindowsCredentialStore({ service: 'openclaw-workbench-test', backend: createMemorySecretBackend() });
@@ -89,10 +89,74 @@ test('PowerShell backend uses fixed helper operations and never places secret in
     assert.equal(call.args.includes('svc'), false);
     const payload = JSON.parse(call.options.input);
     assert.equal(payload.op, ['set', 'get', 'delete'][index]);
-    assert.equal(payload.service, 'svc');
-    assert.equal(payload.name, 'provider');
+    // Q24-1: the helper receives one pre-encoded, unambiguous target,
+    // never a service/name pair it must re-split.
+    assert.equal(payload.target, encodeCredentialTarget('svc', 'provider'));
+    assert.equal(payload.service, undefined);
+    assert.equal(payload.name, undefined);
     assert.equal(payload.value, index === 0 ? 'hidden-value' : undefined);
   }
+});
+
+test('Q24-1: length-prefixed credential targets do not collide on colons', async () => {
+  assert.equal(encodeCredentialTarget('a:b', 'c'), 'OpenClawWorkbench.v2:3:a:b:1:c');
+  assert.equal(encodeCredentialTarget('a', 'b:c'), 'OpenClawWorkbench.v2:1:a:3:b:c');
+  assert.notEqual(encodeCredentialTarget('a:b', 'c'), encodeCredentialTarget('a', 'b:c'));
+  // End-to-end through the PowerShell backend shape: a fake helper
+  // keyed by the encoded target keeps the two pairs isolated.
+  const stored = new Map();
+  const backend = createPowerShellCredentialBackend({
+    platform: 'win32',
+    execFileImpl: async (_file, _args, options) => {
+      const payload = JSON.parse(options.input);
+      const existed = stored.has(payload.target);
+      if (payload.op === 'set') stored.set(payload.target, payload.value);
+      if (payload.op === 'delete') stored.delete(payload.target);
+      const value = stored.get(payload.target);
+      return { stdout: JSON.stringify({ ok: true, found: payload.op === 'delete' ? existed : value !== undefined, deleted: payload.op === 'delete' ? existed : undefined, ...(payload.op === 'get' && value !== undefined ? { value } : {}) }), stderr: '' };
+    },
+  });
+  const first = createWindowsCredentialStore({ service: 'a:b', backend });
+  const second = createWindowsCredentialStore({ service: 'a', backend });
+  await first.set('c', 'first-secret');
+  await second.set('b:c', 'second-secret');
+  assert.equal(await first.get('c'), 'first-secret');
+  assert.equal(await second.get('b:c'), 'second-secret');
+  assert.equal(await first.delete('c'), true);
+  assert.equal(await first.get('c'), null);
+  assert.equal(await second.get('b:c'), 'second-secret');
+});
+
+test('Q24-1 wb10 #56 Q1: new v2 targets never collide with legacy old-format entries', async () => {
+  // The cross-format collision that the old shared namespace allowed:
+  // new-format (a, b) and old-format (1:a, 1:b) both produced
+  // `OpenClawWorkbench:1:a:1:b`. The v2 namespace is disjoint from the
+  // old scheme by construction (old targets have ':' right after
+  // `OpenClawWorkbench`, v2 targets have '.'), so a pre-existing
+  // old-format entry must be invisible to the new-format pair, and a
+  // new-format write must never overwrite it.
+  assert.equal(encodeCredentialTarget('a', 'b'), 'OpenClawWorkbench.v2:1:a:1:b');
+  assert.notEqual(encodeCredentialTarget('a', 'b'), 'OpenClawWorkbench:1:a:1:b');
+  assert.notEqual(encodeCredentialTarget('1:a', '1:b'), 'OpenClawWorkbench:1:a:1:b');
+  const stored = new Map();
+  stored.set('OpenClawWorkbench:1:a:1:b', 'legacy-secret');
+  const backend = createPowerShellCredentialBackend({
+    platform: 'win32',
+    execFileImpl: async (_file, _args, options) => {
+      const payload = JSON.parse(options.input);
+      const existed = stored.has(payload.target);
+      if (payload.op === 'set') stored.set(payload.target, payload.value);
+      if (payload.op === 'delete') stored.delete(payload.target);
+      const value = stored.get(payload.target);
+      return { stdout: JSON.stringify({ ok: true, found: payload.op === 'delete' ? existed : value !== undefined, deleted: payload.op === 'delete' ? existed : undefined, ...(payload.op === 'get' && value !== undefined ? { value } : {}) }), stderr: '' };
+    },
+  });
+  const store = createWindowsCredentialStore({ service: 'a', backend });
+  assert.equal(await store.get('b'), null);
+  await store.set('b', 'new-secret');
+  assert.equal(await store.get('b'), 'new-secret');
+  assert.equal(stored.get('OpenClawWorkbench:1:a:1:b'), 'legacy-secret');
+  assert.equal(stored.get('OpenClawWorkbench.v2:1:a:1:b'), 'new-secret');
 });
 
 test('PowerShell backend transport supplies JSON through stdin and closes the stream', async () => {
