@@ -35,6 +35,8 @@ function blockedHost(hostname) {
   return false;
 }
 
+// 探针执行层校验（非配置保存层）：实际发起请求时才要求 HTTPS 并检查主机与 DNS；
+// 配置保存层允许保存 HTTP 与私网地址，本函数不改变该分层口径。
 function modelEndpoint(profile) {
   if (!profile || typeof profile !== 'object' || typeof profile.endpoint !== 'string') fail('MODEL_INPUT_INVALID', 'model profile is invalid');
   let url;

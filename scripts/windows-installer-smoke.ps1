@@ -25,6 +25,18 @@ $workspace = Join-Path $testRoot 'workspace'
 $workspaceMarker = Join-Path $workspace 'preserve-through-uninstall.txt'
 $secretName = "installer-smoke-{0}" -f [guid]::NewGuid().ToString('N')
 $secretTarget = "OpenClawWorkbench:openclaw-workbench:$secretName"
+# Credential Manager target encodings the server may have written, oldest
+# first. main writes the plain colon form above; PR #56 switched to a
+# length-prefixed form and its fix line (#65) to a disjoint v2 namespace
+# (see runtime/secret-store.mjs encodeCredentialTarget). The smoke check
+# must accept whichever form the installed server wrote, so the credential
+# checks below test every candidate instead of only the legacy target.
+$secretService = 'openclaw-workbench'
+$secretTargetCandidates = @(
+  $secretTarget
+  ("OpenClawWorkbench:{0}:{1}:{2}:{3}" -f $secretService.Length, $secretService, $secretName.Length, $secretName)
+  ("OpenClawWorkbench.v2:{0}:{1}:{2}:{3}" -f $secretService.Length, $secretService, $secretName.Length, $secretName)
+)
 $secretValue = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
 $controlToken = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
 $approvalToken = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
@@ -57,6 +69,27 @@ function Test-CredentialTarget([string]$Target) {
   if (-not [OpenClawInstallerSmokeCredential]::CredRead($Target, 1, 0, [ref]$pointer)) { return $false }
   [OpenClawInstallerSmokeCredential]::CredFree($pointer)
   return $true
+}
+
+function Test-AnyCredentialTarget {
+  foreach ($candidate in $secretTargetCandidates) {
+    if (Test-CredentialTarget $candidate) { return $true }
+  }
+  return $false
+}
+
+# Q24-2 (PR #56): POST /v1/secrets requires actionHash, the SHA-256 hex
+# digest of JSON.stringify({type, sessionId, workspaceRevision, target,
+# preview, risk}) in exactly this field order (see
+# runtime/secret-action.mjs secretActionHash + runtime/action.mjs
+# actionHash). The secret value is never a hash input. The smoke secret
+# name is "installer-smoke-" plus GUID hex, so no JSON escaping is needed
+# in the manually built canonical string below; the lowercase hex digest
+# must NOT use [Convert]::ToHexString, which returns uppercase.
+function Get-SecretActionHash([string]$Version) {
+  $canonicalJson = '{"type":"secret.create","sessionId":"secret","workspaceRevision":"' + $Version + '","target":"' + $secretName + '","preview":null,"risk":"high"}'
+  $hashBytes = [Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonicalJson))
+  return ($hashBytes | ForEach-Object { $_.ToString('x2') }) -join ''
 }
 
 function Get-InstalledProductEntries {
@@ -249,10 +282,33 @@ try {
   $health = Invoke-RestMethod -Uri "$baseUrl/health" -Headers $headers -TimeoutSec 5
   if ($health.ok -ne $true -or $health.service -ne 'openclaw-workbench') { throw 'Bundled Runtime health check failed.' }
 
-  $secretPayload = @{ name = $secretName; value = $secretValue } | ConvertTo-Json -Compress
-  $secretResponse = Invoke-RestMethod -Uri "$baseUrl/v1/secrets" -Method Post -Headers $headers -ContentType 'application/json' -Body $secretPayload -TimeoutSec 5
+  # The existence version is observed by the server inside its secret
+  # lock, so a client can only predict it: GET configured first, then
+  # hash that version. If the state changed between the GET and the
+  # locked check the server answers 409 SECRET_ACTION_HASH_MISMATCH, in
+  # which case re-read the version and retry with a bounded number of
+  # attempts. Any other failure is rethrown unchanged.
+  $secretResponse = $null
+  $secretAttempts = 0
+  while ($null -eq $secretResponse) {
+    $secretAttempts++
+    $existingSecret = Invoke-RestMethod -Uri "$baseUrl/v1/secrets/$secretName" -Headers $headers -TimeoutSec 5
+    $secretVersion = if ($existingSecret.configured -eq $true) { 'present' } else { 'absent' }
+    $secretPayload = @{ name = $secretName; value = $secretValue; actionHash = (Get-SecretActionHash $secretVersion) } | ConvertTo-Json -Compress
+    try {
+      $secretResponse = Invoke-RestMethod -Uri "$baseUrl/v1/secrets" -Method Post -Headers $headers -ContentType 'application/json' -Body $secretPayload -TimeoutSec 5
+    } catch {
+      $detail = ''
+      if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message }
+      $statusCode = $null
+      if ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $statusCode = [int]$_.Exception.Response.StatusCode }
+      $hashMismatch = ($detail -match 'SECRET_ACTION_HASH_MISMATCH') -or ($statusCode -eq 409 -and $detail -notmatch 'SECRET_ALREADY_CONFIGURED')
+      if ($hashMismatch -and $secretAttempts -lt 3) { continue }
+      throw
+    }
+  }
   if ($secretResponse.configured -ne $true -or $secretResponse.name -ne $secretName) { throw 'Credential Manager smoke setup failed.' }
-  $credentialCreated = Test-CredentialTarget $secretTarget
+  $credentialCreated = Test-AnyCredentialTarget
   if (-not $credentialCreated) { throw 'Runtime did not create the isolated Credential Manager entry.' }
 
   $shutdown = Invoke-RestMethod -Uri "$baseUrl/v1/shutdown" -Method Post -Headers $headers -TimeoutSec 5
@@ -264,7 +320,7 @@ try {
   Invoke-InstallerUninstall
   $uninstalled = $true
   if (-not (Test-Path -LiteralPath $workspaceMarker -PathType Leaf)) { throw "$InstallerType uninstall removed the selected workspace." }
-  if (-not (Test-CredentialTarget $secretTarget)) { throw "$InstallerType uninstall removed user Credential Manager data." }
+  if (-not (Test-AnyCredentialTarget)) { throw "$InstallerType uninstall removed user Credential Manager data." }
 
   $smokeSucceeded = $true
   Write-Output "$InstallerType installer smoke passed: install, app launch, bundled Runtime health, Credential Manager preservation, and uninstall."
@@ -281,10 +337,12 @@ try {
     } catch { }
     $desktopProcess.Dispose()
   }
-  if ($credentialCreated -or (Test-CredentialTarget $secretTarget)) {
-    $deleted = [OpenClawInstallerSmokeCredential]::CredDelete($secretTarget, 1, 0)
-    if (-not $deleted -and [Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 1168) {
-      $credentialCleanupFailed = $true
+  foreach ($candidate in $secretTargetCandidates) {
+    if (Test-CredentialTarget $candidate) {
+      $deleted = [OpenClawInstallerSmokeCredential]::CredDelete($candidate, 1, 0)
+      if (-not $deleted -and [Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 1168) {
+        $credentialCleanupFailed = $true
+      }
     }
   }
   if ($smokeSucceeded -and (Test-Path -LiteralPath $testRoot)) {

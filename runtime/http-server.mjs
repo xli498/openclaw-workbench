@@ -23,6 +23,7 @@ import { McpRegistryError, createMcpRegistry, normalizeMcpServer } from './mcp-r
 import { ModelRegistryError, createModelRegistry, normalizeModelProfile } from './model-registry.mjs';
 import { McpRuntimeError, createMcpServerRuntime } from './mcp-runtime.mjs';
 import { SecretResolverError, createSecretResolver } from './secret-resolver.mjs';
+import { secretActionHash, secretVersionOf } from './secret-action.mjs';
 import { SecretStoreError, createWindowsCredentialStore } from './secret-store.mjs';
 import { ModelProbeError, createModelHealthProbe } from './model-probe.mjs';
 import { ModelRunnerError, createModelRunner } from './model-runner.mjs';
@@ -167,7 +168,7 @@ function errorResponse(error) {
   if (error instanceof ConfigError) return { status: ['CONFIG_CONFLICT', 'CONFIG_ACTION_HASH_MISMATCH', 'CONFIG_BUSY', 'BACKUP_TARGET_MISMATCH'].includes(error.code) ? 409 : error.code === 'APPROVAL_AUTH_REQUIRED' ? 403 : error.code === 'CONFIG_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRegistryError) return { status: ['MCP_CONFLICT', 'MCP_DUPLICATE', 'MCP_REGISTRY_BUSY', 'MCP_ACTION_HASH_MISMATCH', 'MCP_PROPOSAL_BUSY'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : error.code === 'MCP_PROPOSAL_LIMIT' ? 429 : 400, body: safe(error.code, error.message) };
   if (error instanceof McpRuntimeError) return { status: ['MCP_CONFLICT', 'MCP_NOT_RUNNING', 'MCP_SERVER_DISABLED', 'MCP_REQUEST_ABORTED', 'MCP_TRANSPORT_CLOSED'].includes(error.code) ? 409 : error.code === 'MCP_NOT_FOUND' ? 404 : ['MCP_APPROVAL_REQUIRED', 'MCP_TOOL_NOT_AUTHORIZED'].includes(error.code) ? 403 : ['MCP_START_FAILED', 'MCP_REQUEST_FAILED', 'MCP_HTTP_STATUS', 'MCP_REMOTE_ERROR', 'MCP_PROCESS_ERROR', 'MCP_PROCESS_CLOSED', 'MCP_STDIN_ERROR', 'MCP_SEND_FAILED'].includes(error.code) ? 502 : error.code === 'MCP_REQUEST_TIMEOUT' ? 504 : 400, body: safe(error.code, error.message) };
-  if (error instanceof SecretResolverError) return { status: error.code === 'SECRET_ALREADY_CONFIGURED' ? 409 : 400, body: safe(error.code, error.message) };
+  if (error instanceof SecretResolverError) return { status: ['SECRET_ALREADY_CONFIGURED', 'SECRET_ACTION_HASH_MISMATCH'].includes(error.code) ? 409 : 400, body: safe(error.code, error.message) };
   if (error instanceof SecretStoreError) return { status: ['SECRET_STORE_BACKEND_FAILED', 'SECRET_STORE_UNAVAILABLE'].includes(error.code) ? 503 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelRunnerError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
   if (error instanceof ModelProbeError) return { status: ['MODEL_TIMEOUT'].includes(error.code) ? 504 : ['MODEL_ABORTED'].includes(error.code) ? 409 : ['MODEL_HTTP_STATUS', 'MODEL_REQUEST_FAILED'].includes(error.code) ? 502 : 400, body: safe(error.code, error.message) };
@@ -327,6 +328,56 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const inspectModelProfile = inspectModelProfileFn ?? (async () => ({ status: 'unavailable', code: 'NOT_CONFIGURED' }));
   const effectiveSecretStore = secretStore ?? createWindowsCredentialStore({ service: secretService });
   const hasSecret = async (name) => typeof effectiveSecretStore.has === 'function' ? effectiveSecretStore.has(name) : (await effectiveSecretStore.get(name)) !== null;
+  // Q24-2/Q24-5: one FIFO promise-chain lock serializes every secret
+  // check-and-write sequence in this process: POST /v1/secrets
+  // (has -> set), DELETE /v1/secrets, model-proposal secret-attribution
+  // snapshots, and proposal-secret cleanup (check -> delete). Holding
+  // the lock across the awaited backend calls is what closes the
+  // has/set and check/delete races. This is explicitly in-process
+  // only: a second process, or another workspace sharing the same
+  // credential service, can still write the same backend concurrently,
+  // so the lock is never described as making a change atomic.
+  let secretQueue = Promise.resolve();
+  function withSecretLock(fn) {
+    const run = secretQueue.then(fn, fn);
+    secretQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+  // Q24-5: per-secret write record for secrets written through this
+  // server instance only: name -> { version, generation, createdAt }.
+  // It is deliberately in-memory and not persisted: after a restart
+  // this server no longer knows the current write of a backend secret
+  // (another workspace may have written the shared credential target
+  // in the meantime), so attribution checks then fail safe to
+  // 'retained'. A version entry alone never grants attribution; a
+  // proposal snapshot also requires the secret to exist at snapshot
+  // time (see the model-registration handler).
+  // wb10 fix for #56 Q3: `generation` is a fresh random UUID minted on
+  // every successful write and never reused. The old integer `version`
+  // alone was not a reliable write generation: DELETE cleared it, so a
+  // delete+recreate minted version 1 again and an old proposal's
+  // cancel could delete the new value; a restart reset it to 1, so a
+  // post-restart rewrite could likewise be deleted by cancelling a
+  // pre-restart proposal. A timestamp comparison alone would not fix
+  // this either (equal timestamps and clock skew are both possible),
+  // so cleanup requires the generation token AND the exact createdAt
+  // string of the attributed write to match the current write.
+  // wb10 policy gate for #56 Q3 ("unknown -> retained" convergence,
+  // pending a coordinator ruling on whether it is acceptable as the
+  // long-term contract): even when every gate below holds, automatic
+  // cleanup stays disabled, because this server cannot prove
+  // exclusive creation across workspaces: the credential backend is
+  // shared, another workspace's reference is invisible here, and a
+  // proposal merely referencing a secret is not proof it created it.
+  // Manual deletion via DELETE /v1/secrets remains the deletion path.
+  // If the coordinator later rules that same-server attribution under
+  // the generation gates below is sufficient, flipping this flag is
+  // the only change needed to re-enable automatic cleanup.
+  const SECRET_AUTO_CLEANUP_ENABLED = false;
+  const secretVersions = new Map();
+  function secretVersionEntry(name) {
+    return secretVersions.get(name) ?? null;
+  }
   const effectiveSecretResolver = secretResolver ?? createSecretResolver({ keychainProvider: (name, options) => effectiveSecretStore.get(name, options) });
   const liveModelProbe = modelHealthProbe ?? createModelHealthProbe({ secretResolver: effectiveSecretResolver });
   const liveModelRunner = modelRunner ?? createModelRunner({ profileResolver: modelRegistry, secretResolver: effectiveSecretResolver });
@@ -347,24 +398,72 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
   const sessions = createChatSessionManager({ root, runAgentFn: agentRunner, modelRunner: liveModelRunner, modelResolver: modelRegistry, modelFallbackFn: agentRunner, toolRegistry: workspaceTools });
   const startupState = startWorkbench({ root, audit: effectiveAudit });
   const currentWorkspaceRevision = async (options) => (await createWorkspace(root)).workspaceRevision(options);
+  // Q24-5: attribution-gated proposal-secret cleanup. This function
+  // does NOT prove a secret is orphaned, and its result must never be
+  // described that way. Gates, all evaluated inside the secret lock
+  // so a new reference cannot land between the check and the delete:
+  //   1. the cancelled/failed proposal carries a secretAttribution
+  //      record for its own id and this secret name (recorded at
+  //      model-registration time: proposal id + secret name + the
+  //      write's version counter + its never-reused generation token
+  //      + the creation timestamp of that write);
+  //   2. the server's current write record for the name still matches
+  //      the attributed write exactly -- same version counter, same
+  //      generation token, same createdAt string -- i.e. the secret
+  //      has not been overwritten, deleted+recreated, or rewritten
+  //      after a restart since attribution (a timestamp check alone
+  //      would not be a reliable generation, so the token is the
+  //      binding factor and createdAt is a secondary exact match);
+  //   3. no registered model profile references the secret;
+  //   4. no other non-terminal model proposal references it.
+  // Anything unknown retains: a proposal persisted before attribution
+  // existed has no record (attribution unknown -> retained); a
+  // pre-fix snapshot without a generation token fails gate 1
+  // (generation unknown -> retained); after a restart the in-memory
+  // write record is empty (current write unknown -> retained); a
+  // secret created by another workspace never gains a write record in
+  // this server, so a proposal that merely references a
+  // cross-workspace shared secret has no attribution and is retained.
+  // wb10 policy gate (#56 Q3, "unknown -> retained" convergence):
+  // even when gates 1-4 all hold, cleanup returns 'retained' while
+  // SECRET_AUTO_CLEANUP_ENABLED is false, because same-server gates
+  // cannot prove exclusive creation across workspaces (another
+  // workspace's reference is invisible here). The delete branch below
+  // is therefore the re-enable path for a future coordinator ruling,
+  // not currently reachable: a failed backend delete would retain the
+  // secret and report 'failed', and the write record would be dropped
+  // only on a confirmed delete. The secret value is never written to
+  // audit events or logs by this path (only the secret name is).
   async function cleanupModelProposalSecret(proposal) {
     const secretRef = proposal?.profile?.secretRef;
     if (typeof secretRef !== 'string' || !secretRef.startsWith('keychain:')) return 'not_needed';
     const secretName = secretRef.slice('keychain:'.length);
-    const referencedByRegistry = modelRegistry.list().some((profile) => profile.secretRef === secretRef);
-    const referencedByPendingProposal = modelProposalStore.list().some((record) => {
-      const candidate = record?.proposal;
-      const candidateAction = candidate?.action;
-      return candidateAction?.id !== proposal?.action?.id
-        && typeof candidateAction?.status === 'string'
-        && !MODEL_TERMINAL_STATUSES.has(candidateAction.status)
-        && candidate?.profile?.secretRef === secretRef;
+    if (!secretName) return 'retained';
+    return withSecretLock(async () => {
+      const attribution = proposal?.secretAttribution;
+      if (!attribution || attribution.proposalId !== proposal?.action?.id || attribution.secretName !== secretName
+        || !Number.isSafeInteger(attribution.version) || typeof attribution.generation !== 'string' || !attribution.generation
+        || typeof attribution.createdAt !== 'string') return 'retained';
+      const current = secretVersionEntry(secretName);
+      if (!current || current.version !== attribution.version || current.generation !== attribution.generation || current.createdAt !== attribution.createdAt) return 'retained';
+      const referencedByRegistry = modelRegistry.list().some((profile) => profile.secretRef === secretRef);
+      const referencedByPendingProposal = modelProposalStore.list().some((record) => {
+        const candidate = record?.proposal;
+        const candidateAction = candidate?.action;
+        return candidateAction?.id !== proposal?.action?.id
+          && typeof candidateAction?.status === 'string'
+          && !MODEL_TERMINAL_STATUSES.has(candidateAction.status)
+          && candidate?.profile?.secretRef === secretRef;
+      });
+      if (referencedByRegistry || referencedByPendingProposal) return 'retained';
+      if (!SECRET_AUTO_CLEANUP_ENABLED) return 'retained';
+      try {
+        const deleted = await effectiveSecretStore.delete(secretName);
+        if (deleted === false) return 'not_found';
+        secretVersions.delete(secretName);
+        return 'deleted';
+      } catch { return 'failed'; }
     });
-    if (!secretName || referencedByRegistry || referencedByPendingProposal) return 'retained';
-    try {
-      const deleted = await effectiveSecretStore.delete(secretName);
-      return deleted === false ? 'not_found' : 'deleted';
-    } catch { return 'failed'; }
   }
   const liveStreams = new Set();
   const bridges = new Set();
@@ -425,8 +524,29 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         if (typeof input.name !== 'string' || typeof input.value !== 'string') throw new SecretResolverError('SECRET_INPUT_INVALID', 'secret input is invalid');
         const overwrite = input.overwrite === true;
         if (overwrite && !requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
-        if (await hasSecret(input.name) && !overwrite) throw new SecretResolverError('SECRET_ALREADY_CONFIGURED', 'secret is already configured; rotate it explicitly');
-        await effectiveSecretStore.set(input.name, input.value);
+        // Q24-2: every create/overwrite must carry the actionHash for
+        // its operation, target, and current existence version (see
+        // runtime/secret-action.mjs for the exact rule). The existence
+        // check and the write run inside the secret lock, so two
+        // concurrent creates cannot both observe 'absent' and both
+        // write: the second re-checks under the lock, finds the
+        // version changed, and is rejected. A backend failure
+        // surfaces as 503 via the SecretStoreError mapping and does
+        // not advance the version counter. Audit events carry only
+        // the secret name and operation, never the value.
+        await withSecretLock(async () => {
+          const exists = await hasSecret(input.name);
+          const version = secretVersionOf(exists);
+          const operation = overwrite ? 'overwrite' : 'create';
+          if (input.actionHash !== secretActionHash({ operation, name: input.name, version })) throw new SecretResolverError('SECRET_ACTION_HASH_MISMATCH', 'secret change must bind the current action hash');
+          if (exists && !overwrite) throw new SecretResolverError('SECRET_ALREADY_CONFIGURED', 'secret is already configured; rotate it explicitly');
+          await effectiveSecretStore.set(input.name, input.value);
+          const previous = secretVersionEntry(input.name);
+          // wb10 #56 Q3: mint a fresh, never-reused generation token
+          // for this write; a later delete+recreate or a post-restart
+          // rewrite can never re-mint an earlier write's token.
+          secretVersions.set(input.name, { version: (previous?.version ?? 0) + 1, generation: randomUUID(), createdAt: new Date().toISOString() });
+        });
         if (effectiveAudit) await effectiveAudit.append({ type: 'secret.configured', actor: 'user', secretName: input.name, operation: overwrite ? 'overwrite' : 'create' });
         return json(response, 200, { name: input.name, configured: true });
       }
@@ -436,7 +556,19 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
       }
       if (request.method === 'DELETE' && secretPath) {
         if (!requireApprovalToken(request, approvalToken)) return json(response, 403, { error: 'APPROVAL_AUTH_REQUIRED', message: 'separate approval token required' });
-        const deleted = await effectiveSecretStore.delete(secretPath[1]);
+        const input = await bodyOf(request);
+        // Q24-2: deletes are hash-bound like writes. The version is
+        // the existence state observed inside the lock; a delete
+        // without a hash, or with a hash for the wrong operation,
+        // target, or version, is rejected. Audit carries only the
+        // secret name, never the value (values are never read here).
+        const deleted = await withSecretLock(async () => {
+          const version = secretVersionOf(await hasSecret(secretPath[1]));
+          if (input.actionHash !== secretActionHash({ operation: 'delete', name: secretPath[1], version })) throw new SecretResolverError('SECRET_ACTION_HASH_MISMATCH', 'secret change must bind the current action hash');
+          const result = await effectiveSecretStore.delete(secretPath[1]);
+          if (result) secretVersions.delete(secretPath[1]);
+          return result;
+        });
         if (effectiveAudit) await effectiveAudit.append({ type: 'secret.deleted', actor: 'user', secretName: secretPath[1] });
         return json(response, 200, { name: secretPath[1], deleted });
       }
@@ -477,10 +609,46 @@ export function createWorkbenchServer({ root, audit, token, approvalToken, host 
         if (modelProposals.size + modelReservations.size >= MAX_MODEL_PROPOSALS) throw new ModelRegistryError('MODEL_PROPOSAL_LIMIT', 'too many pending model proposals');
         const profile = normalizeModelProfile(input);
         const action = transition(transition(createAction({ type: 'model.register', sessionId: input.sessionId, workspaceRevision: profile.configHash, target: profile.id, preview: profile, risk: 'high' }), 'inspected'), 'awaiting_approval');
-        const proposal = Object.freeze({ action, profile }); modelReservations.add(action.id);
+        // Q24-5: record secret-creation attribution on the proposal
+        // while holding the secret lock, so the snapshot cannot race
+        // a concurrent secret write or cleanup. Attribution exists
+        // only when the secret both exists right now and has a
+        // version entry from a write through this server; otherwise
+        // the field is omitted and later cleanup retains (attribution
+        // unknown). The stored record shape is { proposalId,
+        // secretName, version, generation, createdAt } alongside the
+        // existing { action, profile } fields, so snapshots written
+        // before this change (no generation field) still restore and
+        // validate but fail the cleanup generation gate and retain.
+        // The field is internal: publicModelProposal does not expose
+        // it, and it contains no secret value. Note the snapshot
+        // still does not prove the proposal created the secret -- it
+        // only records which write through this server the proposal
+        // was registered against -- which is why the cleanup policy
+        // gate retains even on a full match (see above).
+        let proposal;
+        modelReservations.add(action.id);
         try {
-          if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: profile.id, operation: 'register' });
-          modelProposalStore.put(proposal);
+          // The whole snapshot + audit + persist sequence runs inside
+          // the secret lock: a concurrent cleanup check then cannot
+          // slip in between the attribution snapshot and the durable
+          // record of this proposal, which is what makes a concurrent
+          // new reference visible to cleanup (retained) rather than
+          // deleted out from under it.
+          proposal = await withSecretLock(async () => {
+            let secretAttribution;
+            if (typeof profile.secretRef === 'string' && profile.secretRef.startsWith('keychain:')) {
+              const secretName = profile.secretRef.slice('keychain:'.length);
+              const current = secretVersionEntry(secretName);
+              if (secretName && current && await hasSecret(secretName)) {
+                secretAttribution = Object.freeze({ proposalId: action.id, secretName, version: current.version, generation: current.generation, createdAt: current.createdAt });
+              }
+            }
+            const candidate = Object.freeze({ action, profile, ...(secretAttribution ? { secretAttribution } : {}) });
+            if (effectiveAudit) await effectiveAudit.append({ type: 'model.proposed', actor: 'user', actionId: action.id, sessionId: action.sessionId, actionHash: action.actionHash, profileId: profile.id, operation: 'register' });
+            modelProposalStore.put(candidate);
+            return candidate;
+          });
         } catch (error) { modelReservations.delete(action.id); throw error; }
         modelReservations.delete(action.id); modelProposals.set(action.id, proposal);
         return json(response, 201, { proposal: publicModelProposal(proposal) });
