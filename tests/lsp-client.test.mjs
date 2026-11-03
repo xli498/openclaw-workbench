@@ -47,3 +47,45 @@ test('LSP client never leaks env values into errors', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Q30-2/Q30-4 follow-ups: a custom allowlist used to admit write
+// methods unchecked, and the server inherited the whole parent env.
+test('LSP client rejects forbidden methods even when explicitly allowlisted', () => {
+  for (const method of ['workspace/executeCommand', 'workspace/applyEdit', 'textDocument/formatting', 'textDocument/rename']) {
+    assert.throws(() => createLspClient({ command: process.execPath, args: ['x'], root: '/tmp', allowedMethods: ['initialize', method] }), { code: 'LSP_METHOD_NOT_ALLOWED' });
+  }
+  // A custom allowlist can still add further read methods.
+  const client = createLspClient({ command: process.execPath, args: ['x'], root: '/tmp', allowedMethods: ['initialize', 'shutdown', 'textDocument/documentHighlight'] });
+  assert.ok(client.getAllowedMethods().includes('textDocument/documentHighlight'));
+  assert.equal(client.getAllowedMethods().includes('workspace/executeCommand'), false);
+});
+
+test('LSP client rejects shell and credential material in env values', () => {
+  assert.throws(() => createLspClient({ command: process.execPath, args: ['x'], root: '/tmp', env: { LSP_BAD: '$(touch /tmp/x)' } }), { code: 'LSP_ENV_INVALID' });
+  assert.throws(() => createLspClient({ command: process.execPath, args: ['x'], root: '/tmp', env: { LSP_BAD: 'a; rm -rf /' } }), { code: 'LSP_ENV_INVALID' });
+  assert.throws(() => createLspClient({ command: process.execPath, args: ['x'], root: '/tmp', env: { LSP_BAD: 'token=abc123' } }), { code: 'LSP_ENV_INVALID' });
+  assert.throws(() => createLspClient({ command: process.execPath, args: ['x'], root: '/tmp', env: { LSP_BAD: 'https://user:pass@example.com/x' } }), { code: 'LSP_ENV_INVALID' });
+  const ok = createLspClient({ command: process.execPath, args: ['x'], root: '/tmp', env: { LSP_OK: 'plain-value_123' } });
+  assert.equal(typeof ok.getRoot(), 'string');
+});
+
+test('LSP client spawns with an explicit env, never the whole parent env', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-explicit-env-'));
+  const recordPath = path.join(root, 'env.jsonl');
+  const fixture = new URL('./fixtures/mock-lsp-env-server.mjs', import.meta.url).pathname;
+  process.env.OCW_P2_S4_PARENT_MARKER = 'parent-marker-should-not-leak';
+  const client = createLspClient({ command: process.execPath, args: [fixture, recordPath], root, env: { LSP_TEST_VALUE: 'lsp-caller-value' } });
+  try {
+    const started = await client.start();
+    assert.equal(started.status, 'ready');
+    const snapshot = JSON.parse((await readFile(recordPath, 'utf8')).trim().split('\n').at(-1));
+    assert.equal(snapshot.parentMarkerPresent, false);
+    assert.equal(snapshot.callerValuePresent, true);
+    assert.equal(snapshot.pathPresent, true);
+    await client.shutdown();
+  } finally {
+    delete process.env.OCW_P2_S4_PARENT_MARKER;
+    await client.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});

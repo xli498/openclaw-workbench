@@ -189,3 +189,77 @@ test('MCP list hides config material, update/remove stay proposals, and hash dri
   assert.match(elements.get('#mcp-feedback').textContent, /已拒绝，不会执行/);
   assert.equal(elements.get('#mcp-proposal').hidden, true);
 });
+
+test('MCP panel approval captures its proposal: a proposal swapped or cleared during the wait is not clobbered', async () => {
+  const app = await readFile(path.join(frontendRoot, 'app.js'), 'utf8');
+  const elements = new Map();
+  class FakeElement {
+    constructor() { this.listeners = new Map(); this.dataset = {}; this.classList = { add() {}, toggle() {} }; this.value = ''; this.textContent = ''; this.innerHTML = ''; this.className = ''; this.disabled = false; this.hidden = false; }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    setAttribute() {}
+    focus() {}
+  }
+  const document = { querySelector(selector) { if (!elements.has(selector)) elements.set(selector, new FakeElement()); return elements.get(selector); } };
+  const requests = [];
+  let resolveApprove = null;
+  const window = {
+    localStorage: { getItem: () => '', setItem: () => {} },
+    __TAURI__: { core: { invoke: async (command, args) => {
+      if (command === 'runtime_status') return { state: 'stopped' };
+      const request = args.request;
+      requests.push(request);
+      if (request.method === 'GET' && request.path === '/v1/mcp/servers') return { status: 200, body: { servers: [] } };
+      if (request.method === 'GET' && request.path === '/v1/mcp/runtimes') return { status: 200, body: { runtimes: [] } };
+      if (request.method === 'GET' && request.path.endsWith('/tools')) return { status: 200, body: { tools: [] } };
+      if (request.method === 'POST' && request.path.endsWith('/approve')) {
+        // Delayed approval: the test resolves this only after swapping or
+        // clearing the pending proposal, so the handler's post-await
+        // behavior is exercised deterministically, not by timing luck.
+        return new Promise((resolve) => { resolveApprove = () => resolve({ status: 200, body: { action: { id: 'verified', status: 'verified' } } }); });
+      }
+      throw new Error(`unexpected runtime request: ${request.method} ${request.path}`);
+    } } },
+  };
+  const context = vm.createContext({ document, window, URL, console: { log() {}, error() {} } });
+  vm.runInContext(app, context);
+  const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  await flush();
+  vm.runInContext('runtimeReady = true;', context);
+  const approveClick = elements.get('#approve-mcp').listeners.get('click');
+  const showProposal = (id, hash, operation, name) => vm.runInContext(
+    `renderMcpProposal({ action: { id: '${id}', actionHash: '${hash}', status: 'awaiting_approval' }, server: { id: 'srv-a', name: '${name}' }, operation: '${operation}' })`,
+    context,
+  );
+
+  // Case 1: a newer proposal arrives while the old approval is in flight.
+  // The old approval must succeed with the OLD operation's feedback, and
+  // the newer proposal must survive untouched.
+  showProposal('old-action', 'old-hash', 'update', 'Alpha');
+  approveClick();
+  await flush();
+  assert.equal(requests.some((r) => r.method === 'POST' && r.path === '/v1/mcp/servers/old-action/approve'), true, 'old approval was not submitted');
+  assert.equal(elements.get('#approve-mcp').disabled, true, 'approval busy must disable approve during the wait');
+  assert.equal(elements.get('#deny-mcp').disabled, true, 'approval busy must disable deny during the wait');
+  assert.equal(elements.get('#refresh-mcp').disabled, true, 'approval busy must disable refresh during the wait');
+  showProposal('new-action', 'new-hash', 'remove', 'Beta');
+  resolveApprove();
+  await flush();
+  assert.match(elements.get('#mcp-feedback').textContent, /需重新启用/, 'feedback must describe the approved update, not the newer remove proposal');
+  assert.match(elements.get('#mcp-proposal-summary').textContent, /移除提案/, 'newer proposal must survive the old approval completing');
+  assert.match(elements.get('#mcp-proposal-summary').textContent, /Beta/);
+  assert.equal(elements.get('#mcp-proposal').hidden, false);
+  assert.equal(requests.some((r) => r.method === 'POST' && r.path.includes('new-action')), false, 'newer proposal must not be approved by the old click');
+
+  // Case 2: the pending proposal is cleared while its approval is in
+  // flight. The old handler re-read the cleared pending after the await
+  // and threw, surfacing a successful approval as "approval failed".
+  showProposal('old2-action', 'old2-hash', 'update', 'Alpha');
+  approveClick();
+  await flush();
+  vm.runInContext('renderMcpProposal(null);', context);
+  resolveApprove();
+  await flush();
+  assert.match(elements.get('#mcp-feedback').textContent, /MCP 变更已批准/, 'a cleared pending must not turn a successful approval into a failure report');
+  assert.doesNotMatch(elements.get('#mcp-feedback').textContent, /审批失败/);
+  assert.equal(elements.get('#mcp-proposal').hidden, true);
+});

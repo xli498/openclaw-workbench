@@ -4,11 +4,20 @@ import path from 'node:path';
 // Second LSP slice: document sync, diagnostics intake, an approval-gated
 // edit-proposal path, and a multi-server registry live in companion modules.
 // This client stays read-only on disk: it never writes a file itself.
-// The first slice's guarantees still hold: only allowlisted methods are
-// ever sent; server-initiated requests are never auto-executed; commands
-// and arguments are refused when they contain shell or credential material;
+// The first slice's guarantees still hold, with one correction: the
+// request path sends only methods that are BOTH caller-allowlisted AND
+// not on the non-overridable forbidden list below (Q30-2). A custom
+// allowedMethods value can add further read methods, but it can never
+// re-enable a forbidden write/execute method, so the old absolute claim
+// that "any allowlisted method may be sent" no longer stands -- the
+// allowlist is intersected with the forbidden list at construction.
+// Server-initiated requests are never auto-executed; commands and
+// arguments are refused when they contain shell or credential material;
 // environment values are never logged, never stored in snapshots, and
-// never included in error text.
+// never included in error text. The spawned server inherits only an
+// explicit base environment (PATH/HOME/LANG/LC_ALL/TMPDIR) plus the
+// caller-validated env entries, never the whole parent environment
+// (Q30-4).
 //
 // Edit proposals produced here are NOT applied by this client. A proposal
 // is data for the repository's existing Patch proposal + independent
@@ -26,7 +35,12 @@ const SECRET_FLAG_PATTERN = /(?:^|\s)(?:--?|\/)(?:token|password|secret|api[-_ ]
 const ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const URL_USERINFO_PATTERN = /:\/\/[^/\s:]+:[^@\s]+@/g;
 const BEARER_TOKEN_PATTERN = /bearer\s+[A-Za-z0-9._\-~+/=]+/gi;
-const CREDENTIAL_ASSIGN_PATTERN = /([A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[ _-]?key)[A-Za-z0-9_.\-]*\s*[:=]\s*)[^\s,;]+/gi;
+// Credential-assignment values must cover quoted values in full:
+// with a bare [^\s,;]+ value, secret="a b" redacted only `"a` and
+// left ` b"` behind. The quoted alternatives come first so a quoted
+// value (including spaces) is consumed whole; unquoted values keep
+// the old terminators.
+const CREDENTIAL_ASSIGN_PATTERN = /([A-Za-z0-9_.\-]*(?:password|passwd|secret|token|api[ _-]?key)[A-Za-z0-9_.\-]*\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/gi;
 
 export const LSP_READ_ONLY_METHODS = Object.freeze([
   'initialize',
@@ -38,6 +52,36 @@ export const LSP_READ_ONLY_METHODS = Object.freeze([
   'textDocument/completion',
   'workspace/symbol',
 ]);
+
+// Q30-2: non-overridable forbidden methods. A caller-supplied
+// allowedMethods array is intersected with this list at construction:
+// any entry here makes construction fail, so no caller can smuggle a
+// write or execute method past the read-only gate by passing a custom
+// allowlist. Entries are methods that mutate state, execute commands,
+// or carry edits/commands back from the server: the client never sends
+// them as requests, whatever the caller allowlists.
+export const LSP_FORBIDDEN_METHODS = Object.freeze([
+  'workspace/applyEdit',
+  'workspace/executeCommand',
+  'workspace/didChangeConfiguration',
+  'workspace/didChangeWatchedFiles',
+  'textDocument/didOpen',
+  'textDocument/didChange',
+  'textDocument/didClose',
+  'textDocument/didSave',
+  'textDocument/willSaveWaitUntil',
+  'textDocument/rename',
+  'textDocument/prepareRename',
+  'textDocument/formatting',
+  'textDocument/rangeFormatting',
+  'textDocument/onTypeFormatting',
+  'textDocument/codeAction',
+]);
+
+// Q30-4: the only parent-environment keys a spawned server inherits.
+// Everything else the server sees must come from the caller-validated
+// env argument, never from a blanket process.env spread.
+const LSP_BASE_ENV_KEYS = Object.freeze(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']);
 
 export class LspClientError extends Error {
   constructor(code, message, details = {}) {
@@ -73,7 +117,12 @@ function safeEnv(value) {
   if (entries.length > 128) fail('LSP_ENV_INVALID', 'LSP env has too many entries');
   const env = {};
   for (const [key, val] of entries) {
-    if (!ENV_PATTERN.test(key) || typeof val !== 'string' || val.length > 4096 || /[\0\r\n]/.test(val)) fail('LSP_ENV_INVALID', 'LSP env entry is invalid');
+    // Q30-4: env values get the same shell/credential-material checks as
+    // commands and args. A value smuggling `$(...)`, a shell separator,
+    // or a credential assignment (token=/password=, a URL userinfo) is
+    // refused before spawn instead of being handed to the server.
+    if (!ENV_PATTERN.test(key) || typeof val !== 'string' || val.length > 4096 || /[\0\r\n]/.test(val)
+      || SHELL_PATTERN.test(val) || SECRET_PATTERN.test(val) || SECRET_FLAG_PATTERN.test(val)) fail('LSP_ENV_INVALID', 'LSP env entry is invalid');
     env[key] = val;
   }
   return env;
@@ -249,7 +298,10 @@ function redactDiagnosticMessage(message) {
 
 // Keep only the allowlisted diagnostic fields; drop everything else the
 // server sent. Returns a frozen record, or null when the entry has no
-// usable string message.
+// usable string message. code/source are bounded and redacted like
+// messages: previously they were stored verbatim at any length, so a
+// server could smuggle credential or path material through them past
+// the message filter.
 function sanitizeDiagnostic(diagnostic, maxMessageChars) {
   if (!diagnostic || typeof diagnostic !== 'object' || Array.isArray(diagnostic) || typeof diagnostic.message !== 'string') return null;
   const record = { message: redactDiagnosticMessage(diagnostic.message).slice(0, maxMessageChars) };
@@ -259,8 +311,9 @@ function sanitizeDiagnostic(diagnostic, maxMessageChars) {
     record.range = copyRange(diagnostic.range);
   }
   if (Number.isSafeInteger(diagnostic.severity)) record.severity = diagnostic.severity;
-  if (typeof diagnostic.code === 'string' || Number.isSafeInteger(diagnostic.code)) record.code = diagnostic.code;
-  if (typeof diagnostic.source === 'string') record.source = diagnostic.source;
+  if (Number.isSafeInteger(diagnostic.code)) record.code = diagnostic.code;
+  else if (typeof diagnostic.code === 'string') record.code = redactDiagnosticMessage(diagnostic.code).slice(0, 128);
+  if (typeof diagnostic.source === 'string') record.source = redactDiagnosticMessage(diagnostic.source).slice(0, 128);
   return Object.freeze(record);
 }
 
@@ -324,7 +377,16 @@ export function collectWorkspaceEditProposal(input, { root } = {}) {
     const normalized = edits.map(validateTextEdit);
     const existing = byUri.get(uri);
     if (existing) {
-      if (existing.version === null) existing.version = version;
+      // A version is a constraint on the document state the edits were
+      // written against. Keeping only the first non-null version
+      // silently dropped later constraints, so edits written against
+      // a different version would merge as if they agreed. Equal
+      // versions merge; a null side adopts the other's version; two
+      // different non-null versions conflict and are rejected.
+      if (version !== null) {
+        if (existing.version === null) existing.version = version;
+        else if (existing.version !== version) fail('LSP_EDIT_INVALID', 'LSP workspace edit document versions conflict for the same URI');
+      }
       existing.edits.push(...normalized);
     } else {
       byUri.set(uri, { uri, version, edits: [...normalized] });
@@ -424,6 +486,12 @@ export function createLspClient({
   const rootPath = path.resolve(root);
   const serverEnv = safeEnv(env);
   if (!Array.isArray(allowedMethods) || allowedMethods.length === 0 || allowedMethods.some((m) => typeof m !== 'string')) fail('LSP_METHODS_INVALID', 'LSP allowed methods are invalid');
+  // Q30-2: the forbidden list is non-overridable -- a custom allowlist
+  // containing a forbidden method fails construction outright, rather
+  // than silently dropping the entry and sending the rest.
+  for (const method of allowedMethods) {
+    if (LSP_FORBIDDEN_METHODS.includes(method)) fail('LSP_METHOD_NOT_ALLOWED', 'LSP method is forbidden even when allowlisted');
+  }
   const allowed = new Set(allowedMethods);
   for (const [name, value] of [['requestTimeoutMs', requestTimeoutMs], ['maxFrameBytes', maxFrameBytes], ['maxDocumentBytes', maxDocumentBytes], ['maxDiagnosticsPerUri', maxDiagnosticsPerUri], ['maxDiagnosticMessageChars', maxDiagnosticMessageChars]]) {
     if (!Number.isSafeInteger(value) || value < 1) fail('LSP_CONFIG_INVALID', `${name} must be a positive safe integer`);
@@ -468,16 +536,22 @@ export function createLspClient({
     try { send(error ? { jsonrpc: '2.0', id, error } : { jsonrpc: '2.0', id, result: result ?? null }); } catch {}
   }
 
+  // Returns the frozen sanitized records, or null when the frame is
+  // malformed or out of root. A null return means "discarded": the
+  // caller must not forward the raw frame anywhere, or the screening
+  // above would be bypassed for onNotification consumers.
   function handlePublishDiagnostics(params) {
-    if (!params || typeof params !== 'object' || Array.isArray(params) || typeof params.uri !== 'string' || !Array.isArray(params.diagnostics)) return;
-    try { resolveLspUri(params.uri, rootPath); } catch { return; } // Out-of-root diagnostics are discarded, never stored.
+    if (!params || typeof params !== 'object' || Array.isArray(params) || typeof params.uri !== 'string' || !Array.isArray(params.diagnostics)) return null;
+    try { resolveLspUri(params.uri, rootPath); } catch { return null; } // Out-of-root diagnostics are discarded, never stored.
     const stored = [];
     for (const diagnostic of params.diagnostics) {
       if (stored.length >= maxDiagnosticsPerUri) break;
       const clean = sanitizeDiagnostic(diagnostic, maxDiagnosticMessageChars);
       if (clean) stored.push(clean);
     }
-    diagnostics.set(params.uri, Object.freeze(stored));
+    const frozen = Object.freeze(stored);
+    diagnostics.set(params.uri, frozen);
+    return frozen;
   }
 
   function handleFrame(frame) {
@@ -508,8 +582,18 @@ export function createLspClient({
             sendResponse(frame.id, null, { code: -32602, message: 'Invalid params' });
             return;
           }
+          // The handler only queues proposal data; this client never
+          // writes a file, and this package contains no wiring that
+          // turns a proposal into a Patch proposal, runs independent
+          // approval, and lands it on disk. Approval-before-landing is
+          // therefore a caller contract, not a connected chain in this
+          // package, and must not be claimed as one. Whatever the
+          // handler returns, the receipt to the server is
+          // applied:false: forwarding a handler's applied:true would
+          // tell the server the edit landed while the target file is
+          // still untouched.
           Promise.resolve().then(() => editProposalHandler(proposal))
-            .then((result) => sendResponse(frame.id, result === undefined ? { applied: false } : result))
+            .then(() => sendResponse(frame.id, { applied: false }))
             .catch(() => sendResponse(frame.id, null, { code: -32603, message: 'Internal error' }));
         } else {
           sendResponse(frame.id, null, { code: -32601, message: 'Method not found' });
@@ -524,7 +608,15 @@ export function createLspClient({
       return;
     }
     if (typeof frame.method === 'string') {
-      if (frame.method === 'textDocument/publishDiagnostics') handlePublishDiagnostics(frame.params);
+      if (frame.method === 'textDocument/publishDiagnostics') {
+        // onNotification receives the SANITIZED copy, never the raw
+        // frame: forwarding the raw frame would hand unscreened
+        // diagnostics (credential material, unbounded code/source,
+        // non-allowlisted fields) straight to the callback.
+        const sanitized = handlePublishDiagnostics(frame.params);
+        if (sanitized !== null) onNotification?.({ ...frame, params: { uri: frame.params.uri, diagnostics: sanitized } });
+        return;
+      }
       onNotification?.(frame);
     }
   }
@@ -567,7 +659,13 @@ export function createLspClient({
 
   async function start() {
     if (state === 'ready') return Object.freeze({ status: 'ready' });
-    child = spawn(serverCommand, serverArgs, { cwd: rootPath, shell: false, env: { ...process.env, ...serverEnv }, stdio: ['pipe', 'pipe', 'ignore'] });
+    // Q30-4: no blanket parent-environment inheritance. The child gets
+    // only the explicit base keys from the parent plus caller-validated
+    // entries, so a stray parent secret (or a poisoned parent variable)
+    // can never reach the server implicitly.
+    const baseEnv = {};
+    for (const key of LSP_BASE_ENV_KEYS) if (process.env[key] !== undefined) baseEnv[key] = process.env[key];
+    child = spawn(serverCommand, serverArgs, { cwd: rootPath, shell: false, env: { ...baseEnv, ...serverEnv }, stdio: ['pipe', 'pipe', 'ignore'] });
     child.stdout.on('data', onData);
     child.once('exit', onExit);
     child.once('error', onExit);

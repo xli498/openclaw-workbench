@@ -21,6 +21,6 @@ test('产品契约明确区分核心闭环、受限 Bridge 和未实现的外部
     'Streamable HTTP MCP Bridge',
     '真实公网部署未验证',
     'LSP 编辑提案仍须走 Patch 审批',
-    'Windows ConPTY 已由 Windows CI 执行测试验证',
+    'Windows ConPTY 已由 Windows job 中被选中执行的测试验证',
   ]) assert.match(text, new RegExp(phrase));
 });
