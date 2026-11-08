@@ -71,6 +71,21 @@ const SOURCE = [
   '',
 ].join('\n');
 
+// Test 3 uses its own fixture: the type error sits on a string literal
+// that itself contains an emoji, so the diagnostic range tracks the
+// incremental edit. After the full-text prepend the diagnostic is at
+// line 5 with range 11..17; only the emoji replacement moves its end
+// to 16. Waiting on the new end column (not just the line) is what
+// makes this a server-side proof instead of a stale-diagnostics pass.
+const SOURCE_MULTIBYTE = [
+  'def greet(name: str) -> str:',
+  '    return "hello " + name',
+  '',
+  'result = greet("world")',
+  'bad: int = "a\u{1F600}b"',
+  '',
+].join('\n');
+
 // Polls until `match(diagnostics)` holds. A plain non-empty check
 // would accept STALE diagnostics after a didChange (the previous
 // analysis is still stored until the server re-analyzes), so callers
@@ -161,26 +176,30 @@ test('LSP real server (pyright): didOpen/didChange/didClose lifecycle with multi
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-real-sync-'));
   const file = path.join(root, 'demo.py');
   const uri = `file://${file}`;
-  await writeFile(file, SOURCE, 'utf8');
+  await writeFile(file, SOURCE_MULTIBYTE, 'utf8');
   const { client } = await startClient(root);
   try {
-    client.didOpen(uri, 'python', SOURCE);
+    client.didOpen(uri, 'python', SOURCE_MULTIBYTE);
     assert.equal(client.getOpenDocument(uri).version, 0);
-    await waitForDiagnostics(client, uri, (d) => d.length === 1 && d[0].range.start.line === 4);
-    // Multibyte line: emoji is 2 UTF-16 units, CJK is 1 each. Replace
-    // exactly the emoji (UTF-16 columns 10..12) with X and prove the
-    // server still sees a coherent document: its diagnostics survive
-    // at the same line, and the local text matches the edit.
-    const multi = 'emoji = "a\u{1F600}b"  # \u4e2d\u6587\n' + SOURCE;
+    const first = await waitForDiagnostics(client, uri, (d) => d.length === 1 && d[0].range.start.line === 4);
+    assert.equal(first[0].code, 'reportAssignmentType');
+    assert.deepEqual(first[0].range, { start: { line: 4, character: 11 }, end: { line: 4, character: 17 } });
+    // Multibyte line: emoji is 2 UTF-16 units, CJK is 1 each. Prepend
+    // it so the diagnosed line shifts down one line.
+    const multi = 'emoji = "a\u{1F600}b"  # \u4e2d\u6587\n' + SOURCE_MULTIBYTE;
     client.didChange(uri, multi);
     assert.equal(client.getOpenDocument(uri).version, 1);
     assert.equal(client.getOpenDocument(uri).text.split('\n')[0], 'emoji = "a\u{1F600}b"  # \u4e2d\u6587');
-    client.didChange(uri, [{ range: { start: { line: 0, character: 10 }, end: { line: 0, character: 12 } }, text: 'X' }]);
+    // Incremental edit: replace exactly the emoji inside the diagnosed
+    // literal (UTF-16 columns 13..15 on the shifted line 5) with X.
+    // The diagnostic range tracks the literal, so it moves from
+    // 11..17 to 11..16 only once the server has processed this edit.
+    client.didChange(uri, [{ range: { start: { line: 5, character: 13 }, end: { line: 5, character: 15 } }, text: 'X' }]);
     assert.equal(client.getOpenDocument(uri).version, 2);
-    assert.equal(client.getOpenDocument(uri).text.split('\n')[0], 'emoji = "aXb"  # \u4e2d\u6587');
-    const after = await waitForDiagnostics(client, uri, (d) => d.length === 1 && d[0].range.start.line === 5);
+    assert.equal(client.getOpenDocument(uri).text.split('\n')[5], 'bad: int = "aXb"');
+    const after = await waitForDiagnostics(client, uri, (d) => d.length === 1 && d[0].range.start.line === 5 && d[0].range.end.character === 16);
     assert.equal(after[0].code, 'reportAssignmentType');
-    assert.equal(after[0].range.start.line, 5);
+    assert.deepEqual(after[0].range, { start: { line: 5, character: 11 }, end: { line: 5, character: 16 } });
     client.didClose(uri);
     assert.equal(client.getOpenDocument(uri), null);
     assert.deepEqual(client.listOpenDocuments(), []);
