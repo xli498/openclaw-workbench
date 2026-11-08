@@ -63,6 +63,11 @@ pub struct RuntimeProcess {
 }
 
 impl RuntimeProcess {
+    #[cfg(test)]
+    pub(crate) fn from_test_child(child: Child, ready: RuntimeReady) -> Self {
+        Self { child, ready }
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -111,7 +116,12 @@ impl RuntimeProcess {
 
 impl Drop for RuntimeProcess {
     fn drop(&mut self) {
-        let _ = self.force_stop();
+        if let Err(error) = self.force_stop() {
+            eprintln!(
+                "openclaw-workbench: failed to stop runtime process {} during drop: {error:?}",
+                self.child.id()
+            );
+        }
     }
 }
 
@@ -129,11 +139,10 @@ impl RuntimeLaunchSpec {
         if self.args.iter().any(|arg| arg.is_empty()) {
             return Err(RuntimeLauncherError::EmptyArgument);
         }
-        if self
-            .args
-            .iter()
-            .any(|arg| arg == &self.token || arg == &self.approval_token)
-        {
+        if self.args.iter().any(|arg| {
+            (!self.token.is_empty() && arg.contains(&self.token))
+                || (!self.approval_token.is_empty() && arg.contains(&self.approval_token))
+        }) {
             return Err(RuntimeLauncherError::TokenInArguments);
         }
         if self.token_env.is_empty()
@@ -587,25 +596,24 @@ fn validate_request(
 }
 
 fn approval_header_allowed(method: &str, pathname: &str) -> bool {
-    if method != "POST" {
-        return false;
-    }
     let segments: Vec<_> = pathname.trim_matches('/').split('/').collect();
-    match segments.as_slice() {
-        ["v1", "models", id, operation] => {
+    match (method, segments.as_slice()) {
+        ("POST", ["v1", "models", id, operation]) => {
             !id.is_empty() && matches!(*operation, "health" | "approve")
         }
-        ["v1", "mcp", "servers", id, operation] => {
+        ("POST", ["v1", "mcp", "servers", id, operation]) => {
             !id.is_empty() && matches!(*operation, "approve" | "deny" | "cancel")
         }
-        ["v1", "config", id, "approve"] => !id.is_empty(),
-        ["v1", "terminal", "sessions"] => true,
-        ["v1", "terminal", "sessions", id, operation] => {
+        ("POST", ["v1", "config", id, "approve"]) => !id.is_empty(),
+        ("POST", ["v1", "terminal", "sessions"]) => true,
+        ("POST", ["v1", "terminal", "sessions", id, operation]) => {
             is_uuid_path_segment(id) && matches!(*operation, "input" | "cancel")
         }
-        ["v1", "proposals", id, operation] => {
+        ("POST", ["v1", "proposals", id, operation]) => {
             !id.is_empty() && matches!(*operation, "approve" | "deny" | "cancel")
         }
+        ("POST", ["v1", "recovery", "proposals", id, "approve"]) => !id.is_empty(),
+        ("DELETE", ["v1", "secrets", id]) => !id.is_empty(),
         _ => false,
     }
 }
@@ -765,6 +773,44 @@ mod request_tests {
     }
 
     #[test]
+    fn approval_header_allows_recovery_approve_and_secret_delete_only() {
+        for (method, path) in [
+            ("POST", "/v1/recovery/proposals/action-123/approve"),
+            ("DELETE", "/v1/secrets/workbench.model.primary"),
+        ] {
+            assert!(
+                approval_header_allowed(method, path),
+                "not allowed: {method} {path}"
+            );
+            assert_eq!(
+                validate_request(method, path, None, true, false),
+                Ok(()),
+                "validate_request rejected: {method} {path}"
+            );
+        }
+        for (method, path) in [
+            ("GET", "/v1/recovery/proposals/action-123/approve"),
+            ("POST", "/v1/recovery/proposals/action-123/deny"),
+            ("POST", "/v1/recovery/proposals/action-123/cancel"),
+            ("POST", "/v1/recovery/proposals/action-123"),
+            ("GET", "/v1/secrets/workbench.model.primary"),
+            ("DELETE", "/v1/secrets"),
+            ("DELETE", "/v1/secrets/a/b"),
+            ("DELETE", "/v1/models/primary"),
+            ("DELETE", "/v1/recovery/proposals/action-123/approve"),
+        ] {
+            assert!(
+                !approval_header_allowed(method, path),
+                "unexpectedly allowed: {method} {path}"
+            );
+        }
+        assert_eq!(
+            validate_request("DELETE", "/v1/status", None, true, false),
+            Err(RuntimeLauncherError::ApprovalHeaderNotAllowed)
+        );
+    }
+
+    #[test]
     fn decodes_chunked_json_response() {
         let wire =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n{\"ok\":1}\r\n0\r\n\r\n";
@@ -870,6 +916,52 @@ mod tests {
         value.args.push(value.token.clone());
         assert_eq!(
             value.validate(),
+            Err(RuntimeLauncherError::TokenInArguments)
+        );
+    }
+
+    #[test]
+    fn rejects_tokens_embedded_in_argument_values() {
+        let mut value = spec();
+        value.args.push(format!("--value={}", value.token));
+        assert_eq!(
+            value.validate(),
+            Err(RuntimeLauncherError::TokenInArguments)
+        );
+        let mut approval = spec();
+        approval
+            .args
+            .push(format!("--approval-token={}", approval.approval_token));
+        assert_eq!(
+            approval.validate(),
+            Err(RuntimeLauncherError::TokenInArguments)
+        );
+    }
+
+    // Unix-path twin of the test above: spec() uses Windows paths, so on
+    // Linux validate() stops at the absolute-path check before ever
+    // reaching the token check. This variant actually exercises the
+    // substring check on Linux.
+    #[test]
+    #[cfg(unix)]
+    fn rejects_tokens_embedded_in_argument_values_unix_paths() {
+        let mut base = spec();
+        base.node_executable = PathBuf::from("/usr/bin/node");
+        base.runtime_script = PathBuf::from("/workbench/bin/workbench.mjs");
+        base.working_directory = PathBuf::from("/workbench");
+        assert_eq!(base.validate(), Ok(()));
+        let mut value = base.clone();
+        value.args.push(format!("--value={}", value.token));
+        assert_eq!(
+            value.validate(),
+            Err(RuntimeLauncherError::TokenInArguments)
+        );
+        let mut approval = base.clone();
+        approval
+            .args
+            .push(format!("--approval-token={}", approval.approval_token));
+        assert_eq!(
+            approval.validate(),
             Err(RuntimeLauncherError::TokenInArguments)
         );
     }
