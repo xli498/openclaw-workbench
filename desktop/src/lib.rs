@@ -174,15 +174,16 @@ fn runtime_script_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn stop_manager(manager: &mut RuntimeManager) -> Result<(), String> {
+    let mut process = manager.process.take();
     let stop_result = match (
-        manager.process.take(),
+        process.as_mut(),
         manager.token.as_deref(),
         manager.approval_token.as_deref(),
     ) {
-        (Some(mut process), Some(token), Some(approval_token)) => {
+        (Some(process), Some(token), Some(approval_token)) => {
             process.stop(token, approval_token).map_err(error_text)
         }
-        (Some(mut process), _, _) => {
+        (Some(process), _, _) => {
             let result = process.force_stop().map_err(error_text);
             if result.is_ok() {
                 Err("runtime credentials were unavailable during shutdown".into())
@@ -192,16 +193,22 @@ fn stop_manager(manager: &mut RuntimeManager) -> Result<(), String> {
         }
         (None, _, _) => Ok(()),
     };
-    manager.ready = None;
-    manager.token = None;
-    manager.approval_token = None;
     match stop_result {
         Ok(()) => {
+            manager.process = None;
+            manager.ready = None;
+            manager.token = None;
+            manager.approval_token = None;
             manager.status = "stopped".into();
             manager.error = None;
             Ok(())
         }
         Err(error) => {
+            // Keep the process handle and its credentials so a failed stop
+            // stays retryable instead of silently dropping the only handle.
+            // (A force-stopped process reports as exited, so retrying it
+            // then succeeds and clears state normally.)
+            manager.process = process;
             manager.status = "failed".into();
             manager.error = Some(error.clone());
             Err(error)
@@ -234,7 +241,9 @@ pub fn run() {
         ) {
             if let Some(state) = app_handle.try_state::<RuntimeState>() {
                 if let Ok(mut manager) = state.0.lock() {
-                    let _ = stop_manager(&mut manager);
+                    if let Err(error) = stop_manager(&mut manager) {
+                        eprintln!("openclaw-workbench: failed to stop runtime on exit: {error}");
+                    }
                 }
             }
         }
@@ -243,8 +252,45 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn desktop_library_test_harness_is_available() {
         assert!(true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_stop_keeps_retryable_handle() {
+        // Credentials-missing path: force_stop succeeds, but stop_manager
+        // still reports an error, so the handle must survive for retry.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep for stop test");
+        let process = RuntimeProcess::from_test_child(
+            child,
+            RuntimeReady {
+                host: "127.0.0.1".into(),
+                port: 1,
+            },
+        );
+        let mut manager = RuntimeManager {
+            process: Some(process),
+            ready: None,
+            workspace: None,
+            token: None,
+            approval_token: None,
+            status: "ready".into(),
+            error: None,
+        };
+        let result = stop_manager(&mut manager);
+        assert!(result.is_err());
+        assert_eq!(manager.status, "failed");
+        assert!(manager.error.is_some());
+        assert!(
+            manager.process.is_some(),
+            "failed stop must keep the process handle for retry"
+        );
     }
 }

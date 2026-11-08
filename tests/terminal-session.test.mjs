@@ -314,3 +314,277 @@ test('恢复持久化终端会话时再次脱敏绝对路径输出', async () =>
     await manager.close();
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('终端会话审批门禁只接受严格 true，非布尔真值不得启动 provider 或 runner', async () => {
+  const root = await fixture('ocw-terminal-session-approval-strict-');
+  let providerStarts = 0;
+  const providerManager = createTerminalSessionManager({ root, sessionProvider: () => { providerStarts += 1; return { cancel() {} }; } });
+  try {
+    for (const approved of [1, 'yes', {}]) {
+      await assert.rejects(() => providerManager.create({ argv: ['pwd'], approved }), (error) => error.code === 'APPROVAL_REQUIRED');
+    }
+    assert.equal(providerStarts, 0);
+  } finally {
+    await providerManager.close();
+  }
+  const runnerRoot = await fixture('ocw-terminal-session-approval-strict-runner-');
+  let runnerCalls = 0;
+  const runnerManager = createTerminalSessionManager({ root: runnerRoot, runCommand: async () => { runnerCalls += 1; return { code: 0, stdout: 'ok\n', stderr: '', cwd: runnerRoot }; } });
+  try {
+    await assert.rejects(() => runnerManager.create({ argv: ['pwd'], approved: 1 }), (error) => error.code === 'APPROVAL_REQUIRED');
+    assert.equal(runnerCalls, 0);
+  } finally {
+    await runnerManager.close();
+    await rm(root, { recursive: true, force: true });
+    await rm(runnerRoot, { recursive: true, force: true });
+  }
+});
+
+test('已是 manual_review 的快照恢复时统一清零能力位并保留原复核原因', async () => {
+  const root = await fixture('ocw-terminal-session-manual-review-caps-');
+  const id = '00000000-0000-4000-8000-000000000030';
+  const directory = path.join(root, '.openclaw-workbench', 'terminal-sessions');
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, `${id}.json`), JSON.stringify({ version: 1, id, status: 'manual_review', argv: ['pwd'], cwd: '.', capabilities: { pty: true, input: true, incrementalOutput: true }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), outputBytes: 0, chunks: [], error: { code: 'SESSION_STORE_FAILURE' } }), 'utf8');
+    const manager = createTerminalSessionManager({ root });
+    await manager.restore();
+    const restored = await manager.get(id);
+    assert.equal(restored.status, 'manual_review');
+    assert.deepEqual(restored.capabilities, { pty: false, input: false, incrementalOutput: false });
+    assert.equal(restored.error.code, 'SESSION_STORE_FAILURE');
+    const onDisk = JSON.parse(await readFile(path.join(directory, `${id}.json`), 'utf8'));
+    assert.deepEqual(onDisk.capabilities, { pty: false, input: false, incrementalOutput: false });
+    await manager.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('永不返回的 PTY provider 不会挂住创建，会话在超时内收敛且能力位为 false', async () => {
+  const root = await fixture('ocw-terminal-session-provider-hang-');
+  const manager = createTerminalSessionManager({ root, sessionProvider: () => new Promise(() => {}) });
+  try {
+    const startedAt = Date.now();
+    const session = await manager.create({ argv: ['pwd'], timeoutMs: 30, approved: true });
+    assert.ok(Date.now() - startedAt < 5000);
+    assert.equal(session.status, 'timed_out');
+    assert.equal(session.error.code, 'TIMEOUT');
+    assert.deepEqual(session.capabilities, { pty: false, input: false, incrementalOutput: false });
+  } finally {
+    await manager.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('迟到返回的 PTY 句柄会被取消且不更新已终态会话的能力位', async () => {
+  const root = await fixture('ocw-terminal-session-provider-late-');
+  let lateCancelled = 0;
+  const manager = createTerminalSessionManager({
+    root,
+    sessionProvider: () => new Promise((resolve) => setTimeout(() => resolve({ cancel() { lateCancelled += 1; }, capabilities: { pty: true, input: true, incrementalOutput: true } }), 80)),
+  });
+  try {
+    const session = await manager.create({ argv: ['pwd'], timeoutMs: 20, approved: true });
+    assert.equal(session.status, 'timed_out');
+    await wait(200);
+    assert.deepEqual((await manager.get(session.id)).capabilities, { pty: false, input: false, incrementalOutput: false });
+    assert.equal(lateCancelled, 1);
+  } finally {
+    await manager.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+// Regression for the s1 review finding (Q23-4): the public view redacted
+// argv through the path-aware helper, but the persisted snapshot and the
+// restore path used the secret-only helper, so absolute paths survived on
+// disk even though get() looked clean. All paths below are synthetic fakes
+// that never appear on this machine; the old fixed-prefix pattern covered
+// none of the POSIX forms here, and only the drive/UNC forms.
+test('持久化快照与公开视图对未覆盖前缀的绝对路径 argv 脱敏一致，且执行参数保持原文', async () => {
+  const root = await fixture('ocw-terminal-session-persist-redaction-');
+  const seen = [];
+  const manager = createTerminalSessionManager({
+    root,
+    sessionProvider: ({ argv, onOutput }) => {
+      seen.push([...argv]);
+      onOutput({ stream: 'stdout', text: 'see http://example.com/x and a/b' });
+      return { cancel() {} };
+    },
+  });
+  const fakes = [
+    '/workspace/fake-proj/secret.txt',
+    '/opt/fake-vendor/tool.bin',
+    '/srv/fake-data/file.txt',
+    '/etc/fake-conf.conf',
+    '/usr/local/fake/bin',
+    'C:\\fake\\secret.txt',
+    '\\\\fake-server\\fake-share\\file.txt',
+  ];
+  try {
+    const session = await manager.create({ argv: ['pwd', ...fakes, '--opt=/workspace/fake-proj/other.txt'], approved: true });
+    await wait();
+    // The live command still receives the real arguments; only outward
+    // copies are redacted.
+    assert.deepEqual(seen[0], ['pwd', ...fakes, '--opt=/workspace/fake-proj/other.txt']);
+    const shown = await manager.get(session.id);
+    assert.deepEqual(shown.argv, ['pwd', ...fakes.map(() => '[path redacted]'), '--opt=[path redacted]']);
+    assert.deepEqual(manager.list()[0].argv, shown.argv);
+    // URLs and relative segments are not absolute paths and must survive.
+    assert.equal((await manager.read(session.id)).chunks[0].text, 'see http://example.com/x and a/b');
+    const file = path.join(root, '.openclaw-workbench', 'terminal-sessions', `${session.id}.json`);
+    for (const raw of [await readFile(file, 'utf8')]) {
+      // Disk assertions must compare parsed values, not raw bytes: a Windows
+      // path leaks into JSON with doubled backslashes, so raw.includes(fake)
+      // is false even when the leak is present. Check both the parsed values
+      // and the JSON-escaped spelling of every fake.
+      const parsed = JSON.parse(raw);
+      const diskValues = [...parsed.argv, ...parsed.chunks.map((chunk) => chunk.text)];
+      for (const fake of [...fakes, '/workspace/fake-proj/other.txt']) {
+        assert.equal(diskValues.some((value) => String(value).includes(fake)), false);
+        assert.equal(raw.includes(JSON.stringify(fake).slice(1, -1)), false);
+      }
+      assert.equal(raw.includes('[path redacted]'), true);
+    }
+    await manager.close();
+    const afterClose = await readFile(file, 'utf8');
+    const parsedAfterClose = JSON.parse(afterClose);
+    const diskValuesAfterClose = [...parsedAfterClose.argv, ...parsedAfterClose.chunks.map((chunk) => chunk.text)];
+    for (const fake of fakes) {
+      assert.equal(diskValuesAfterClose.some((value) => String(value).includes(fake)), false);
+      assert.equal(afterClose.includes(JSON.stringify(fake).slice(1, -1)), false);
+    }
+    assert.equal(afterClose.includes('[path redacted]'), true);
+  } finally { await manager.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('恢复旧快照时磁盘 argv 与公开视图同步脱敏，二次恢复仍干净', async () => {
+  const root = await fixture('ocw-terminal-session-restore-disk-redaction-');
+  const id = '00000000-0000-4000-8000-000000000021';
+  const directory = path.join(root, '.openclaw-workbench', 'terminal-sessions');
+  const fakes = ['/workspace/fake-tool', '/opt/fake-data/file.txt', 'C:\\fake\\secret.txt', '/srv/fake-data/out.txt'];
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, `${id}.json`), JSON.stringify({ version: 1, id, status: 'exited', argv: fakes.slice(0, 3), cwd: '.', capabilities: { pty: false, input: false, incrementalOutput: false }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), outputBytes: 32, chunks: [{ sequence: 1, stream: 'stdout', text: `wrote ${fakes[3]}` }] }), 'utf8');
+    const manager = createTerminalSessionManager({ root });
+    await manager.restore();
+    assert.deepEqual((await manager.get(id)).argv, ['[path redacted]', '[path redacted]', '[path redacted]']);
+    assert.equal((await manager.read(id)).chunks[0].text.includes(fakes[3]), false);
+    // close() re-persists every record, so the on-disk snapshot itself must
+    // now be clean — checking get() alone would not prove this.
+    await manager.close();
+    const raw = await readFile(path.join(directory, `${id}.json`), 'utf8');
+    const parsed = JSON.parse(raw);
+    const diskValues = [...parsed.argv, ...parsed.chunks.map((chunk) => chunk.text)];
+    for (const fake of fakes) {
+      assert.equal(diskValues.some((value) => String(value).includes(fake)), false);
+      assert.equal(raw.includes(JSON.stringify(fake).slice(1, -1)), false);
+    }
+    assert.equal(raw.includes('[path redacted]'), true);
+    const second = createTerminalSessionManager({ root });
+    await second.restore();
+    assert.deepEqual((await second.get(id)).argv, ['[path redacted]', '[path redacted]', '[path redacted]']);
+    await second.close();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('含空格的工作区根路径在持久化与公开视图中整体脱敏', async () => {
+  const spaced = path.join(tmpdir(), `ocw fake root-${Math.random().toString(36).slice(2, 8)}`);
+  await mkdir(spaced, { recursive: true });
+  const manager = createTerminalSessionManager({ root: spaced, sessionProvider: () => ({ cancel() {} }) });
+  try {
+    const session = await manager.create({ argv: ['pwd', `${spaced}/sub/secret.txt`], approved: true });
+    // Exact equality: a prefix-only redaction would stop at the space and
+    // leak the remainder of the root path.
+    assert.equal((await manager.get(session.id)).argv[1], '[path redacted]');
+    await manager.close();
+    const raw = await readFile(path.join(spaced, '.openclaw-workbench', 'terminal-sessions', `${session.id}.json`), 'utf8');
+    assert.equal(raw.includes(spaced), false);
+    assert.equal(raw.includes('fake root'), false);
+    assert.equal(raw.includes('[path redacted]'), true);
+  } finally { await manager.close(); await rm(spaced, { recursive: true, force: true }); }
+});
+
+// Redline Q1: delimiters that used to pass paths through (`>`, `<`, `|`, `&`),
+// forward-slash UNC, and a space-containing path whose continuation segment
+// carries a separator must all redact as one placeholder; a closing `)` must
+// survive instead of being swallowed. URLs and relative segments still pass.
+test('定界符与 UNC 路径在输出中整体脱敏，网址与相对路径不受影响', async () => {
+  const root = await fixture('ocw-terminal-session-delim-redaction-');
+  const manager = createTerminalSessionManager({
+    root,
+    sessionProvider: ({ onOutput }) => {
+      onOutput({ stream: 'stdout', text: 'a >/tmp/private.txt b </tmp/private2.txt c |/tmp/private3.txt d &/tmp/private4.txt e //server/share/file.txt f /opt/private dir/file g (see /tmp/private5.txt) h see http://example.com/x and a/b' });
+      return { cancel() {} };
+    },
+  });
+  try {
+    const session = await manager.create({ argv: ['pwd'], approved: true });
+    await wait();
+    assert.equal((await manager.read(session.id)).chunks[0].text, 'a >[path redacted] b <[path redacted] c |[path redacted] d &[path redacted] e [path redacted] f [path redacted] g (see [path redacted]) h see http://example.com/x and a/b');
+  } finally { await manager.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+// Redline Q2: a sibling directory sharing the root prefix must never be
+// partially replaced (`<root>2/...` used to become `[path redacted]2/...`),
+// a root spelled with backslash separators must redact as one placeholder,
+// and a space-containing sibling root must redact whole as well.
+test('工作区根同名兄弟目录不被部分替换，反斜杠拼写根整体脱敏', async () => {
+  const root = await fixture('ocw-terminal-session-root-boundary-');
+  const manager = createTerminalSessionManager({ root, sessionProvider: () => ({ cancel() {} }) });
+  try {
+    const backslashRoot = root.replaceAll('/', '\\');
+    const session = await manager.create({ argv: ['pwd', `${root}2/sub/file.txt`, `${backslashRoot}\\sub\\file.txt`, `pre${root}/sub/file.txt`], approved: true });
+    assert.deepEqual((await manager.get(session.id)).argv, ['pwd', '[path redacted]', '[path redacted]', 'pre[path redacted]']);
+  } finally { await manager.close(); await rm(root, { recursive: true, force: true }); }
+  const spaced = path.join(tmpdir(), `ocw fake root-${Math.random().toString(36).slice(2, 8)}`);
+  await mkdir(spaced, { recursive: true });
+  const spacedManager = createTerminalSessionManager({ root: spaced, sessionProvider: () => ({ cancel() {} }) });
+  try {
+    const session = await spacedManager.create({ argv: ['pwd', `${spaced}2/sub/file.txt`], approved: true });
+    assert.equal((await spacedManager.get(session.id)).argv[1], '[path redacted]');
+  } finally { await spacedManager.close(); await rm(spaced, { recursive: true, force: true }); }
+});
+
+// Redline Q4: a space-containing root appearing as a secret value used to be
+// cut at the space by the secret rule before root matching ran, leaking the
+// tail (`key=[redacted] fake root-.../file`). Root matching now runs first,
+// and a placeholder after a key is not mangled by the secret rule.
+test('秘密值中的含空格根路径整体脱敏，占位符不被秘密规则切断', async () => {
+  const spaced = path.join(tmpdir(), `ocw fake root-${Math.random().toString(36).slice(2, 8)}`);
+  await mkdir(spaced, { recursive: true });
+  const manager = createTerminalSessionManager({ root: spaced, sessionProvider: () => ({ cancel() {} }) });
+  try {
+    const session = await manager.create({ argv: ['pwd', `key=${spaced}/sub/file.txt`, 'key=dummy', 'key=/tmp/plain-path.txt'], approved: true });
+    assert.deepEqual((await manager.get(session.id)).argv, ['pwd', 'key=[path redacted]', 'key=[redacted]', 'key=[path redacted]']);
+    await manager.close();
+    const parsed = JSON.parse(await readFile(path.join(spaced, '.openclaw-workbench', 'terminal-sessions', `${session.id}.json`), 'utf8'));
+    assert.equal(parsed.argv.some((value) => String(value).includes('fake root')), false);
+  } finally { await manager.close(); await rm(spaced, { recursive: true, force: true }); }
+});
+
+// Redline Q7: the disk assertion itself must be able to catch a Windows-path
+// leak. The old raw.includes(fake) check is false for a JSON-escaped leak, so
+// this test asserts on parsed snapshot values and on the JSON-escaped
+// spelling, for both argv and chunk text.
+test('磁盘断言按解析后取值比对，含反斜杠路径泄露可被检出', async () => {
+  const root = await fixture('ocw-terminal-session-disk-parsed-assert-');
+  const id = '00000000-0000-4000-8000-000000000022';
+  const directory = path.join(root, '.openclaw-workbench', 'terminal-sessions');
+  const fakes = ['C:\\fake\\secret.txt', '\\\\fake-server\\fake-share\\file.txt'];
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, `${id}.json`), JSON.stringify({ version: 1, id, status: 'exited', argv: fakes, cwd: '.', capabilities: { pty: false, input: false, incrementalOutput: false }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), outputBytes: 32, chunks: [{ sequence: 1, stream: 'stdout', text: `wrote ${fakes[0]}` }] }), 'utf8');
+    const manager = createTerminalSessionManager({ root });
+    await manager.restore();
+    await manager.close();
+    const raw = await readFile(path.join(directory, `${id}.json`), 'utf8');
+    const parsed = JSON.parse(raw);
+    const diskValues = [...parsed.argv, ...parsed.chunks.map((chunk) => chunk.text)];
+    for (const fake of fakes) {
+      assert.equal(diskValues.some((value) => String(value).includes(fake)), false);
+      assert.equal(raw.includes(JSON.stringify(fake).slice(1, -1)), false);
+    }
+    assert.equal(raw.includes('[path redacted]'), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
