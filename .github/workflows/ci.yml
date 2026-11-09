@@ -21,6 +21,18 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - run: npm install --ignore-scripts --package-lock=false
+      - name: Install real pyright language server for LSP tests
+        run: |
+          # Real-server LSP tests (tests/lsp-real-server.test.mjs) must
+          # never silently skip on CI: install pyright 1.1.414 into a
+          # temp dir (never into the repo; package.json untouched) and
+          # fail THIS step if the binary is not executable, so a skip
+          # in npm test can only mean this step already failed.
+          PYRIGHT_DIR="${RUNNER_TEMP}/ocw-pyright-1.1.414"
+          npm install --prefix "$PYRIGHT_DIR" pyright@1.1.414 --ignore-scripts --no-save --no-package-lock
+          BIN="$PYRIGHT_DIR/node_modules/.bin/pyright-langserver"
+          if [ ! -x "$BIN" ]; then echo "pyright-langserver is not executable at $BIN" >&2; exit 1; fi
+          echo "OCW_PYRIGHT_BIN=$BIN" >> "$GITHUB_ENV"
       - run: npm test
       - run: npm pack --dry-run
       - run: git diff --check

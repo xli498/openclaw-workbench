@@ -53,6 +53,7 @@ export function createMcpServerRuntime({ registry, transportFactory, stdioOption
     if (server.enabled !== true) throw new McpRuntimeError('MCP_SERVER_DISABLED', 'MCP server is disabled');
     const existing = instances.get(id);
     if (existing) {
+      if (existing.state === 'stopping') throw new McpRuntimeError('MCP_RUNTIME_CLOSED', 'MCP runtime is stopping');
       if (existing.configHash !== server.configHash) throw new McpRuntimeError('MCP_CONFLICT', 'MCP server configuration changed');
       return existing.startPromise ?? publicInstance(existing);
     }
@@ -74,12 +75,36 @@ export function createMcpServerRuntime({ registry, transportFactory, stdioOption
     return instance.startPromise;
   }
 
+  // Q29-3: stop keeps the instance registered with state 'stopping'
+  // until close completes, so the "must be stopped" guards that read
+  // status() (server removal/update) cannot pass mid-close, and
+  // callTool/listTools (which require state 'ready') cannot pass
+  // either. Only after a successful close is the record deleted. If
+  // close fails, the record is restored to its previous state and the
+  // failure is reported, instead of silently dropping a live instance.
   async function stop(id) {
     const instance = instances.get(id);
     if (!instance) throw new McpRuntimeError('MCP_NOT_RUNNING', 'MCP server is not running');
+    if (instance.state === 'stopping') throw new McpRuntimeError('MCP_RUNTIME_CLOSED', 'MCP runtime is already stopping');
+    const previousState = instance.state;
     instance.closed = true;
-    instances.delete(id);
-    await instance.closeOnce();
+    instance.state = 'stopping';
+    try {
+      await instance.closeOnce();
+    } catch (error) {
+      // closeOnce memoizes its promise, so a failed close must clear
+      // it or every later stop would replay the same rejection and the
+      // "restored" instance could never be stopped again.
+      instance.closePromise = null;
+      // Restore only if this instance is still the registered one: a
+      // concurrent start failure may legitimately have removed it.
+      if (instances.get(id) === instance) {
+        instance.closed = false;
+        instance.state = previousState;
+      }
+      throw error instanceof McpRuntimeError ? error : new McpRuntimeError('MCP_STOP_FAILED', 'MCP server could not be stopped');
+    }
+    if (instances.get(id) === instance) instances.delete(id);
     return Object.freeze({ id, state: 'stopped' });
   }
 

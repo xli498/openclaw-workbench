@@ -179,3 +179,79 @@ test('MCP update approval resets enablement and an enable proposal re-enables it
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Q29-3 follow-ups: stop used to delete the instance before awaiting
+// close, so "must be stopped" guards could pass mid-close and a failed
+// close silently dropped the record. The control-plane test above never
+// started a server; these tests start one for real at runtime level.
+function fakeRuntimeTransport(hooks = {}) {
+  return {
+    start: async () => {},
+    close: async () => { if (hooks.closeImpl) return hooks.closeImpl(); },
+    request: async (method) => {
+      if (method === 'tools/list') return { tools: [{ name: 'tool-a' }] };
+      return {};
+    },
+  };
+}
+
+test('MCP runtime stop after a real start removes the instance only after close', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-stop-real-'));
+  try {
+    const registry = createMcpRegistry({ root });
+    const created = registry.register(serverInput());
+    registry.setEnabled('demo', true, created.configHash);
+    const current = registry.get('demo');
+    const runtime = createMcpServerRuntime({ registry, transportFactory: () => fakeRuntimeTransport() });
+    const started = await runtime.start('demo', { expectedConfigHash: current.configHash, approved: true });
+    assert.equal(started.state, 'ready');
+    assert.deepEqual(await runtime.stop('demo'), { id: 'demo', state: 'stopped' });
+    assert.deepEqual(runtime.status(), []);
+    await assert.rejects(runtime.stop('demo'), (error) => error.code === 'MCP_NOT_RUNNING');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('MCP runtime stop reports stopping and blocks calls until close completes', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-stop-barrier-'));
+  try {
+    const registry = createMcpRegistry({ root });
+    const created = registry.register(serverInput());
+    registry.setEnabled('demo', true, created.configHash);
+    const current = registry.get('demo');
+    let releaseClose;
+    const closeGate = new Promise((resolve) => { releaseClose = resolve; });
+    const runtime = createMcpServerRuntime({ registry, transportFactory: () => fakeRuntimeTransport({ closeImpl: () => closeGate }) });
+    await runtime.start('demo', { expectedConfigHash: current.configHash, approved: true });
+    const stopping = runtime.stop('demo');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(runtime.status().length, 1);
+    assert.equal(runtime.status()[0].state, 'stopping');
+    await assert.rejects(runtime.callTool('demo', 'tool-a', {}, { expectedConfigHash: current.configHash, approved: true }), (error) => error.code === 'MCP_NOT_RUNNING');
+    await assert.rejects(runtime.listTools('demo', { expectedConfigHash: current.configHash, approved: true }), (error) => error.code === 'MCP_NOT_RUNNING');
+    await assert.rejects(runtime.start('demo', { expectedConfigHash: current.configHash, approved: true }), (error) => error.code === 'MCP_RUNTIME_CLOSED');
+    releaseClose();
+    assert.deepEqual(await stopping, { id: 'demo', state: 'stopped' });
+    assert.deepEqual(runtime.status(), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('MCP runtime stop failure restores the instance record', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ocw-mcp-stop-fail-'));
+  try {
+    const registry = createMcpRegistry({ root });
+    const created = registry.register(serverInput());
+    registry.setEnabled('demo', true, created.configHash);
+    const current = registry.get('demo');
+    const hooks = { closeImpl: async () => { throw new Error('close boom'); } };
+    const runtime = createMcpServerRuntime({ registry, transportFactory: () => fakeRuntimeTransport(hooks) });
+    await runtime.start('demo', { expectedConfigHash: current.configHash, approved: true });
+    await assert.rejects(runtime.stop('demo'), (error) => error.code === 'MCP_STOP_FAILED');
+    assert.equal(runtime.status().length, 1);
+    assert.equal(runtime.status()[0].state, 'ready');
+    const listed = await runtime.listTools('demo', { expectedConfigHash: current.configHash, approved: true });
+    assert.deepEqual(listed.tools, [{ name: 'tool-a', authorized: true }]);
+    hooks.closeImpl = async () => {};
+    assert.deepEqual(await runtime.stop('demo'), { id: 'demo', state: 'stopped' });
+    assert.deepEqual(runtime.status(), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

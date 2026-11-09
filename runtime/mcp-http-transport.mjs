@@ -29,7 +29,12 @@ function validateHeaders(headers) {
   for (const [name, value] of Object.entries(headers)) {
     if (!HEADER_NAME.test(name) || typeof value !== 'string' || !value || value.length > 4096 || /[\0\r\n]/.test(value)) throw new McpHttpTransportError('MCP_HEADERS_INVALID', 'MCP headers are invalid');
   }
-  return { ...headers };
+  // The transport owns the session headers exclusively: a caller-supplied
+  // mcp-session-id / mcp-protocol-version in baseHeaders would otherwise
+  // survive a 404 clear (the clear only nulls internal state) and be sent
+  // again on the next request, re-attaching the dead session.
+  const reserved = new Set(['mcp-session-id', 'mcp-protocol-version']);
+  return Object.fromEntries(Object.entries(headers).filter(([name]) => !reserved.has(name.toLowerCase())));
 }
 
 function frameBytes(text) { return Buffer.byteLength(text, 'utf8'); }
@@ -160,8 +165,36 @@ export function createMcpHttpTransport({
     if (signal?.aborted) abortExternal();
     else signal?.addEventListener('abort', abortExternal, { once: true });
     try {
+      // Identity binding (Q51-6): judge the 404 by the session this
+      // request actually carried, not by the shared state at arrival time.
+      // A late 404 for an old session must not clear a newer session
+      // that was established after this request was sent.
+      const sentSessionId = sessionId;
       const response = await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(sessionId ? { 'mcp-session-id': sessionId } : {}), ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal });
-      if (!response || !response.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      if (!response || !response.ok) {
+        // Spec session rule: a 404 for a request that carried a session
+        // id means the server terminated that session, and the client
+        // MUST start a new session with a bare InitializeRequest. The
+        // old transport kept the dead id, so the next initialize sent
+        // it back and the server answered 400 (session fixation) — the
+        // transport was wedged until close(). Clear the stale id (and
+        // the negotiated version, which belongs to that session) and
+        // report the session loss distinctly, so initialize() works
+        // again immediately. A 404 with no session id carried (e.g. a
+        // wrong endpoint) stays a plain HTTP error.
+        if (response?.status === 404 && sentSessionId) {
+          // The error classification follows the sent identity: this
+          // request's session is dead even if the transport has since
+          // moved on. The clear, however, only applies while the current
+          // session is still the one this request carried.
+          if (sessionId === sentSessionId) {
+            sessionId = null;
+            protocolVersion = null;
+          }
+          throw new McpHttpTransportError('MCP_SESSION_NOT_FOUND', 'MCP session was terminated by the server; start a new session with initialize()');
+        }
+        throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      }
       if (response.status === 202 || response.status === 204) return null;
       const responseText = await readBoundedText(response, maxFrameBytes);
       const contentType = String(response.headers?.get?.('content-type') ?? '').toLowerCase();
@@ -194,8 +227,26 @@ export function createMcpHttpTransport({
     activeControllers.add(controller);
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     try {
+      // Identity binding (Q51-6), same rule as request().
+      const sentSessionId = sessionId;
       const response = await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(sessionId ? { 'mcp-session-id': sessionId } : {}), ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal });
-      if (!response || !response.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      if (!response || !response.ok) {
+        // Same session-termination rule as request(): a 404 for a
+        // notification that carried a session id clears the stale id
+        // instead of leaving the transport wedged.
+        if (response?.status === 404 && sentSessionId) {
+          // The error classification follows the sent identity: this
+          // request's session is dead even if the transport has since
+          // moved on. The clear, however, only applies while the current
+          // session is still the one this request carried.
+          if (sessionId === sentSessionId) {
+            sessionId = null;
+            protocolVersion = null;
+          }
+          throw new McpHttpTransportError('MCP_SESSION_NOT_FOUND', 'MCP session was terminated by the server; start a new session with initialize()');
+        }
+        throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server returned an HTTP error');
+      }
       return Object.freeze({ status: response.status });
     } finally { clearTimeout(timer); activeControllers.delete(controller); }
   }
@@ -226,11 +277,24 @@ export function createMcpHttpTransport({
         if (id !== null) lastEventId = id;
         if (frame && typeof frame.method === 'string' && frame.id !== undefined) {
           if (onRequest) {
+            // Q28-3: a server-request reply is an outbound frame like any
+            // other, so it gets the same maxFrameBytes check, and a reply
+            // failure is never swallowed: it is reported to onError when
+            // one is registered, and otherwise closes the subscription
+            // with a rejected closedPromise so the failure is visible to
+            // the caller instead of vanishing into a caught promise.
             Promise.resolve().then(() => onRequest(frame)).then(async (result) => {
               if (result === undefined) return;
               const body = JSON.stringify({ jsonrpc: '2.0', id: frame.id, result });
-              await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-session-id': sessionId, ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal }).catch(() => {});
-            }).catch(() => {});
+              if (frameBytes(body) > maxFrameBytes) throw new McpHttpTransportError('MCP_FRAME_LIMIT', 'MCP response frame exceeded the configured limit');
+              const reply = await fetchImpl(target, { method: 'POST', headers: { ...baseHeaders, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-session-id': sessionId, ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}) }, body, signal: controller.signal });
+              if (!reply || !reply.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP server request reply failed');
+            }).catch((error) => {
+              const report = error instanceof McpHttpTransportError ? error : new McpHttpTransportError('MCP_REQUEST_FAILED', 'MCP server request reply failed');
+              if (onError) {
+                try { onError(report); } catch { controller.abort(); finish(report); }
+              } else { controller.abort(); finish(report); }
+            });
           }
           onMessage?.(frame);
           return;
@@ -239,11 +303,18 @@ export function createMcpHttpTransport({
         onMessage?.(frame);
       },
     });
+    // Q28-4: onError runs inside try/finally so a throwing error
+    // callback can never strand closedPromise: the rejection (or the
+    // clean resolution) always executes. The callback's own throw is
+    // swallowed here -- finish is also called from a detached stream
+    // task, where a rethrown callback error would surface as an
+    // unhandled rejection instead of reaching any caller.
     const finish = (error) => {
       if (closed) return;
       closed = true;
       subscriptions.delete(handle);
-      if (error) { onError?.(error); rejectClosed(error); } else resolveClosed(Object.freeze({ status: 'closed', lastEventId }));
+      try { if (error) onError?.(error); } catch {}
+      finally { if (error) rejectClosed(error); else resolveClosed(Object.freeze({ status: 'closed', lastEventId })); }
     };
     const handle = Object.freeze({
       close: () => { controller.abort(); finish(null); },
@@ -256,8 +327,25 @@ export function createMcpHttpTransport({
     signal?.addEventListener('abort', () => { controller.abort(); finish(null); }, { once: true });
     void (async () => {
       try {
+        // Identity binding (Q51-6): subscribe() required a session id,
+        // so this GET always carried one; capture it before sending.
+        const sentSessionId = sessionId;
         const response = await fetchImpl(target, { method: 'GET', headers: { ...baseHeaders, accept: 'text/event-stream', 'mcp-session-id': sessionId, ...(protocolVersion ? { 'mcp-protocol-version': protocolVersion } : {}), ...(lastEventId ? { 'last-event-id': lastEventId } : {}) }, signal: controller.signal });
-        if (!response || !response.ok) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP SSE stream returned an HTTP error');
+        if (!response || !response.ok) {
+          // A GET stream always carries a session id, so a 404 here is
+          // a terminated session: clear it before reporting, so an
+          // onError handler that re-initializes sees a clean transport.
+          if (response?.status === 404) {
+            // Clear only if the current session is still the one this
+            // stream carried; a late 404 must not kill a newer session.
+            if (sessionId === sentSessionId) {
+              sessionId = null;
+              protocolVersion = null;
+            }
+            throw new McpHttpTransportError('MCP_SESSION_NOT_FOUND', 'MCP session was terminated by the server; start a new session with initialize()');
+          }
+          throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP SSE stream returned an HTTP error');
+        }
         const contentType = String(response.headers?.get?.('content-type') ?? '').toLowerCase();
         if (!contentType.includes('text/event-stream')) throw new McpHttpTransportError('MCP_FRAME_INVALID', 'MCP SSE stream did not return an event stream');
         const decoder = new TextDecoder();
@@ -300,6 +388,11 @@ export function createMcpHttpTransport({
       if (!response || !(response.ok || response.status === 404)) throw new McpHttpTransportError('MCP_HTTP_STATUS', 'MCP session termination failed');
       sessionId = null;
       protocolVersion = null;
+      // Q28-4: terminating the session also closes its live SSE
+      // subscriptions; previously a caller had to close the stream
+      // manually first, and the DELETE-then-stream link was untested.
+      // A failed DELETE leaves the session (and its streams) in place.
+      for (const subscription of [...subscriptions]) subscription.close();
       return Object.freeze({ status: 'terminated' });
     } finally { clearTimeout(timer); activeControllers.delete(controller); }
   }

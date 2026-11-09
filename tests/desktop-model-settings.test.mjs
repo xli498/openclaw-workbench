@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 import path from 'node:path';
+import { webcrypto } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -61,6 +62,7 @@ test('desktop model setup stores the key separately and gates registration and e
     const request = args.request;
     const result = (status, body) => ({ status, body });
     if (request.method === 'GET' && request.path === '/v1/models') return result(200, { models: profile ? [{ ...profile, health }] : [] });
+    if (request.method === 'GET' && request.path.startsWith('/v1/secrets/')) return result(200, { name: request.path.slice('/v1/secrets/'.length), configured: false });
     if (request.method === 'POST' && request.path === '/v1/secrets') return result(200, { configured: true });
     if (request.method === 'POST' && request.path === '/v1/models') {
       pendingProposal = { action: { id: 'register-action', actionHash: 'register-hash', type: 'model.register', preview: { id: 'primary', provider: 'Example', protocol: 'openai-compatible', model: 'demo', endpoint: 'https://provider.example/v1', capabilities: ['text', 'tool_calling'], secretRef: 'keychain:workbench.model.primary' } } };
@@ -91,7 +93,7 @@ test('desktop model setup stores the key separately and gates registration and e
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
   };
   const source = await readFile(path.join(frontendRoot, 'app.js'), 'utf8');
-  vm.runInNewContext(source, { window, document, URL, console: { log() {}, error() {} } });
+  vm.runInNewContext(source, { window, document, URL, crypto: webcrypto, TextEncoder, console: { log() {}, error() {} } });
   await new Promise((resolve) => setImmediate(resolve));
 
   document.querySelector('#model-id').value = 'primary';
@@ -104,6 +106,7 @@ test('desktop model setup stores the key separately and gates registration and e
   const secretWrite = calls.find(({ args }) => args.request?.path === '/v1/secrets');
   const profileCreate = calls.find(({ args }) => args.request?.path === '/v1/models' && args.request?.method === 'POST');
   assert.equal(secretWrite.args.request.body.value, 'secret-model-key-123');
+  assert.equal(typeof secretWrite.args.request.body.actionHash, 'string');
   assert.equal(profileCreate.args.request.body.secretRef, 'keychain:workbench.model.primary');
   assert.equal(JSON.stringify(profileCreate.args.request.body).includes('secret-model-key-123'), false);
   assert.equal(document.querySelector('#model-api-key').value, '');

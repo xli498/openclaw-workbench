@@ -15,6 +15,8 @@ export class ModelRegistryError extends Error {
 
 function fail(code, message) { throw new ModelRegistryError(code, message); }
 function text(value, field, max, code) { if (typeof value !== 'string' || !value.trim() || value.length > max || /[\0\r\n]/.test(value)) fail(code, `${field} is invalid`); return value.trim(); }
+// 配置保存层：仅要求 http(s) 且不含凭据或敏感查询，允许保存 HTTP 与私网地址；
+// HTTPS 与主机/DNS 阻断只在探针/runner 实际执行时生效，不是本层的阻断条件。
 function endpoint(value) {
   const raw = text(value, 'endpoint', 2048, 'MODEL_ENDPOINT_INVALID');
   let parsed; try { parsed = new URL(raw); } catch { fail('MODEL_ENDPOINT_INVALID', 'endpoint must be an http(s) URL'); }
