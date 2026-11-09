@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { accessSync, constants } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -113,17 +113,25 @@ async function startClient(root) {
     root,
     requestTimeoutMs: 60000,
   });
-  const started = await client.start();
-  return { client, started };
+  try {
+    const started = await client.start();
+    return { client, started };
+  } catch (error) {
+    // start() already closes the child on failure; close again so a
+    // failed start can never leak the server process.
+    await client.close().catch(() => {});
+    throw error;
+  }
 }
 
 test('LSP real server (pyright): hover and definition resolve through the registry entry', { skip: SKIP_NO_SERVER }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-real-'));
   const file = path.join(root, 'demo.py');
   const uri = `file://${file}`;
-  await writeFile(file, SOURCE, 'utf8');
-  const { client } = await startClient(root);
+  let client;
   try {
+    await writeFile(file, SOURCE, 'utf8');
+    ({ client } = await startClient(root));
     // pyright does not advertise positionEncoding; the client keeps
     // its UTF-16 default. Pinning this documents which encoding the
     // assertions below actually exercise.
@@ -137,9 +145,12 @@ test('LSP real server (pyright): hover and definition resolve through the regist
     assert.ok(Array.isArray(definition) && definition.length >= 1);
     assert.equal(definition[0].uri, uri);
     assert.deepEqual(definition[0].range, { start: { line: 0, character: 4 }, end: { line: 0, character: 9 } });
+    // The client never writes to disk, so the fixture must still hold
+    // exactly what the test wrote (not just the in-memory copy).
+    assert.equal(await readFile(file, 'utf8'), SOURCE);
     assert.deepEqual(await client.shutdown(), { status: 'closed' });
   } finally {
-    await client.close().catch(() => {});
+    await client?.close().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -148,9 +159,10 @@ test('LSP real server (pyright): diagnostics arrive for a type error and track l
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-real-diag-'));
   const file = path.join(root, 'demo.py');
   const uri = `file://${file}`;
-  await writeFile(file, SOURCE, 'utf8');
-  const { client } = await startClient(root);
+  let client;
   try {
+    await writeFile(file, SOURCE, 'utf8');
+    ({ client } = await startClient(root));
     client.didOpen(uri, 'python', SOURCE);
     const first = await waitForDiagnostics(client, uri, (d) => d.length === 1 && d[0].range.start.line === 4);
     assert.equal(first.length, 1);
@@ -165,9 +177,12 @@ test('LSP real server (pyright): diagnostics arrive for a type error and track l
     const shifted = await waitForDiagnostics(client, uri, (d) => d.length === 1 && d[0].range.start.line === 5);
     assert.equal(shifted[0].range.start.line, 5);
     assert.equal(shifted[0].code, 'reportAssignmentType');
+    // The client never writes to disk, so the fixture must still hold
+    // exactly what the test wrote (not just the in-memory copy).
+    assert.equal(await readFile(file, 'utf8'), SOURCE);
     assert.deepEqual(await client.shutdown(), { status: 'closed' });
   } finally {
-    await client.close().catch(() => {});
+    await client?.close().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -176,9 +191,10 @@ test('LSP real server (pyright): didOpen/didChange/didClose lifecycle with multi
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-lsp-real-sync-'));
   const file = path.join(root, 'demo.py');
   const uri = `file://${file}`;
-  await writeFile(file, SOURCE_MULTIBYTE, 'utf8');
-  const { client } = await startClient(root);
+  let client;
   try {
+    await writeFile(file, SOURCE_MULTIBYTE, 'utf8');
+    ({ client } = await startClient(root));
     client.didOpen(uri, 'python', SOURCE_MULTIBYTE);
     assert.equal(client.getOpenDocument(uri).version, 0);
     const first = await waitForDiagnostics(client, uri, (d) => d.length === 1 && d[0].range.start.line === 4);
@@ -204,9 +220,12 @@ test('LSP real server (pyright): didOpen/didChange/didClose lifecycle with multi
     assert.equal(client.getOpenDocument(uri), null);
     assert.deepEqual(client.listOpenDocuments(), []);
     assert.throws(() => client.didClose(uri), { code: 'LSP_DOCUMENT_NOT_OPEN' });
+    // The client never writes to disk, so the fixture must still hold
+    // exactly what the test wrote (not just the in-memory copy).
+    assert.equal(await readFile(file, 'utf8'), SOURCE_MULTIBYTE);
     assert.deepEqual(await client.shutdown(), { status: 'closed' });
   } finally {
-    await client.close().catch(() => {});
+    await client?.close().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });
