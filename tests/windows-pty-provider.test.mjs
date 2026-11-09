@@ -262,22 +262,19 @@ test('Windows PTY ConPTY normalizes case-variant env and reads caller value', { 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('Windows PTY ConPTY resize reports PTY_RESIZE_UNSUPPORTED on a live session instead of faking a size', { skip: SKIP_OFF_WINDOWS }, async () => {
+test('Windows ConPTY resize on a live session succeeds over the control channel and the child observes the new size', { skip: SKIP_OFF_WINDOWS }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ocw-winpty-'));
   try {
-    // Windows-native resize coverage, and the gap left by the PR #37
-    // slice: the #37 Windows provider tests all skipped on win32 and
-    // the POSIX resize tests carry no "Windows" token, so the Windows
-    // CI name-pattern run executed zero new #37 tests on Windows.
-    // This test's title contains "Windows", so the CI pattern selects
-    // it, and on win32 it is NOT skipped: it spawns the real ConPTY
-    // helper, waits for the child's ready marker (so the resize is
-    // attempted on a provably live session, not a dead one), and
-    // requires the honest PTY_RESIZE_UNSUPPORTED rejection (no
-    // persistent control channel exists yet). On Linux it is skipped
-    // by platform, which the runner reports as skipped rather than
-    // passed -- selection and execution stay distinguishable in the
-    // run record.
+    // New contract (PR #47): the named-pipe control channel exists,
+    // so resize on a live session is a real resize, not a
+    // PTY_RESIZE_UNSUPPORTED rejection. The old expectation ("no
+    // persistent control channel exists yet") died with the channel:
+    // resize resolves with the acked size, and the child itself must
+    // then observe the new console size -- an ack alone is not
+    // sufficient evidence. The observation mechanism is the same one
+    // the already-passing tests/windows-pty-resize.test.mjs uses:
+    // a PowerShell child printing its own $Host.UI.RawUI.WindowSize
+    // every 200 ms as SIZE:<WindowSize>/<BufferSize>.
     const provider = createWindowsPtyProvider();
     const outputs = [];
     let resolveExit;
@@ -285,19 +282,33 @@ test('Windows PTY ConPTY resize reports PTY_RESIZE_UNSUPPORTED on a live session
     const exited = new Promise((resolve) => { resolveExit = resolve; });
     const controller = new AbortController();
     const handle = await provider({
-      root, argv: ['cmd.exe', '/d', '/c', 'echo pty-ready-resize & ping -n 60 127.0.0.1'], cwd: '.', signal: controller.signal,
+      root,
+      argv: ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "while ($true) { $w=$Host.UI.RawUI.WindowSize; $b=$Host.UI.RawUI.BufferSize; Write-Output ('SIZE:{0}x{1}/{2}x{3}' -f $w.Width,$w.Height,$b.Width,$b.Height); Start-Sleep -Milliseconds 200 }"],
+      cwd: '.', signal: controller.signal,
       onOutput: (value) => { outputs.push(value.text); },
       onExit: (result) => { exitedFlag = true; resolveExit(result); },
     });
-    try {
-      const deadline = Date.now() + 30_000;
-      while (!/pty-ready-resize/.test(outputs.join(''))) {
-        if (Date.now() > deadline) throw new Error('timed out waiting for ConPTY child ready marker');
+    const waitForOutput = async (pattern, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!pattern.test(outputs.join(''))) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for output ${pattern}`);
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
+    };
+    try {
+      // Initial SIZE match only: Windows CI measured 23-28 s before
+      // the first SIZE line (PowerShell child startup under ConPTY),
+      // so 60 s keeps the same assertion with room for slow runners.
+      await waitForOutput(/SIZE:80x24\//, 60_000);
       assert.equal(exitedFlag, false, 'child must not have exited before resize');
-      await assert.rejects(handle.resize(120, 40), (error) => error.code === 'PTY_RESIZE_UNSUPPORTED');
-      await assert.rejects(handle.resize(80, 24), (error) => error.code === 'PTY_RESIZE_UNSUPPORTED');
+      // Ack: resize resolves with the size the helper echoed back.
+      const size = await handle.resize(120, 40);
+      assert.deepEqual(size, { cols: 120, rows: 40 });
+      // Observation: the child itself prints the new WindowSize.
+      await waitForOutput(/SIZE:120x40\//, 30_000);
+      const back = await handle.resize(80, 24);
+      assert.deepEqual(back, { cols: 80, rows: 24 });
+      await waitForOutput(/SIZE:80x24\//, 30_000);
     } finally {
       controller.abort();
       await handle.cancel().catch(() => {});

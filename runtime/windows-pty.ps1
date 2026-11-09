@@ -4,19 +4,30 @@ param(
 
 # Windows ConPTY helper for openclaw-workbench.
 #
-# WINDOWS_PTY_STATUS: VERIFIED ON WINDOWS CI (PR #45, 2026-11-02).
-# This script was written and reviewed on Linux, then validated by
-# Windows CI execution tests (spawn, input pumping, output pumping,
-# cancel via taskkill from the Node provider, and exit-code propagation).
-# Windows resize is still PTY_RESIZE_UNSUPPORTED.
+# WINDOWS_PTY_STATUS: EXECUTION VERIFIED ON WINDOWS CI (PR #45,
+# 2026-11-02) for spawn, input/output pumping, cancel, and exit-code
+# propagation. ConPTY RESIZE IS WIRED IN THIS SLICE via a named-pipe
+# control channel (see the provider header); its Windows CI execution
+# verification lives in tests/windows-pty-resize.test.mjs and is
+# reported per-PR, not claimed here ahead of that run.
 #
 # Invocation contract (Node side, shell:false, base64 JSON payload):
-#   { cwd, argv, cols, rows, env }
+#   { cwd, argv, cols, rows, controlPipe, env }
 # Only these fields are accepted; argv is turned into a CreateProcess
 # command line with CommandLineToArgvW quoting, never through a shell.
 # cols 1-500, rows 1-200, env keys must match [A-Za-z_][A-Za-z0-9_]*.
-# The script prints only the child process output on stdout; failures
-# print a single PTY_FAILED line on stderr and exit 1.
+# controlPipe, when present, must match ^ocw-pty-[0-9a-f-]{36}$ or the
+# spawn fails (never a silent fallback to a no-resize session); when
+# absent the helper runs the legacy one-shot path with no control
+# channel and no READY line (the provider always sends it, so this
+# path is only for foreign callers). With a control pipe, the helper
+# creates the pipe server BEFORE CreateProcess, starts a control
+# runspace after CreateProcess, and writes exactly one
+# READY <pipeName> line to stdout BEFORE the child output pump
+# starts; the provider scans initial stdout for exactly that line
+# and queues any child lines seen before it. The script prints only
+# READY plus child process output on stdout; failures print a single
+# PTY_FAILED line on stderr and exit 1.
 
 $ErrorActionPreference = 'Stop'
 
@@ -34,6 +45,15 @@ try {
     if ($null -eq $item -or [string]$item -eq '' -or ([string]$item -match "[\0\r\n]")) { throw 'argv entry is invalid' }
   }
   if ($cols -lt 1 -or $cols -gt 500 -or $rows -lt 1 -or $rows -gt 200) { throw 'size is invalid' }
+  # Control pipe name: a fresh per-session UUID from the provider.
+  # Present-but-malformed is a payload error, never a fallback: a
+  # session whose resize channel cannot be named must not start as a
+  # silent no-resize session. Absent means a legacy foreign caller.
+  $controlPipe = $null
+  if ($null -ne $inputObject.controlPipe -and [string]$inputObject.controlPipe -ne '') {
+    $controlPipe = [string]$inputObject.controlPipe
+    if ($controlPipe -notmatch '^ocw-pty-[0-9a-f-]{36}$') { throw 'control pipe name is invalid' }
+  }
   $envPairs = @()
   $childSystemRoot = $null
   if ($null -ne $inputObject.env) {
@@ -77,6 +97,27 @@ try {
     $envText = ($envPairs | ForEach-Object { "$_`0" }) -join ''
     $envText += "`0"
     $envBlock = [System.Text.Encoding]::Unicode.GetBytes($envText)
+  }
+
+  # Control pipe server, created BEFORE CreateProcess so the channel
+  # exists for the whole child lifetime. ACL is an explicit
+  # PipeSecurity granting FullControl to the current user SID only:
+  # no allow entry for anyone else means no one else can connect
+  # (absence of an allow entry denies). This is a MUST, not a
+  # nice-to-have: the pipe accepts resize commands for a live
+  # console. The .NET default is NOT relied on. The server object
+  # lives at script scope so the cleanup below can dispose it.
+  # Cross-user rejection is code-reviewed, not CI-executed: the
+  # hosted runner offers no second credential to connect with.
+  $controlServer = $null
+  $controlPump = $null
+  $controlJob = $null
+  $controlState = [hashtable]::Synchronized(@{ connected = $false; closeRequested = $false })
+  if ($null -ne $controlPipe) {
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $pipeSecurity = New-Object System.IO.Pipes.PipeSecurity
+    $pipeSecurity.AddAccessRule((New-Object System.IO.Pipes.PipeAccessRule($currentSid, [System.IO.Pipes.PipeAccessRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)))
+    $controlServer = New-Object System.IO.Pipes.NamedPipeServerStream($controlPipe, [System.IO.Pipes.PipeDirection]::InOut, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::None, 0, 0, $pipeSecurity)
   }
 
   Add-Type -TypeDefinition @'
@@ -155,6 +196,12 @@ public static class OcwConPty
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern void ClosePseudoConsole(IntPtr hPC);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern int ResizePseudoConsole(IntPtr hPC, Coord size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
@@ -303,6 +350,113 @@ public static class OcwConPty
   # CreateProcess is not the sample order and risks tearing the console
   # session down early. It is closed in the cleanup below.
 
+  # Control runspace: blocks on WaitForConnection first (the pipe
+  # server already exists), then serves resize/close JSON lines until
+  # the pipe disconnects. It NEVER calls Environment.Exit and NEVER
+  # closes the HPC: the main thread owns process exit and HPC
+  # lifetime. It is never Stop()ed synchronously (Q1 lesson): if it
+  # is still blocked when the main thread finishes, process exit
+  # terminates it, and the cleanup below only EndInvokes it when a
+  # zero-time check shows it already finished.
+  if ($null -ne $controlServer) {
+    $controlPump = [powershell]::Create().AddScript({
+      param($server, $hPC, $procHandle, $state)
+      try {
+        $server.WaitForConnection()
+        $state.connected = $true
+        try { [Console]::Error.WriteLine('PTY_CONTROL: connected') } catch { }
+        $reader = New-Object System.IO.StreamReader($server, [System.Text.Encoding]::UTF8)
+        # No-BOM UTF-8: [Text.Encoding]::UTF8 emits a BOM before the
+        # first frame, and the provider's JSON.parse rejects a
+        # BOM-prefixed line, which silently dropped every first ack
+        # (resize timeout, never a nack) in the first Windows CI run.
+        $writer = New-Object System.IO.StreamWriter($server, (New-Object System.Text.UTF8Encoding($false)))
+        $writer.AutoFlush = $true
+        while ($true) {
+          $line = $null
+          try { $line = $reader.ReadLine() } catch { break }
+          if ($null -eq $line) { break }
+          if ($line.Length -gt 4096) {
+            try { $writer.WriteLine('{"id":null,"ok":false,"error":"PTY_CONTROL_INVALID"}') } catch { break }
+            continue
+          }
+          $msg = $null
+          try { $msg = $line | ConvertFrom-Json } catch { }
+          if ($null -eq $msg) {
+            try { $writer.WriteLine('{"id":null,"ok":false,"error":"PTY_CONTROL_INVALID"}') } catch { break }
+            continue
+          }
+          # Strict integer gate: ConvertFrom-Json yields [int]/[long]
+          # for JSON integers and [double] for fractions, and a bare
+          # [int] cast would ROUND a fraction into range. Fractions
+          # are rejected here, not rounded into a valid size.
+          $id = $null
+          if ($msg.id -is [int] -or $msg.id -is [long]) { $id = [int]$msg.id }
+          $idJson = 'null'
+          if ($null -ne $id) { $idJson = "$id" }
+          if ($msg.type -eq 'resize') {
+            $ok = $false
+            $cols = 0
+            $rows = 0
+            if (($msg.cols -is [int] -or $msg.cols -is [long]) -and ($msg.rows -is [int] -or $msg.rows -is [long])) {
+              $cols = [int]$msg.cols
+              $rows = [int]$msg.rows
+            }
+            if ($cols -ge 1 -and $cols -le 500 -and $rows -ge 1 -and $rows -le 200) {
+              $coord = New-Object OcwConPty+Coord
+              $coord.X = [int16]$cols
+              $coord.Y = [int16]$rows
+              $hr = -1
+              try { $hr = [OcwConPty]::ResizePseudoConsole($hPC, $coord) } catch { $hr = -1 }
+              if ($hr -eq 0) { $ok = $true }
+            }
+            if ($ok) { $ack = "{`"id`":$idJson,`"ok`":true,`"cols`":$cols,`"rows`":$rows}" } else { $ack = "{`"id`":$idJson,`"ok`":false,`"error`":`"PTY_RESIZE_FAILED`"}" }
+            try { $writer.WriteLine($ack) } catch { break }
+          } elseif ($msg.type -eq 'close') {
+            try { $writer.WriteLine("{`"id`":$idJson,`"ok`":true}") } catch { }
+            try { [Console]::Error.WriteLine('PTY_CONTROL: close-requested') } catch { }
+            $state.closeRequested = $true
+            # Bounded teardown: terminating the child unblocks the
+            # main thread's wait, which then runs the normal cleanup
+            # and exits. Waiting indefinitely for a child that never
+            # exits after its console is closed would reintroduce the
+            # unbounded-hang class the Q1 cleanup exists to remove,
+            # so close terminates rather than waiting. Node only
+            # sends close while tearing down (cancel), never on a
+            # healthy session's behalf.
+            try { [void][OcwConPty]::TerminateProcess($procHandle, 1) } catch { }
+            break
+          } else {
+            try { $writer.WriteLine("{`"id`":$idJson,`"ok`":false,`"error`":`"PTY_CONTROL_INVALID`"}" ) } catch { break }
+          }
+        }
+      } catch {
+        # WaitForConnection / stream failure: fall through to the
+        # abandonment check below.
+      } finally {
+        # Pipe disconnect while the child is still running is session
+        # abandonment: an orphaned ConPTY child with no owner must not
+        # outlive its session. TerminateProcess on an already-exited
+        # child fails harmlessly, so the STILL_ACTIVE (259) gate only
+        # keeps the stage line honest.
+        try {
+          [uint32]$code = 0
+          if ([OcwConPty]::GetExitCodeProcess($procHandle, [ref]$code) -and $code -eq 259) {
+            [void][OcwConPty]::TerminateProcess($procHandle, 1)
+            # A close-requested teardown already logged its own stage
+            # line; only a genuine disconnect earns 'abandoned'.
+            if (-not $state.closeRequested) {
+              try { [Console]::Error.WriteLine('PTY_CONTROL: abandoned') } catch { }
+            }
+          }
+        } catch { }
+        try { $server.Disconnect() } catch { }
+        try { $server.Dispose() } catch { }
+      }
+    }).AddParameters(@{ server = $controlServer; hPC = $hPC; procHandle = $procInfo.hProcess; state = $controlState })
+    $controlJob = $controlPump.BeginInvoke()
+  }
+
   # Host ends are owned by exactly one FileStream each
   # (ownsHandle=$true): FileStream.Close then really closes the
   # underlying handle. With $false the cleanup below could not rely on
@@ -312,6 +466,26 @@ public static class OcwConPty
   $inputStream = New-Object System.IO.FileStream((New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($inputPipe.Write, $true)), [System.IO.FileAccess]::Write)
   $consoleOut = [Console]::OpenStandardOutput()
   $consoleIn = [Console]::OpenStandardInput()
+
+  # Readiness line, flushed BEFORE the output pump starts. It carries
+  # the per-session pipe name (READY <pipeName>): the provider scans
+  # initial stdout for exactly that line and queues any child lines
+  # seen before it, because Windows CI rounds 1-2 proved a fast
+  # child's output can reach the pipe before this write even though
+  # the write precedes pump start in program order (the exact
+  # .NET-side reorder mechanism is not established, so the protocol
+  # no longer depends on write order). The pipe name here is the
+  # provider's own value, so a child printing a bare READY cannot
+  # spoof readiness, and the provider consumes this line -- it is
+  # never forwarded as child output and never logged. Written
+  # through $consoleOut, the SAME stream object the output pump
+  # writes through. The provider accepts READY modulo a trailing CR.
+  # No READY in the legacy path.
+  if ($null -ne $controlServer) {
+    $readyBytes = [System.Text.Encoding]::ASCII.GetBytes("READY $controlPipe`r`n")
+    $consoleOut.Write($readyBytes, 0, $readyBytes.Length)
+    $consoleOut.Flush()
+  }
 
   # Pump diagnostics, shared with both runspaces. The input pump used
   # to swallow every exception silently, so a stuck or failed input
@@ -419,6 +593,16 @@ public static class OcwConPty
     if ($inputDone) { try { $inputPump.EndInvoke($inputJob) } catch { } }
     if ($outputDone) { try { $outputPump.Dispose() } catch { } } else { [Console]::Error.WriteLine('PTY_STAGE: output-pump-dispose-skipped-still-running') }
     if ($inputDone) { try { $inputPump.Dispose() } catch { } } else { [Console]::Error.WriteLine('PTY_STAGE: input-pump-dispose-skipped-still-running') }
+    # Control pump: NEVER waited on (it blocks on the pipe while Node
+    # holds it open, and Node only closes the pipe after the helper
+    # exits -- waiting here would deadlock). A zero-time check only:
+    # EndInvoke + Dispose when already finished, otherwise skip and
+    # let process exit terminate it, exactly like a stuck I/O pump.
+    $controlDone = $false
+    try { if ($null -ne $controlJob) { $controlDone = $controlJob.AsyncWaitHandle.WaitOne(0) } } catch { }
+    [Console]::Error.WriteLine("PTY_STAGE: control-pump-done=$controlDone")
+    if ($controlDone) { try { $controlPump.EndInvoke($controlJob) } catch { } try { $controlPump.Dispose() } catch { } } elseif ($null -ne $controlPump) { [Console]::Error.WriteLine('PTY_STAGE: control-pump-dispose-skipped-still-running') }
+    try { if ($null -ne $controlServer) { $controlServer.Dispose() } } catch { }
     [void][OcwConPty]::CloseHandle($procInfo.hProcess)
     # ConPTY-side ends were already closed (and zeroed) right after a
     # successful CreateProcess; close them here only if that step did
