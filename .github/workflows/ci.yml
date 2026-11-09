@@ -74,6 +74,11 @@ jobs:
       - run: cargo metadata --manifest-path desktop/Cargo.toml --no-deps --format-version 1
       - name: Desktop contract checks
         run: node --test tests/desktop-frontend.test.mjs tests/desktop-ask-session.test.mjs tests/desktop-packaging.test.mjs
+      - name: Cache WiX 3.14 toolchain
+        uses: actions/cache@v6
+        with:
+          path: '~\AppData\Local\tauri\WixTools314'
+          key: wix3141rtm-${{ runner.os }}
       - name: Build Windows desktop installers
         run: npx --yes @tauri-apps/cli@2.12.1 build --ci
         working-directory: desktop
